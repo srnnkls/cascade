@@ -248,8 +248,14 @@ fn handle_read(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
 
     // Args: file_fh + offset + count
     if let Ok((fh, rest)) = decode_fh(args) {
-        let offset = decode_u64(rest).ok();
-        let count = offset.and_then(|(_, r)| decode_u32(r).ok()).map(|(c, _)| c);
+        let Some((offset, count)) = decode_u64(rest)
+            .ok()
+            .and_then(|(o, r)| decode_u32(r).ok().map(|(c, _)| (o, c)))
+        else {
+            encode_u32(&mut reply, NFS3ERR_INVAL);
+            encode_post_op_attr(&mut reply, &PostOpAttr::none());
+            return reply;
+        };
 
         let file_key = fh
             .to_item_id()
@@ -260,9 +266,9 @@ fn handle_read(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
         let file_attr = make_attributes(file_path.as_deref().unwrap_or("unknown"), false);
 
         // Try to fetch file data synchronously via the VFS.
-        let data = match &file_path {
-            Some(path) => match fetch_file_data_sync(ctx, path, offset.map(|(o, _)| o), count) {
-                Ok(d) => d,
+        let (data, is_eof) = match &file_path {
+            Some(path) => match ctx.read_range_blocking(path, offset, count) {
+                Ok(read) => read,
                 Err(e) => {
                     tracing::debug!(path = %path, error = %e, "READ: failed to fetch data");
                     encode_u32(&mut reply, NFS3ERR_IO);
@@ -270,15 +276,14 @@ fn handle_read(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
                     return reply;
                 }
             },
-            None => Vec::new(),
+            None => (Vec::new(), true),
         };
 
-        let is_eof = data.is_empty();
         encode_u32(&mut reply, NFS3_OK);
         encode_post_op_attr(&mut reply, &PostOpAttr::some(file_attr));
         let data_len = u32::try_from(data.len()).unwrap_or(u32::MAX);
         encode_u32(&mut reply, data_len); // count of bytes returned
-        encode_bool(&mut reply, is_eof); // EOF if no data
+        encode_bool(&mut reply, is_eof);
         reply.extend_from_slice(&data);
     } else {
         encode_u32(&mut reply, NFS3ERR_STALE);
@@ -286,47 +291,6 @@ fn handle_read(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
     }
 
     reply
-}
-
-/// Synchronously fetch file data from the VFS backend.
-fn fetch_file_data_sync(
-    ctx: &NfsContext,
-    path: &str,
-    offset: Option<u64>,
-    max_count: Option<u32>,
-) -> anyhow::Result<Vec<u8>> {
-    let rt = tokio::runtime::Handle::current();
-    rt.block_on(async {
-        let (backend, relative) = {
-            let vfs = ctx
-                .vfs()
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let (backend, relative) = vfs.resolve(std::path::Path::new(path));
-            let result = (Arc::clone(backend), relative);
-            drop(vfs);
-            result
-        };
-        let entry = backend.metadata(&relative).await?;
-        let buf = backend.download(&entry).await?;
-
-        // Apply offset and count bounds.
-        let off = usize::try_from(offset.unwrap_or(0)).unwrap_or(usize::MAX);
-        if off >= buf.len() {
-            return Ok(Vec::new());
-        }
-        let remaining = buf
-            .get(off..)
-            .ok_or_else(|| anyhow::anyhow!("offset {off} out of bounds"))?;
-        let max = max_count.map_or(remaining.len(), |c| {
-            usize::try_from(c).unwrap_or(usize::MAX)
-        });
-        let end = max.min(remaining.len());
-        Ok(remaining
-            .get(..end)
-            .ok_or_else(|| anyhow::anyhow!("slice end {end} out of bounds"))?
-            .to_vec())
-    })
 }
 
 /// FSSTAT — return filesystem statistics.

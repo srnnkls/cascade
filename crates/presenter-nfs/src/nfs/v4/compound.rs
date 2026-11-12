@@ -349,11 +349,10 @@ fn handle_read(cursor: &mut &[u8], ctx: &NfsContext, current_fh: Option<&NfsFh4>
         || op_status_reply(NFS4ERR_BADHANDLE),
         |fh| {
             let path = fh.to_path().unwrap_or_default();
-            let Ok(data) = fetch_file_data_sync(ctx, &path, offset, count) else {
+            let Ok((data, eof)) = ctx.read_range_blocking(&path, offset, count) else {
                 return op_status_reply(NFS4ERR_IO);
             };
 
-            let eof = data.is_empty();
             let mut reply = op_status_reply(NFS4_OK);
             xdr::encode_bool(&mut reply, eof);
             xdr::encode_opaque(&mut reply, &data);
@@ -763,44 +762,6 @@ fn file_size_sync(ctx: &NfsContext, path: &str) -> u64 {
         .ok()
         .and_then(|entry| entry.size)
         .unwrap_or(0)
-}
-
-/// Synchronously fetch file data from the VFS backend.
-fn fetch_file_data_sync(
-    ctx: &NfsContext,
-    path: &str,
-    offset: u64,
-    max_count: u32,
-) -> anyhow::Result<Vec<u8>> {
-    let rt = tokio::runtime::Handle::current();
-    rt.block_on(async {
-        let (backend, relative) = {
-            let vfs = ctx
-                .vfs()
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let (backend, relative) = vfs.resolve(std::path::Path::new(path));
-            let result = (Arc::clone(backend), relative);
-            drop(vfs);
-            result
-        };
-        let entry = backend.metadata(&relative).await?;
-        let buf = backend.download(&entry).await?;
-
-        let off = usize::try_from(offset).unwrap_or(usize::MAX);
-        if off >= buf.len() {
-            return Ok(Vec::new());
-        }
-        let remaining = buf
-            .get(off..)
-            .ok_or_else(|| anyhow::anyhow!("offset out of bounds"))?;
-        let max = usize::try_from(max_count).unwrap_or(usize::MAX);
-        let end = max.min(remaining.len());
-        Ok(remaining
-            .get(..end)
-            .ok_or_else(|| anyhow::anyhow!("slice out of bounds"))?
-            .to_vec())
-    })
 }
 
 #[cfg(test)]

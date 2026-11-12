@@ -90,6 +90,40 @@ impl NfsContext {
         &self.vfs
     }
 
+    /// Read up to `count` bytes at `offset` from the file at a VFS path,
+    /// fetching only that range from the owning backend.
+    ///
+    /// Returns the bytes and whether the read reached end-of-file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend cannot resolve or read the file.
+    pub fn read_range_blocking(
+        &self,
+        path: &str,
+        offset: u64,
+        count: u32,
+    ) -> anyhow::Result<(Vec<u8>, bool)> {
+        let (backend, relative) = {
+            let vfs = self
+                .vfs
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (backend, relative) = vfs.resolve(std::path::Path::new(path));
+            (Arc::clone(backend), relative)
+        };
+        tokio::runtime::Handle::current().block_on(async {
+            let entry = backend.metadata(&relative).await?;
+            let data = backend.read_range(&entry, offset, count).await?;
+            let read = u64::try_from(data.len()).unwrap_or(u64::MAX);
+            let eof = entry.size.map_or_else(
+                || read < u64::from(count),
+                |size| offset.saturating_add(read) >= size,
+            );
+            Ok((data, eof))
+        })
+    }
+
     /// Get the root file handle key.
     #[must_use]
     pub const fn root_key(&self) -> u64 {
@@ -183,6 +217,7 @@ impl NfsContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cascade_engine::types::{FileEntry, ItemId};
 
     #[test]
     fn path_to_key_deterministic() {
@@ -212,6 +247,111 @@ mod tests {
         ))));
         let ctx = NfsContext::new(vfs);
         assert_eq!(ctx.lookup_path(ctx.root_key()), Some("/".to_string()));
+    }
+
+    #[derive(Debug)]
+    struct RangeOnlyBackend;
+
+    const RANGE_BODY: &[u8] = b"hello world";
+
+    #[async_trait::async_trait]
+    impl cascade_engine::backend::Backend for RangeOnlyBackend {
+        fn id(&self) -> &'static str {
+            "range"
+        }
+        fn display_name(&self) -> &'static str {
+            "Range"
+        }
+        async fn quota(&self) -> anyhow::Result<Option<cascade_engine::types::Quota>> {
+            Ok(None)
+        }
+        async fn changes(
+            &self,
+            _cursor: Option<&cascade_engine::types::Cursor>,
+        ) -> anyhow::Result<(
+            Vec<cascade_engine::types::Change>,
+            cascade_engine::types::Cursor,
+        )> {
+            Ok((vec![], cascade_engine::types::Cursor("range".to_string())))
+        }
+        async fn metadata(&self, _path: &std::path::Path) -> anyhow::Result<FileEntry> {
+            Ok(FileEntry::file(
+                ItemId::new("range", "f"),
+                ItemId::new("range", "root"),
+                "f.bin".to_string(),
+            )
+            .with_size(Some(RANGE_BODY.len() as u64)))
+        }
+        async fn download(&self, _file: &FileEntry) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("download must not be called for a ranged read")
+        }
+        async fn read_range(
+            &self,
+            _file: &FileEntry,
+            offset: u64,
+            length: u32,
+        ) -> anyhow::Result<Vec<u8>> {
+            let start = usize::try_from(offset)?.min(RANGE_BODY.len());
+            let end = start
+                .saturating_add(usize::try_from(length)?)
+                .min(RANGE_BODY.len());
+            Ok(RANGE_BODY[start..end].to_vec())
+        }
+        async fn upload(
+            &self,
+            _path: &std::path::Path,
+            _data: &[u8],
+            _parent_id: &cascade_engine::types::FileId,
+        ) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("no upload")
+        }
+        async fn update(
+            &self,
+            _file_id: &cascade_engine::types::FileId,
+            _data: &[u8],
+        ) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("no update")
+        }
+        async fn create_dir(&self, _path: &std::path::Path) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("no create_dir")
+        }
+        async fn delete(&self, _file: &FileEntry) -> anyhow::Result<()> {
+            anyhow::bail!("no delete")
+        }
+        async fn move_entry(
+            &self,
+            _src: &std::path::Path,
+            _dst: &std::path::Path,
+        ) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("no move")
+        }
+        async fn poll_interval(&self) -> Option<std::time::Duration> {
+            None
+        }
+    }
+
+    fn range_ctx() -> NfsContext {
+        NfsContext::new(Arc::new(RwLock::new(VfsTree::new(Arc::new(
+            RangeOnlyBackend,
+        )))))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_range_blocking_fetches_only_the_range() {
+        let ctx = range_ctx();
+        let (data, eof) =
+            tokio::task::block_in_place(|| ctx.read_range_blocking("/f.bin", 6, 3)).unwrap();
+        assert_eq!(data, b"wor");
+        assert!(!eof);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_range_blocking_reports_eof_on_final_chunk() {
+        let ctx = range_ctx();
+        let (data, eof) =
+            tokio::task::block_in_place(|| ctx.read_range_blocking("/f.bin", 6, 5)).unwrap();
+        assert_eq!(data, b"world");
+        assert!(eof);
     }
 
     #[test]
