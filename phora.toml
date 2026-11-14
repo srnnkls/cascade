@@ -1,0 +1,44 @@
+version = 1
+
+[sources.rclone]
+git = "https://github.com/rclone/rclone.git"
+
+[sources.mfuse]
+git = "https://github.com/lollipopkit/mfuse.git"
+
+[sources.apple-msdosfs]
+git = "https://github.com/apple-oss-distributions/msdosfs.git"
+
+[sources.apple-smbclient]
+git = "https://github.com/apple-oss-distributions/SMBClient.git"
+
+[sources.apple-copyfile]
+git = "https://github.com/apple-oss-distributions/copyfile.git"
+
+[sources.apple-xnu]
+git = "https://github.com/apple-oss-distributions/xnu.git"
+include = ["bsd/vfs/**", "bsd/sys/**", "bsd/kern/**", "bsd/man/**"]
+
+[sources.fskit-sample]
+git = "https://github.com/KhaosT/FSKitSample.git"
+
+[sources.nextcloud-fileproviderkit]
+git = "https://github.com/nextcloud/NextcloudFileProviderKit.git"
+
+[sources.vaulthalla-desktop]
+git = "https://github.com/valkyrianlabs/vaulthalla-desktop.git"
+
+[targets.resources]
+path = "./resources"
+layout = "by-source"
+
+[targets.resources.sources]
+rclone = { history = true }
+mfuse = { history = true }
+apple-msdosfs = { history = true }
+apple-smbclient = { history = true }
+apple-copyfile = { history = true }
+apple-xnu = {}
+fskit-sample = { history = true }
+nextcloud-fileproviderkit = { history = true }
+vaulthalla-desktop = { history = true }

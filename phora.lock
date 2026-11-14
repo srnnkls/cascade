@@ -1,0 +1,73 @@
+version = 1
+
+[[sources]]
+name = "apple-msdosfs"
+git = "https://github.com/apple-oss-distributions/msdosfs.git"
+resolved = "default"
+commit = "c9f076c4e7c10b4bc3b0177d114aedf1bb8b9109"
+digest = "blake3:dfb47145803f3d8b8fcadadfba209d5cca77e3acec4b9ee4638ebefcde2d5892"
+config_digest = "blake3:7b7015bb92cf0b318037702a6cdd81dee41224f734684c2c122cd6359cb1ee63"
+
+[[sources]]
+name = "nextcloud-fileproviderkit"
+git = "https://github.com/nextcloud/NextcloudFileProviderKit.git"
+resolved = "default"
+commit = "8360eea912b7a87fe7d347a42e59261dc3c56d45"
+digest = "blake3:e37a3f0bf402a61b779775555eccda4d4cd2f84c57275ddd6326297417b4bba2"
+config_digest = "blake3:7b7015bb92cf0b318037702a6cdd81dee41224f734684c2c122cd6359cb1ee63"
+
+[[sources]]
+name = "apple-smbclient"
+git = "https://github.com/apple-oss-distributions/SMBClient.git"
+resolved = "default"
+commit = "99da2d9a4bbe17cde3cee382ad3edc16e25f5535"
+digest = "blake3:1609a2a4e20b65e3b619ddc1a33b5c9230608144e801dee2a427dfcc93174d36"
+config_digest = "blake3:7b7015bb92cf0b318037702a6cdd81dee41224f734684c2c122cd6359cb1ee63"
+
+[[sources]]
+name = "apple-xnu"
+git = "https://github.com/apple-oss-distributions/xnu.git"
+resolved = "default"
+commit = "f6217f891ac0bb64f3d375211650a4c1ff8ca1ea"
+digest = "blake3:b042aacf7950f40a5c26742be8ccefea9c2af25cb85dcf702185587e0d79ccf9"
+config_digest = "blake3:6d30c5dea747532e62eabdbc6ce736d86812100f0bdcf717e9bbd61ddaef6596"
+
+[[sources]]
+name = "vaulthalla-desktop"
+git = "https://github.com/valkyrianlabs/vaulthalla-desktop.git"
+resolved = "default"
+commit = "ec2bcc7b8c22477c1e743fff52d80184976a395e"
+digest = "blake3:5a5207f449dafffe5a1d9e237f9f789ded12ea5327f199544bba7180e0583a4d"
+config_digest = "blake3:7b7015bb92cf0b318037702a6cdd81dee41224f734684c2c122cd6359cb1ee63"
+
+[[sources]]
+name = "apple-copyfile"
+git = "https://github.com/apple-oss-distributions/copyfile.git"
+resolved = "default"
+commit = "9f91eb6ced021952278816cdc76ad68da8631ccb"
+digest = "blake3:f5b69f5da5de5e2f7cbf8c2a4d49ecb1eec35965994aa278e45576496a73c7d4"
+config_digest = "blake3:7b7015bb92cf0b318037702a6cdd81dee41224f734684c2c122cd6359cb1ee63"
+
+[[sources]]
+name = "fskit-sample"
+git = "https://github.com/KhaosT/FSKitSample.git"
+resolved = "default"
+commit = "840af949b8f70c81dca3fb1c14b80a6ac922314c"
+digest = "blake3:70532ff3078824a9af2c230f0bb56f2e9d79f311c115e80ad70c9ecd0e9f9eef"
+config_digest = "blake3:7b7015bb92cf0b318037702a6cdd81dee41224f734684c2c122cd6359cb1ee63"
+
+[[sources]]
+name = "rclone"
+git = "https://github.com/rclone/rclone.git"
+resolved = "default"
+commit = "b0ef5f6a6eca641a6bfb55bc05ef1595f4105d07"
+digest = "blake3:ef2fc3d8804e5b0cb1c415f167542252871d8b85a314cebcb1c9cee350cc8237"
+config_digest = "blake3:7b7015bb92cf0b318037702a6cdd81dee41224f734684c2c122cd6359cb1ee63"
+
+[[sources]]
+name = "mfuse"
+git = "https://github.com/lollipopkit/mfuse.git"
+resolved = "default"
+commit = "776753a83f82486531fe92f6fb03d74c3ed0766e"
+digest = "blake3:2c3cb40d65549571ef5eeade73a45ce88d6214c73c85537b685b9d9f9f5ab4f7"
+config_digest = "blake3:7b7015bb92cf0b318037702a6cdd81dee41224f734684c2c122cd6359cb1ee63"

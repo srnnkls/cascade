@@ -25,3 +25,7 @@ swift/CascadeFileProvideriOS/build/
 swift/CascadeFileProvideriOS/*.xcodeproj/
 swift/CascadeFileProvideriOS/Extension/Sources/cascade_ffi.swift
 swift/CascadeFileProvideriOS/Extension/FFI/cascade_ffiFFI.h
+/resources
+/phora.local.toml
+/phora.local.lock
+/.phora-local
