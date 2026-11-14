@@ -1,0 +1,22 @@
+[package]
+name = "cascade-backend-smb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cascade-engine = { path = "../engine" }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+futures-util = { workspace = true }
+smb = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+
+[lints]
+workspace = true

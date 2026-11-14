@@ -1,0 +1,45 @@
+name: cascade-smb
+
+# Samba share for the live SMB suite:
+#   docker compose -f test/smb/compose.yml up -d --wait
+#   CASCADE_SMB_TEST=127.0.0.1:1445/data/cascade/cascade \
+#     cargo test -p cascade-backend-smb --test smb_live -- --ignored
+
+services:
+  seed:
+    image: busybox:1.37
+    volumes:
+      - share:/storage
+    command:
+      - sh
+      - -c
+      - |
+        mkdir -p /storage/sub
+        printf 'hello from samba\n' > /storage/sub/hello.txt
+        [ -f /storage/big.bin ] || dd if=/dev/urandom of=/storage/big.bin bs=1M count=8
+        chown -R 1000:1000 /storage
+
+  samba:
+    image: dockurr/samba
+    container_name: cascade-smb
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+    environment:
+      NAME: data
+      USER: cascade
+      PASS: cascade
+      UID: "1000"
+      GID: "1000"
+    ports:
+      - "127.0.0.1:1445:445"
+    volumes:
+      - share:/storage
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 445"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+volumes:
+  share:
