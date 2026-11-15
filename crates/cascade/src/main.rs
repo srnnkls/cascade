@@ -14,7 +14,7 @@ use clap::Parser;
 
 fn main() -> Result<()> {
     let args = cli::Cli::parse();
-    let ctx = cli::CliContext::resolve(&args.config)?;
+    let ctx = cli::CliContext::resolve(&args.config, args.app_group.as_deref())?;
 
     // Derive the tracing filter from --quiet / --verbose, unless RUST_LOG is set.
     let filter = if args.quiet {

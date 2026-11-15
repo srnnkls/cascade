@@ -13,15 +13,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(target_os = "macos")]
 use tokio::net::UnixStream;
 
-const SOCKET_RELATIVE_PATH: &str = ".config/cascade/fileprovider.sock";
-
-/// Resolve the default File Provider bridge socket path.
-pub fn default_socket_path() -> Result<PathBuf> {
-    let home =
-        std::env::var_os("HOME").context("HOME is required to locate the File Provider socket")?;
-    Ok(PathBuf::from(home).join(SOCKET_RELATIVE_PATH))
-}
-
 /// Client for the Swift File Provider extension bridge.
 #[derive(Debug)]
 pub struct FileProviderBridge {
@@ -35,10 +26,6 @@ impl FileProviderBridge {
             socket_path: socket_path.into(),
             next_id: AtomicU32::new(1),
         }
-    }
-
-    pub fn from_default_socket() -> Result<Self> {
-        Ok(Self::new(default_socket_path()?))
     }
 
     pub fn socket_path(&self) -> &Path {

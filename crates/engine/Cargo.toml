@@ -19,6 +19,7 @@ reqwest = { workspace = true, optional = true }
 cascade-p2p = { path = "../p2p", optional = true }
 data-encoding.workspace = true
 sha2 = { workspace = true }
+reflink-copy = { workspace = true, optional = true }
 cascade-exec = { version = "0.1.141", path = "../exec", optional = true }
 
 [features]
@@ -29,7 +30,7 @@ cascade-exec = { version = "0.1.141", path = "../exec", optional = true }
 # build drops it (`--no-default-features --features portable`) and supplies its
 # own adapters behind the same contracts.
 default = ["native", "p2p", "exec"]
-native = ["dep:tokio", "dep:rusqlite", "dep:reqwest"]
+native = ["dep:tokio", "dep:rusqlite", "dep:reqwest", "dep:reflink-copy"]
 # `p2p` pulls in the P2P block-sharing engine (cascade-p2p), the management-plane
 # dispatch and signed capability tokens, and the p2p_bridge module. The ring C
 # crate inside cascade-p2p does not compile to wasm32, so a WASM build drops this

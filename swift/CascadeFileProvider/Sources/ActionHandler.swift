@@ -3,7 +3,7 @@ import FileProvider
 import Foundation
 import os
 
-private let cascadeSocketPath = "\(NSHomeDirectory())/.config/cascade/fileprovider.sock"
+private let cascadeSocketPath = "\(NSHomeDirectory())/.config/cascade/fp.sock"
 private let rootIdentifier = "root"
 
 private let actionLogger = Logger(subsystem: "com.cascade.fileprovider", category: "ActionHandler")

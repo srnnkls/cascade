@@ -9,7 +9,7 @@ impl SchemaVersion {
     /// Current schema version.
     #[must_use]
     pub const fn current() -> Self {
-        Self(8)
+        Self(9)
     }
 }
 
@@ -38,6 +38,9 @@ pub fn migrate(conn: &Connection, from: SchemaVersion, _to: SchemaVersion) -> Re
     }
     if from < SchemaVersion(8) {
         v8_exec_sessions(conn)?;
+    }
+    if from < SchemaVersion(9) {
+        v9_replica_and_content(conn)?;
     }
 
     Ok(())
@@ -383,6 +386,103 @@ fn v8_exec_sessions(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_exec_sessions_owner ON exec_sessions(owner_device);
         CREATE INDEX IF NOT EXISTS idx_exec_sessions_live ON exec_sessions(ended_at);
+        ",
+    )?;
+
+    Ok(())
+}
+
+/// Schema v9 -- revisioned replica and content cache index.
+///
+/// `replica_items` maps a daemon-assigned `uid` to the backend's stable id and
+/// keeps the last remote revision seen (`remote_size`, `remote_mtime`,
+/// `remote_ctime`) beside the presented attributes. `replica_tombstones` and
+/// the single-row `replica_meta` back change enumeration from a sync anchor.
+///
+/// `content_objects` holds one cached sparse file per row with its
+/// `source_revision` (`source_*` columns) and write-back state; the upload's
+/// temporary name and file id are recorded before the rename so a restart
+/// recognises a finished rename. `content_ranges` is the authority for the
+/// fetched byte ranges of an object, kept merged. `materialized_items` is the
+/// set of items the system reports as on disk. Times are nanoseconds since the
+/// Unix epoch.
+fn v9_replica_and_content(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS replica_items (
+            uid               INTEGER PRIMARY KEY,
+            backend_id        TEXT NOT NULL,
+            stable_id         TEXT NOT NULL,
+            native_id         TEXT NOT NULL,
+            parent_uid        INTEGER,
+            name              TEXT NOT NULL,
+            kind              TEXT NOT NULL,
+            size              INTEGER,
+            btime             INTEGER,
+            mtime             INTEGER,
+            ctime             INTEGER,
+            remote_size       INTEGER,
+            remote_mtime      INTEGER,
+            remote_ctime      INTEGER,
+            content_version   TEXT NOT NULL,
+            metadata_version  TEXT NOT NULL,
+            uploaded          BOOLEAN NOT NULL DEFAULT TRUE,
+            listed_at         INTEGER,
+            pinned            BOOLEAN NOT NULL DEFAULT FALSE,
+            revision          INTEGER NOT NULL,
+            UNIQUE (backend_id, stable_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_replica_items_parent ON replica_items(parent_uid, name);
+        CREATE INDEX IF NOT EXISTS idx_replica_items_revision ON replica_items(revision);
+
+        CREATE TABLE IF NOT EXISTS replica_tombstones (
+            uid           INTEGER PRIMARY KEY,
+            parent_uid    INTEGER,
+            revision      INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_replica_tombstones_revision ON replica_tombstones(revision);
+
+        CREATE TABLE IF NOT EXISTS replica_meta (
+            id            INTEGER PRIMARY KEY CHECK (id = 1),
+            store_id      TEXT NOT NULL,
+            revision      INTEGER NOT NULL DEFAULT 0,
+            floor         INTEGER NOT NULL DEFAULT 0
+        );
+
+        INSERT OR IGNORE INTO replica_meta (id, store_id) VALUES (1, lower(hex(randomblob(16))));
+
+        CREATE TABLE IF NOT EXISTS content_objects (
+            object_id         INTEGER PRIMARY KEY,
+            uid               INTEGER NOT NULL,
+            content_version   TEXT NOT NULL,
+            source_stable_id  TEXT NOT NULL,
+            source_size       INTEGER,
+            source_mtime      INTEGER,
+            source_ctime      INTEGER,
+            size              INTEGER NOT NULL,
+            cache_path        TEXT NOT NULL,
+            state             TEXT NOT NULL DEFAULT 'partial',
+            dirty             BOOLEAN NOT NULL DEFAULT FALSE,
+            upload_temp_name  TEXT,
+            upload_file_id    TEXT,
+            last_access       INTEGER
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_content_objects_uid ON content_objects(uid);
+        CREATE INDEX IF NOT EXISTS idx_content_objects_last_access ON content_objects(last_access);
+
+        CREATE TABLE IF NOT EXISTS content_ranges (
+            object_id     INTEGER NOT NULL REFERENCES content_objects(object_id) ON DELETE CASCADE,
+            start         INTEGER NOT NULL,
+            end           INTEGER NOT NULL,
+            PRIMARY KEY (object_id, start)
+        );
+
+        CREATE TABLE IF NOT EXISTS materialized_items (
+            uid           INTEGER PRIMARY KEY
+        );
         ",
     )?;
 

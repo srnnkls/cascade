@@ -5,6 +5,7 @@ pub mod files;
 pub mod grant;
 pub mod init;
 pub mod mount;
+pub mod paths;
 /// Engine-backed `ContentProvider` for the Windows `ProjFS` presenter.
 /// Only the Windows daemon wires it up in production, so the module is
 /// Windows-gated — but it is plain cross-platform Rust, so it is also
@@ -18,7 +19,7 @@ pub mod status;
 pub mod token;
 pub mod tui;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
@@ -43,28 +44,24 @@ pub struct CliContext {
 }
 
 impl CliContext {
-    /// Resolve paths from the `--config` flag value.
-    ///
-    /// The `config_flag` is the raw string from `--config` (may contain `~`).
-    /// If it points to a file, its parent directory is used as the config dir.
-    /// If it points to a directory, that directory is used directly.
-    pub fn resolve(config_flag: &str) -> Result<Self> {
-        let expanded = shellexpand::tilde(config_flag).to_string();
-        let path = PathBuf::from(expanded);
-
-        let config_dir = if path.is_file() {
-            path.parent()
-                .context("--config path has no parent directory")?
-                .to_path_buf()
-        } else {
-            path
-        };
-
+    /// Resolve paths from the `--config` and `--app-group` flag values.
+    pub fn resolve(config_flag: &str, app_group: Option<&Path>) -> Result<Self> {
+        let paths = paths::AppPaths::resolve(config_flag, app_group)?;
         Ok(Self {
-            db_path: config_dir.join("state.db"),
-            pid_path: config_dir.join("cascade.pid"),
-            config_dir,
+            config_dir: paths.config_dir,
+            db_path: paths.db_path,
+            pid_path: paths.pid_path,
         })
+    }
+
+    /// The full path layout of this context; state, cache, staging and the
+    /// socket share the directory of the state database.
+    pub fn app_paths(&self) -> Result<paths::AppPaths> {
+        let state_dir = self
+            .db_path
+            .parent()
+            .context("state database path has no parent directory")?;
+        Ok(paths::AppPaths::in_dirs(self.config_dir.clone(), state_dir))
     }
 }
 
@@ -114,6 +111,10 @@ pub struct Cli {
     /// Config directory path (or path to config.toml)
     #[arg(long, global = true, default_value = "~/.config/cascade")]
     pub config: String,
+
+    /// App Group container holding state, cache, staging and the File Provider socket
+    #[arg(long, global = true)]
+    pub app_group: Option<PathBuf>,
 
     /// Increase verbosity (-v = debug, -vv = trace)
     #[arg(long, short, global = true, action = clap::ArgAction::Count)]
@@ -228,7 +229,7 @@ pub enum Commands {
         /// Serve the macOS File Provider RPC bridge instead of `FSKit`.
         ///
         /// Stands up the File Provider Unix-socket server that the Swift
-        /// extension connects to (`~/.config/cascade/fileprovider.sock`) and
+        /// extension connects to (`fp.sock` under `--app-group` or `--config`) and
         /// drives the sync runner to populate the state DB and change feed.
         /// The Swift host app must be built, codesigned, and have registered
         /// its File Provider domain separately — see
@@ -1125,6 +1126,20 @@ mod tests {
                 device_id, command, ..
             } => (device_id, command.into_remote_command().unwrap()),
             _ => panic!("expected a remote subcommand"),
+        }
+    }
+
+    #[test]
+    fn app_paths_round_trips_the_resolved_layout() {
+        let group = Path::new("/nonexistent/group-container");
+
+        for app_group in [None, Some(group)] {
+            let ctx = CliContext::resolve("/nonexistent/cascade-config", app_group).unwrap();
+
+            assert_eq!(
+                ctx.app_paths().unwrap(),
+                paths::AppPaths::resolve("/nonexistent/cascade-config", app_group).unwrap()
+            );
         }
     }
 

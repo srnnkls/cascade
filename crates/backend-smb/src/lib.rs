@@ -15,7 +15,7 @@
 
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -25,48 +25,22 @@ use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use smb::binrw_util::file_time::FileTime;
 use smb::{
-    Client, ClientConfig, ConnectionConfig, DirAccessMask, Directory, FileAccessMask,
-    FileCreateArgs, FileFullDirectoryInformation, FileNetworkOpenInformation, ReadAt, Resource,
-    UncPath,
+    Client, DirAccessMask, Directory, File, FileAccessMask, FileCreateArgs,
+    FileFullDirectoryInformation, FileNetworkOpenInformation, ReadAt, Resource, UncPath,
 };
-use tokio::sync::OnceCell;
+
+mod client;
+mod config;
+
+use client::{MAX_REQUEST, REQUEST_DEADLINE, SmbClient};
+
+/// A file handle and the client it was opened on.
+type OpenFile = (Arc<Client>, Arc<File>);
+pub use config::SmbConfig;
+use config::parse_smb_config;
 
 /// Native id of the share root.
 const ROOT_ID: &str = "/";
-
-/// Upper bound on a single `read_at` request when draining a whole file.
-const DOWNLOAD_CHUNK: usize = 1024 * 1024;
-
-// ── Config ───────────────────────────────────────────────────────────────────
-
-/// Configuration for an SMB backend.
-#[derive(Clone)]
-pub struct SmbConfig {
-    /// Server host name or address.
-    pub host: String,
-    /// Share name on the server.
-    pub share: String,
-    /// TCP port; `None` uses the SMB default (445).
-    pub port: Option<u16>,
-    /// User name for NTLM authentication.
-    pub username: String,
-    /// Password for NTLM authentication.
-    pub password: String,
-    /// Optional sub-directory of the share to serve (no leading or trailing slash).
-    pub prefix: Option<String>,
-}
-
-impl std::fmt::Debug for SmbConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SmbConfig")
-            .field("host", &self.host)
-            .field("share", &self.share)
-            .field("port", &self.port)
-            .field("username", &self.username)
-            .field("prefix", &self.prefix)
-            .finish_non_exhaustive()
-    }
-}
 
 // ── Backend struct ───────────────────────────────────────────────────────────
 
@@ -76,7 +50,7 @@ pub struct SmbBackend {
     backend_id: String,
     display_name: String,
     share_path: UncPath,
-    client: OnceCell<Client>,
+    client: SmbClient,
 }
 
 impl std::fmt::Debug for SmbBackend {
@@ -112,37 +86,6 @@ pub fn create_backend(config: &toml::Value) -> anyhow::Result<Box<dyn Backend>> 
         .unwrap_or("smb")
         .to_string();
     Ok(Box::new(SmbBackend::new(smb_config, backend_id)?))
-}
-
-fn parse_smb_config(config: &toml::Value) -> anyhow::Result<SmbConfig> {
-    let get_str = |key: &str| -> anyhow::Result<String> {
-        config
-            .get(key)
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .ok_or_else(|| anyhow::anyhow!("SMB backend requires '{key}' config"))
-    };
-
-    let port = config
-        .get("port")
-        .and_then(toml::Value::as_integer)
-        .map(u16::try_from)
-        .transpose()
-        .map_err(|_| anyhow::anyhow!("SMB backend 'port' must be between 0 and 65535"))?;
-
-    Ok(SmbConfig {
-        host: get_str("host")?,
-        share: get_str("share")?,
-        port,
-        username: get_str("username")?,
-        password: get_str("password")?,
-        prefix: config
-            .get("prefix")
-            .and_then(|v| v.as_str())
-            .map(|s| s.trim_matches('/'))
-            .filter(|s| !s.is_empty())
-            .map(String::from),
-    })
 }
 
 // ── Path mapping ─────────────────────────────────────────────────────────────
@@ -196,36 +139,12 @@ impl SmbBackend {
             .map_err(|e| anyhow::anyhow!("invalid SMB share path {unc}: {e}"))?;
         let display_name = format!("{}/{}", config.host, config.share);
         Ok(Self {
+            client: SmbClient::new(config.clone(), share_path.clone()),
             config,
             backend_id,
             display_name,
             share_path,
-            client: OnceCell::new(),
         })
-    }
-
-    async fn client(&self) -> anyhow::Result<&Client> {
-        self.client
-            .get_or_try_init(|| async {
-                let client = Client::new(ClientConfig {
-                    dfs: false,
-                    connection: ConnectionConfig {
-                        port: self.config.port,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                });
-                client
-                    .share_connect(
-                        &self.share_path,
-                        &self.config.username,
-                        self.config.password.clone(),
-                    )
-                    .await?;
-                tracing::debug!(share = %self.display_name, "connected to SMB share");
-                anyhow::Ok(client)
-            })
-            .await
     }
 
     /// UNC path of the item with the given native id.
@@ -239,8 +158,12 @@ impl SmbBackend {
         self.share_path.clone().with_path(&full.replace('/', "\\"))
     }
 
-    async fn open(&self, native_id: &str, access: FileAccessMask) -> anyhow::Result<Resource> {
-        let client = self.client().await?;
+    async fn open(
+        &self,
+        client: &Client,
+        native_id: &str,
+        access: FileAccessMask,
+    ) -> anyhow::Result<Resource> {
         let resource = client
             .create_file(
                 &self.unc_for(native_id),
@@ -273,11 +196,21 @@ impl SmbBackend {
     }
 
     async fn list_dir(&self, native_id: &str) -> anyhow::Result<Vec<FileEntry>> {
+        self.client
+            .run(|client| async move { self.list_dir_on(&client, native_id).await })
+            .await
+    }
+
+    async fn list_dir_on(
+        &self,
+        client: &Client,
+        native_id: &str,
+    ) -> anyhow::Result<Vec<FileEntry>> {
         let access = DirAccessMask::new()
             .with_list_directory(true)
             .with_synchronize(true)
             .into();
-        let Resource::Directory(dir) = self.open(native_id, access).await? else {
+        let Resource::Directory(dir) = self.open(client, native_id, access).await? else {
             anyhow::bail!("SMB path {native_id} is not a directory");
         };
         let dir = Arc::new(dir);
@@ -300,6 +233,78 @@ impl SmbBackend {
         }
         dir.close().await?;
         Ok(entries)
+    }
+
+    /// Read `length` bytes at `offset`, or to the end of the file when `None`,
+    /// in requests of at most [`MAX_REQUEST`] on one handle reopened after a reconnect.
+    async fn read(
+        &self,
+        native_id: &str,
+        offset: u64,
+        length: Option<usize>,
+    ) -> anyhow::Result<Vec<u8>> {
+        let handle = std::sync::Mutex::new(None);
+        let mut data = Vec::new();
+        let result = loop {
+            let want = length.map_or(MAX_REQUEST, |l| {
+                l.saturating_sub(data.len()).min(MAX_REQUEST)
+            });
+            if want == 0 {
+                break Ok(());
+            }
+            let at = offset.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
+            let handle = &handle;
+            let read = self
+                .client
+                .run(move |client| async move {
+                    let file = self.file_on(handle, &client, native_id).await?;
+                    let mut chunk = vec![0u8; want];
+                    let n = file.read_at(&mut chunk, at).await?;
+                    chunk.truncate(n);
+                    Ok(chunk)
+                })
+                .await;
+            match read {
+                Ok(chunk) if chunk.is_empty() => break Ok(()),
+                Ok(chunk) => data.extend_from_slice(&chunk),
+                Err(e) => break Err(e),
+            }
+        };
+        let open = handle.into_inner().unwrap_or_else(PoisonError::into_inner);
+        if let Some((_, file)) = open {
+            match tokio::time::timeout(REQUEST_DEADLINE, file.close()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::debug!(native_id, error = %e, "closing SMB file failed"),
+                Err(_) => tracing::debug!(native_id, "closing SMB file timed out"),
+            }
+        }
+        result.map(|()| data)
+    }
+
+    /// The open file in `handle` when it belongs to `client`, otherwise a newly opened one.
+    async fn file_on(
+        &self,
+        handle: &std::sync::Mutex<Option<OpenFile>>,
+        client: &Arc<Client>,
+        native_id: &str,
+    ) -> anyhow::Result<Arc<File>> {
+        let reusable = handle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .filter(|(owner, _)| Arc::ptr_eq(owner, client))
+            .map(|(_, file)| Arc::clone(file));
+        if let Some(file) = reusable {
+            return Ok(file);
+        }
+        let access = FileAccessMask::new().with_generic_read(true);
+        let Resource::File(file) = self.open(client, native_id, access).await? else {
+            anyhow::bail!("SMB path {native_id} is not a file");
+        };
+        let file = Arc::new(file);
+        *handle.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some((Arc::clone(client), Arc::clone(&file)));
+        Ok(file)
     }
 
     /// Every entry under the share, parents before children.
@@ -355,25 +360,30 @@ impl Backend for SmbBackend {
     }
 
     async fn metadata(&self, path: &Path) -> anyhow::Result<FileEntry> {
-        let native_id = native_id_for_path(path);
+        let native_id = &native_id_for_path(path);
         let access = FileAccessMask::new()
             .with_file_read_attributes(true)
             .with_synchronize(true);
-        let (info, is_dir) = match self.open(&native_id, access).await? {
-            Resource::File(file) => {
-                let info = file.query_info::<FileNetworkOpenInformation>().await;
-                file.close().await?;
-                (info?, false)
-            }
-            Resource::Directory(dir) => {
-                let info = dir.query_info::<FileNetworkOpenInformation>().await;
-                dir.close().await?;
-                (info?, true)
-            }
-            Resource::Pipe(_) => anyhow::bail!("SMB path {native_id} is a pipe"),
-        };
+        let (info, is_dir) = self
+            .client
+            .run(|client| async move {
+                match self.open(&client, native_id, access).await? {
+                    Resource::File(file) => {
+                        let info = file.query_info::<FileNetworkOpenInformation>().await;
+                        file.close().await?;
+                        Ok((info?, false))
+                    }
+                    Resource::Directory(dir) => {
+                        let info = dir.query_info::<FileNetworkOpenInformation>().await;
+                        dir.close().await?;
+                        Ok((info?, true))
+                    }
+                    Resource::Pipe(_) => anyhow::bail!("SMB path {native_id} is a pipe"),
+                }
+            })
+            .await?;
         Ok(self.entry_for(
-            &native_id,
+            native_id,
             is_dir,
             info.end_of_file,
             file_time_to_utc(info.last_write_time),
@@ -381,26 +391,7 @@ impl Backend for SmbBackend {
     }
 
     async fn download(&self, file: &FileEntry) -> anyhow::Result<Vec<u8>> {
-        let native_id = file.id.native_id();
-        let Resource::File(handle) = self
-            .open(native_id, FileAccessMask::new().with_generic_read(true))
-            .await?
-        else {
-            anyhow::bail!("SMB path {native_id} is not a file");
-        };
-        let mut data = Vec::new();
-        let mut chunk = vec![0u8; DOWNLOAD_CHUNK];
-        let result = loop {
-            let offset = u64::try_from(data.len()).unwrap_or(u64::MAX);
-            match handle.read_at(&mut chunk, offset).await {
-                Ok(0) => break Ok(()),
-                Ok(n) => data.extend_from_slice(chunk.get(..n).unwrap_or_default()),
-                Err(e) => break Err(e),
-            }
-        };
-        handle.close().await?;
-        result?;
-        Ok(data)
+        self.read(file.id.native_id(), 0, None).await
     }
 
     async fn read_range(
@@ -409,36 +400,8 @@ impl Backend for SmbBackend {
         offset: u64,
         length: u32,
     ) -> anyhow::Result<Vec<u8>> {
-        if length == 0 {
-            return Ok(Vec::new());
-        }
-        let native_id = file.id.native_id();
-        let Resource::File(handle) = self
-            .open(native_id, FileAccessMask::new().with_generic_read(true))
-            .await?
-        else {
-            anyhow::bail!("SMB path {native_id} is not a file");
-        };
-        let mut buf = vec![0u8; usize::try_from(length).unwrap_or(usize::MAX)];
-        let mut filled = 0;
-        let result = loop {
-            let Some(rest) = buf.get_mut(filled..) else {
-                break Ok(());
-            };
-            if rest.is_empty() {
-                break Ok(());
-            }
-            let at = offset.saturating_add(u64::try_from(filled).unwrap_or(u64::MAX));
-            match handle.read_at(rest, at).await {
-                Ok(0) => break Ok(()),
-                Ok(n) => filled += n,
-                Err(e) => break Err(e),
-            }
-        };
-        handle.close().await?;
-        result?;
-        buf.truncate(filled);
-        Ok(buf)
+        let length = usize::try_from(length).unwrap_or(usize::MAX);
+        self.read(file.id.native_id(), offset, Some(length)).await
     }
 
     async fn upload(

@@ -53,13 +53,6 @@ impl FileProviderPresenter {
         }
     }
 
-    pub fn from_default_socket() -> Result<Self> {
-        Ok(Self {
-            bridge: FileProviderBridge::from_default_socket()?,
-            mount_point: PathBuf::from("/Volumes/Cascade"),
-        })
-    }
-
     pub fn with_mount_point(mut self, mount_point: impl Into<PathBuf>) -> Self {
         self.mount_point = mount_point.into();
         self

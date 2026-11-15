@@ -116,6 +116,9 @@ web-sys = "0.3"
 # OS process management (Unix-only)
 nix = { version = "0.31", features = ["signal", "process"] }
 
+# Copy-on-write clones with an explicit copy fallback (engine content cache)
+reflink-copy = "0.1"
+
 # Platform config / cache paths
 dirs = "6"
 

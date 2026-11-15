@@ -130,7 +130,7 @@ domain is registered (step 5). The daemon prints the RPC socket path on startup.
 Confirm the socket exists before continuing:
 
 ```bash
-ls -l ~/.config/cascade/fileprovider.sock
+ls -l ~/.config/cascade/fp.sock
 ```
 
 If the socket is missing, the daemon did not start the File Provider server — check that
@@ -403,7 +403,7 @@ CascadeFileProviderHost.app/Contents/PlugIns/CascadeFileProvider.appex
 
 **Finder shows "Unable to connect"** or the extension crashes immediately after
 registration. The daemon is not running or the socket does not exist. Run
-`./target/release/cascade start` and confirm `~/.config/cascade/fileprovider.sock`
+`./target/release/cascade start` and confirm `~/.config/cascade/fp.sock`
 exists before clicking Register.
 
 **enumerateChanges never fires.** The system only calls `enumerateChanges` when it

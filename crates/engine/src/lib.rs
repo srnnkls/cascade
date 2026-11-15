@@ -23,6 +23,8 @@ pub mod cache;
 #[cfg(any(feature = "native", feature = "portable"))]
 pub mod changefeed;
 pub mod config;
+#[cfg(feature = "native")]
+pub mod content;
 pub mod db;
 // The engine owns the cache manager and sync runner (daemon-level concerns) as
 // fields, so it shares their compilation gate: native, or a non-wasm32 portable

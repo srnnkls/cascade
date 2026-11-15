@@ -786,6 +786,7 @@ dependencies = [
  "data-encoding",
  "js-sys",
  "num-traits",
+ "reflink-copy",
  "reqwest",
  "rusqlite",
  "serde",
@@ -4008,6 +4009,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "reflink-copy"
+version = "0.1.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20d23b61573e4e96a48e3196327eedc4d50e30ba1ea1eae3f08187b44542e642"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "rustix",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -68,7 +68,7 @@ impl VfsPresenter for NoopPresenter {
 /// Try to serve the macOS File Provider RPC bridge.
 ///
 /// Unlike `FSKit`, the daemon does not mount anything here. It stands up the
-/// Unix-socket server (`~/.config/cascade/fileprovider.sock`) that the
+/// Unix-socket server (`fp.sock` in the App Group container or config directory) that the
 /// Swift `CascadeFileProvider` extension connects to per request, and runs
 /// the sync runner so the state database and the engine's change feed stay
 /// populated. The extension surfaces the tree in Finder once its File
@@ -115,19 +115,18 @@ pub(super) async fn try_fileprovider(
 
     // The File Provider RPC server answers inbound queries from the Swift
     // extension against the engine's live VFS, state DB, cache directory,
-    // and change feed. The cache directory is a sibling of the state DB
-    // under the config root.
-    let cache_dir = ctx.config_dir.join("cache");
-    ensure_directory(&cache_dir, "File Provider cache directory")?;
+    // and change feed.
+    let paths = ctx.app_paths().context("resolve File Provider paths")?;
+    let socket_path = paths.bindable_socket_path()?.to_path_buf();
+    ensure_directory(&paths.cache_dir, "File Provider cache directory")?;
+    ensure_directory(&paths.staging_dir, "File Provider staging directory")?;
     let handlers = Arc::new(EngineHandlers::new(
         engine.vfs().clone(),
         engine.db().clone(),
-        cache_dir,
+        paths.cache_dir,
         engine.change_feed(),
     ));
 
-    let socket_path = cascade_presenter_fileprovider::bridge::default_socket_path()
-        .context("resolve File Provider socket path")?;
     let server = Arc::new(FileProviderServer::new(socket_path.clone(), handlers));
 
     // Cancellation channel for the server task; signalled on Ctrl+C below.

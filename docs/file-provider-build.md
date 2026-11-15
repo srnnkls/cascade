@@ -112,7 +112,7 @@ The App Group `group.io.cascade.shared` must be provisioned for the team beforeh
 
 There is no C ABI / FFI surface. The bridge is a Unix domain socket using Cascade's length-prefixed JSON protocol (`cascade_engine::protocol::{Request, Response}` with `encode_message`). Source: `crates/presenter-fileprovider/src/bridge.rs`.
 
-The default socket path resolves to `$HOME/.config/cascade/fileprovider.sock`. The Rust `FileProviderPresenter` pushes these notifications to Swift:
+The default socket path resolves to `$HOME/.config/cascade/fp.sock`. The Rust `FileProviderPresenter` pushes these notifications to Swift:
 
 - `upsertItem({ item })`
 - `deleteItem({ id })`
