@@ -207,6 +207,28 @@ impl FileEntry {
     }
 }
 
+/// The backend-reported state of an item that identifies a version of its
+/// content: a stable id that survives renames, and the size and timestamps a
+/// rescan compares to detect a change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Revision {
+    pub stable_id: String,
+    pub size: Option<u64>,
+    pub last_write_time: Option<DateTime<Utc>>,
+    pub change_time: Option<DateTime<Utc>>,
+}
+
+impl From<&FileEntry> for Revision {
+    fn from(entry: &FileEntry) -> Self {
+        Self {
+            stable_id: entry.id.native_id().to_string(),
+            size: entry.size,
+            last_write_time: entry.mod_time,
+            change_time: None,
+        }
+    }
+}
+
 /// A change event from a backend.
 #[derive(Debug, Clone)]
 pub enum Change {

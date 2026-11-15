@@ -8,7 +8,7 @@ use async_trait::async_trait;
 
 #[cfg(feature = "p2p")]
 use crate::manage::{DataAuthority, ManageDispatch};
-use crate::types::{Change, Cursor, FileEntry, FileId, Quota};
+use crate::types::{Change, Cursor, FileEntry, FileId, Quota, Revision};
 
 /// A backend-level error category that presenters can map to specific
 /// HTTP status codes (or equivalent OS error codes for FUSE/File Provider).
@@ -33,6 +33,25 @@ pub enum BackendError {
     /// The operation conflicts with the current state (e.g. name taken).
     #[error("conflict: {0}")]
     Conflict(String),
+}
+
+/// A failure that is expected to clear on retry. Backends wrap it in
+/// `anyhow::Error` like [`BackendError`]; callers recover it by downcast.
+#[derive(Debug, thiserror::Error)]
+pub enum TransientError {
+    /// The server cannot be reached.
+    #[error("unreachable: {0}")]
+    Unreachable(String),
+    /// The target is held open elsewhere.
+    #[error("busy: {0}")]
+    Busy(String),
+}
+
+async fn read_local_file(local: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(feature = "native")]
+    return tokio::fs::read(local).await;
+    #[cfg(not(feature = "native"))]
+    return std::fs::read(local);
 }
 
 // Note: Box<dyn Backend> is the owned concrete return type from create_backend.
@@ -165,6 +184,62 @@ pub trait Backend: Send + Sync {
     /// Returns an empty vec for backends that don't support this.
     async fn list_children(&self, _parent_native_id: &str) -> anyhow::Result<Vec<FileEntry>> {
         Ok(vec![])
+    }
+
+    /// The revision of `entry`. The default derives it from the entry's id,
+    /// size and modification time.
+    async fn revision(&self, entry: &FileEntry) -> anyhow::Result<Revision> {
+        Ok(Revision::from(entry))
+    }
+
+    /// List immediate children of a directory with the revision of each.
+    async fn list_children_with_revisions(
+        &self,
+        parent_native_id: &str,
+    ) -> anyhow::Result<Vec<(FileEntry, Revision)>> {
+        let children = self.list_children(parent_native_id).await?;
+        let mut listed = Vec::with_capacity(children.len());
+        for entry in children {
+            let revision = self.revision(&entry).await?;
+            listed.push((entry, revision));
+        }
+        Ok(listed)
+    }
+
+    /// Upload a new file from the contents of the local file at `local`.
+    /// The default reads the whole file and calls [`Backend::upload`].
+    async fn upload_from_path(
+        &self,
+        path: &Path,
+        local: &Path,
+        parent_id: &FileId,
+    ) -> anyhow::Result<FileEntry> {
+        let data = read_local_file(local).await?;
+        self.upload(path, &data, parent_id).await
+    }
+
+    /// Overwrite an existing file with the contents of the local file at
+    /// `local`. The default reads the whole file and calls [`Backend::update`].
+    async fn update_from_path(&self, file_id: &FileId, local: &Path) -> anyhow::Result<FileEntry> {
+        let data = read_local_file(local).await?;
+        self.update(file_id, &data).await
+    }
+
+    /// Rename the file at `source` over `target`, returning the renamed entry
+    /// with its revision. The default deletes an existing target and then
+    /// moves the source; a failed delete leaves the source in place. A
+    /// [`TransientError`] from the target lookup is returned; any other lookup
+    /// error is taken as an absent target, and `move_entry` reports a real
+    /// collision itself.
+    async fn replace(&self, source: &Path, target: &Path) -> anyhow::Result<(FileEntry, Revision)> {
+        match self.metadata(target).await {
+            Ok(existing) => self.delete(&existing).await?,
+            Err(err) if err.downcast_ref::<TransientError>().is_some() => return Err(err),
+            Err(_) => {}
+        }
+        let entry = self.move_entry(source, target).await?;
+        let revision = self.revision(&entry).await?;
+        Ok((entry, revision))
     }
 
     /// Whether `native_id` names one of this backend's top-level root
