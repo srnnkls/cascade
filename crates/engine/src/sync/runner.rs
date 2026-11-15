@@ -745,7 +745,7 @@ impl<R: RuntimeHandle> SyncRunner<R> {
             // The neutral root's child: the synthetic mount-point directory.
             // Inject it exactly once per top-level mount so the mount point shows
             // on a cold start regardless of content.
-            if let Some(mount_dir) = mount_point_item(&mounted.mount_prefix, &root_id) {
+            if let Some(mount_dir) = crate::vfs::mount_point_item(&mounted.mount_prefix, &root_id) {
                 if let Err(e) = self.presenter.upsert_item(mount_dir).await {
                     tracing::debug!(prefix = %mounted.mount_prefix.display(), error = %e, "failed to hydrate mount point");
                 } else {
@@ -756,45 +756,6 @@ impl<R: RuntimeHandle> SyncRunner<R> {
         tracing::info!(count = total, "presenter hydrated from DB");
         Ok(())
     }
-}
-
-/// Build the synthetic mount-point directory a top-level mount contributes to
-/// the neutral root, or `None` when the mount contributes no such directory.
-///
-/// A mount-point directory exists only for a backend mounted directly beneath
-/// the neutral root — a single-segment prefix such as `personal`. Its
-/// `parent_id` is the neutral root's container so presenters list it under the
-/// absolute root; its `id` is the backend's root container so a request that
-/// descends into it routes straight to the owning backend; and its `path` is the
-/// mount prefix itself.
-///
-/// Returns `None` for:
-/// - the empty prefix (a backend mounted at `/`), which *is* the root rather
-///   than a directory under it, so it injects nothing; and
-/// - a multi-segment prefix (a nested mount), whose mount-point directory is a
-///   child of another backend's subtree — [`VfsTree::read_dir`](crate::vfs::VfsTree::read_dir) injects that one
-///   lazily into the parent backend's listing, so eager hydration must not also
-///   surface it under the neutral root.
-fn mount_point_item(prefix: &Path, root_id: &ItemId) -> Option<VfsItem> {
-    let mut components = prefix.components();
-    let first = components.next()?;
-    // A nested mount has a further component beyond the first; its mount-point
-    // directory belongs to the parent backend's subtree, not the neutral root.
-    if components.next().is_some() {
-        return None;
-    }
-    let name = first.as_os_str().to_string_lossy().into_owned();
-    Some(VfsItem {
-        id: root_id.clone(),
-        parent_id: crate::vfs::neutral_root_item_id(),
-        name,
-        path: prefix.to_string_lossy().into_owned(),
-        is_dir: true,
-        size: None,
-        mod_time: None,
-        cache_state: CacheState::Online,
-        mime_type: None,
-    })
 }
 
 /// Match a glob pattern against a path string.

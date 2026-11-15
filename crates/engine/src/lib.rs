@@ -35,6 +35,7 @@ pub mod db;
     all(feature = "portable", not(target_arch = "wasm32"))
 ))]
 pub mod engine;
+pub mod loom_sync;
 pub mod manage;
 #[cfg(feature = "p2p")]
 pub mod p2p_bridge;
@@ -47,6 +48,8 @@ pub mod protocol;
     all(feature = "portable", not(target_arch = "wasm32"))
 ))]
 pub mod sync;
+#[cfg(feature = "native")]
+pub mod testing;
 pub mod types;
 #[cfg(any(feature = "native", feature = "portable"))]
 pub mod vfs;

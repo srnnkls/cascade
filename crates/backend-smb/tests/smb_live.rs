@@ -7,8 +7,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use cascade_engine::backend::{Backend, TransientError};
-use cascade_engine::types::Change;
+use cascade_engine::backend::{Backend, BackendError, TransientError};
+use cascade_engine::types::{Change, FileEntry, Revision};
+use chrono::{DateTime, TimeZone, Utc};
 use tokio::sync::RwLock;
 
 const CONTAINER: &str = "cascade-smb";
@@ -99,6 +100,182 @@ async fn wait_healthy() {
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+/// Runs `script` in the share root as the share's owner, outside SMB.
+async fn on_share(script: &str) {
+    docker(&[
+        "exec",
+        "-u",
+        "1000:1000",
+        "-e",
+        "TZ=UTC",
+        "-w",
+        "/storage",
+        CONTAINER,
+        "sh",
+        "-c",
+        script,
+    ])
+    .await;
+}
+
+fn fixed_write_time() -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2020, 1, 2, 3, 4, 5).unwrap()
+}
+
+async fn listed(backend: &dyn Backend, dir: &str, name: &str) -> (FileEntry, Revision) {
+    backend
+        .list_children_with_revisions(dir)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|(entry, _)| entry.name == name)
+        .unwrap_or_else(|| panic!("{dir}/{name} not listed"))
+}
+
+/// Change time on the share has second granularity on some filesystems.
+async fn let_change_time_advance() {
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live SMB share"]
+async fn rename_on_share_keeps_stable_id_and_moves_only_change_time() {
+    let _share = SHARE.write().await;
+    on_share(
+        "rm -rf identity-rename && mkdir identity-rename \
+         && printf 'renamed content\\n' > identity-rename/a.txt \
+         && touch -d '2020-01-02 03:04:05' identity-rename/a.txt",
+    )
+    .await;
+    let backend = backend();
+
+    let (entry, before) = listed(&*backend, "identity-rename", "a.txt").await;
+    assert_eq!(before.size, Some(16));
+    assert_eq!(before.last_write_time, Some(fixed_write_time()));
+    assert!(before.change_time.is_some(), "listing lacks change time");
+    assert!(
+        !before.stable_id.contains("a.txt"),
+        "stable id {:?} derives from the path",
+        before.stable_id
+    );
+    assert_eq!(
+        backend.revision(&entry).await.unwrap(),
+        before,
+        "revision read from the file differs from the listing"
+    );
+
+    let_change_time_advance().await;
+    on_share("mv identity-rename/a.txt identity-rename/b.txt").await;
+
+    let (renamed, after) = listed(&*backend, "identity-rename", "b.txt").await;
+    assert_eq!(
+        after.stable_id, before.stable_id,
+        "rename changed the stable id"
+    );
+    assert_eq!(after.size, before.size);
+    assert_eq!(after.last_write_time, before.last_write_time);
+    assert!(
+        after.change_time > before.change_time,
+        "rename did not move change time: {:?} -> {:?}",
+        before.change_time,
+        after.change_time
+    );
+    assert_eq!(backend.revision(&renamed).await.unwrap(), after);
+
+    on_share("rm -rf identity-rename").await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live SMB share"]
+async fn replace_by_rename_is_a_new_id_and_timestamp_restoring_edit_moves_change_time() {
+    let _share = SHARE.write().await;
+    on_share(
+        "rm -rf identity-replace && mkdir identity-replace \
+         && printf 'original\\n' > identity-replace/target.txt \
+         && printf 'replacement\\n' > identity-replace/incoming.txt \
+         && touch -d '2020-01-02 03:04:05' identity-replace/target.txt",
+    )
+    .await;
+    let backend = backend();
+
+    let (_, target) = listed(&*backend, "identity-replace", "target.txt").await;
+    let (_, incoming) = listed(&*backend, "identity-replace", "incoming.txt").await;
+    assert_ne!(target.stable_id, incoming.stable_id);
+
+    let_change_time_advance().await;
+    on_share(
+        "printf 'edited!!\\n' > identity-replace/target.txt \
+         && touch -d '2020-01-02 03:04:05' identity-replace/target.txt",
+    )
+    .await;
+    let (_, edited) = listed(&*backend, "identity-replace", "target.txt").await;
+    assert_eq!(
+        edited.stable_id, target.stable_id,
+        "in-place edit changed the stable id"
+    );
+    assert_eq!(edited.size, target.size);
+    assert_eq!(edited.last_write_time, Some(fixed_write_time()));
+    assert!(
+        edited.change_time > target.change_time,
+        "timestamp-restoring edit did not move change time: {:?} -> {:?}",
+        target.change_time,
+        edited.change_time
+    );
+
+    on_share("mv identity-replace/incoming.txt identity-replace/target.txt").await;
+    let (_, replaced) = listed(&*backend, "identity-replace", "target.txt").await;
+    assert_ne!(
+        replaced.stable_id, target.stable_id,
+        "replace-by-rename kept the replaced file's id"
+    );
+    assert_eq!(replaced.stable_id, incoming.stable_id);
+
+    on_share("rm -rf identity-replace").await;
+}
+
+fn assert_not_found(err: &anyhow::Error) {
+    assert!(
+        matches!(err.downcast_ref(), Some(BackendError::NotFound(_))),
+        "expected BackendError::NotFound, got {err:#}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a live SMB share"]
+async fn deleted_folder_is_reported_not_found() {
+    let _share = SHARE.write().await;
+    on_share("rm -rf deleted-folder && mkdir deleted-folder").await;
+    let backend = backend();
+    assert!(
+        backend
+            .list_children_with_revisions("deleted-folder")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    on_share("rm -rf deleted-folder").await;
+
+    assert_not_found(
+        &backend
+            .list_children_with_revisions("deleted-folder")
+            .await
+            .unwrap_err(),
+    );
+    assert_not_found(
+        &backend
+            .metadata(Path::new("deleted-folder"))
+            .await
+            .unwrap_err(),
+    );
+    assert_not_found(
+        &backend
+            .metadata(Path::new("deleted-folder/child"))
+            .await
+            .unwrap_err(),
+    );
 }
 
 /// Unpauses the container when dropped, so a failing test leaves the share serving.

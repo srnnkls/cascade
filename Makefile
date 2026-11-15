@@ -28,14 +28,18 @@ debug: release
 # Cascade domain with macOS. No automated registration — that step requires
 # an interactive UI click in the host app window.
 #
-# Prerequisites: macOS 15.4+, Xcode CLT. See docs/fileprovider-smoke-test.md
+# Prerequisites: macOS 26+, Xcode, and an Apple development team id passed as
+# TEAM=<team id> (signing is automatic). See docs/fileprovider-smoke-test.md
 # for the full step-by-step guide including backend setup and Finder operations.
 fileprovider-smoke:
+	@test -n "$(TEAM)" || { echo "fileprovider-smoke: set TEAM=<development team id>"; exit 1; }
 	xcodebuild \
 		-project swift/CascadeFileProvider.xcodeproj \
 		-scheme CascadeFileProviderHost \
 		-configuration Debug \
 		-destination "platform=macOS" \
+		-allowProvisioningUpdates \
+		DEVELOPMENT_TEAM=$(TEAM) \
 		build
 	open "$$(xcodebuild \
 		-project swift/CascadeFileProvider.xcodeproj \
@@ -43,6 +47,7 @@ fileprovider-smoke:
 		-configuration Debug \
 		-destination "platform=macOS" \
 		-showBuildSettings \
+		DEVELOPMENT_TEAM=$(TEAM) \
 		2>/dev/null \
 		| awk '/BUILT_PRODUCTS_DIR/{print $$3}')/CascadeFileProviderHost.app"
 

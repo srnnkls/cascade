@@ -14,7 +14,7 @@ use cascade_engine::backend::Backend;
 use cascade_engine::changefeed::{ChangeFeed, ChangeQueryResult};
 use cascade_engine::db::StateDb;
 use cascade_engine::types::{CacheState, Change, FileEntry, FileId, ItemId, SyncCursor, VfsItem};
-use cascade_engine::vfs::{VfsTree, derive_sync_cursor};
+use cascade_engine::vfs::{VfsTree, derive_sync_cursor, neutral_root_item_id};
 use chrono::{DateTime, Utc};
 use data_encoding::BASE64URL_NOPAD;
 use sha2::{Digest, Sha256};
@@ -23,7 +23,7 @@ use tokio::sync::Mutex;
 use crate::handlers::{
     EnumerateChangesOutput, EnumerateOutput, FileProviderHandlers, HandlerError, HandlerResult,
 };
-use crate::items::FileProviderItem;
+use crate::items::{EXTENSION_ROOT_ID, FileProviderItem};
 
 /// Subdirectory inside the cache directory where File Provider materialised
 /// contents live. Each item gets its own folder keyed by sanitised ID.
@@ -320,6 +320,44 @@ impl EngineHandlers {
                     item_id.backend_id()
                 ))
             })
+    }
+
+    /// The neutral root's listing, as `VfsTree::read_dir("")` composes it: the
+    /// top-level children of a backend mounted at `/`, shadowed by the
+    /// mount-point directories of the backends mounted directly under the root.
+    async fn extension_root_children(&self) -> HandlerResult<Vec<FileProviderItem>> {
+        let (mount_points, at_root) = {
+            let vfs = self
+                .vfs
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (vfs.mount_point_items(), vfs.at_root_backend().cloned())
+        };
+        let mut items = Vec::new();
+        if let Some(backend) = at_root {
+            for entry in backend.list_children(backend.root_native_id()).await? {
+                if mount_points.iter().any(|mount| mount.name == entry.name) {
+                    continue;
+                }
+                let mut item = VfsItem::from(entry);
+                item.parent_id = neutral_root_item_id();
+                items.push(FileProviderItem::from(item));
+            }
+        }
+        items.extend(mount_points.into_iter().map(FileProviderItem::from));
+        Ok(items)
+    }
+
+    /// The mount-point directory whose id is `id`, when `id` names the root
+    /// container of a backend mounted directly under the neutral root.
+    fn mount_point_by_id(&self, id: &ItemId) -> Option<VfsItem> {
+        let vfs = self
+            .vfs
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        vfs.mount_point_items()
+            .into_iter()
+            .find(|mount| &mount.id == id)
     }
 
     /// Compute the cache directory for a given item.
@@ -802,7 +840,13 @@ impl EngineHandlers {
 #[async_trait]
 impl FileProviderHandlers for EngineHandlers {
     async fn get_item(&self, id: &str) -> HandlerResult<FileProviderItem> {
+        if id == EXTENSION_ROOT_ID {
+            return Ok(extension_root_item());
+        }
         let item_id = ItemId(id.to_string());
+        if let Some(mount_point) = self.mount_point_by_id(&item_id) {
+            return Ok(FileProviderItem::from(mount_point));
+        }
         let entry = self
             .db
             .get_file(&item_id)?
@@ -822,19 +866,28 @@ impl FileProviderHandlers for EngineHandlers {
         parent_id: &str,
         page: Option<&str>,
     ) -> HandlerResult<EnumerateOutput> {
-        let parent = ItemId(parent_id.to_string());
-        let backend = self.backend_for(&parent)?;
-        let mut entries = backend.list_children(parent.native_id()).await?;
+        let mut entries: Vec<FileProviderItem> = if parent_id == EXTENSION_ROOT_ID {
+            self.extension_root_children().await?
+        } else {
+            let parent = ItemId(parent_id.to_string());
+            let backend = self.backend_for(&parent)?;
+            backend
+                .list_children(parent.native_id())
+                .await?
+                .into_iter()
+                .map(|entry| FileProviderItem::from(VfsItem::from(entry)))
+                .collect()
+        };
 
         // Deterministic ordering — id is the only field guaranteed unique
         // and stable across calls.
-        entries.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+        entries.sort_by(|a, b| a.id.cmp(&b.id));
 
         let after_id = decode_enumerate_page(page)?;
         let start = after_id.as_deref().map_or(0, |last| {
             entries
                 .iter()
-                .position(|entry| entry.id.0.as_str() > last)
+                .position(|entry| entry.id.as_str() > last)
                 .unwrap_or(entries.len())
         });
         let end = start.saturating_add(ENUMERATE_PAGE_SIZE).min(entries.len());
@@ -842,15 +895,12 @@ impl FileProviderHandlers for EngineHandlers {
         let next_page = if end < entries.len() {
             entries
                 .get(end.saturating_sub(1))
-                .map(|entry| encode_enumerate_page(&entry.id.0))
+                .map(|entry| encode_enumerate_page(&entry.id))
         } else {
             None
         };
 
-        let items = entries
-            .drain(start..end)
-            .map(|entry| FileProviderItem::from(VfsItem::from(entry)))
-            .collect();
+        let items = entries.drain(start..end).collect();
 
         Ok(EnumerateOutput { items, next_page })
     }
@@ -888,6 +938,11 @@ impl FileProviderHandlers for EngineHandlers {
             )
         ));
 
+        tracing::info!(
+            target: "cascade::presenter_fileprovider",
+            item_id = %entry.id,
+            "fetchContents"
+        );
         let data = backend.download(&entry).await?;
         tokio::fs::write(&temp_path, &data)
             .await
@@ -1096,6 +1151,20 @@ fn backend_for_self(
                 parent.backend_id()
             ))
         })
+}
+
+fn extension_root_item() -> FileProviderItem {
+    FileProviderItem::from(VfsItem {
+        id: neutral_root_item_id(),
+        parent_id: neutral_root_item_id(),
+        name: String::new(),
+        path: String::new(),
+        is_dir: true,
+        size: None,
+        mod_time: None,
+        cache_state: CacheState::Online,
+        mime_type: None,
+    })
 }
 
 /// Convert a vector of `Change` events into the `(added_or_modified,

@@ -3,6 +3,6 @@
 pub mod tree;
 
 pub use tree::{
-    NEUTRAL_ROOT_ID, VfsTree, derive_sync_cursor, merge_listing, neutral_root_item_id,
-    resolve_listing_native_id,
+    NEUTRAL_ROOT_ID, VfsTree, derive_sync_cursor, merge_listing, mount_point_item,
+    neutral_root_item_id, resolve_listing_native_id,
 };

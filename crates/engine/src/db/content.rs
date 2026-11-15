@@ -106,7 +106,7 @@ pub struct EvictionCandidate {
     pub populated_bytes: u64,
 }
 
-fn id_to_sql(id: u64) -> Result<i64> {
+pub(super) fn id_to_sql(id: u64) -> Result<i64> {
     i64::try_from(id).map_err(|_| anyhow!("id {id} exceeds the SQLite integer range"))
 }
 
@@ -118,12 +118,12 @@ fn object_id_column(row: &Row<'_>, idx: usize) -> rusqlite::Result<ObjectId> {
     u64_column(row, idx).map(ObjectId::new)
 }
 
-fn u64_column(row: &Row<'_>, idx: usize) -> rusqlite::Result<u64> {
+pub(super) fn u64_column(row: &Row<'_>, idx: usize) -> rusqlite::Result<u64> {
     let value: i64 = row.get(idx)?;
     u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(idx, value))
 }
 
-fn optional_u64_column(row: &Row<'_>, idx: usize) -> rusqlite::Result<Option<u64>> {
+pub(super) fn optional_u64_column(row: &Row<'_>, idx: usize) -> rusqlite::Result<Option<u64>> {
     row.get::<_, Option<i64>>(idx)?
         .map(|value| {
             u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(idx, value))
@@ -131,11 +131,11 @@ fn optional_u64_column(row: &Row<'_>, idx: usize) -> rusqlite::Result<Option<u64
         .transpose()
 }
 
-fn time_to_sql(time: Option<DateTime<Utc>>) -> Option<i64> {
+pub(super) fn time_to_sql(time: Option<DateTime<Utc>>) -> Option<i64> {
     time.and_then(|t| t.timestamp_nanos_opt())
 }
 
-fn time_column(row: &Row<'_>, idx: usize) -> rusqlite::Result<Option<DateTime<Utc>>> {
+pub(super) fn time_column(row: &Row<'_>, idx: usize) -> rusqlite::Result<Option<DateTime<Utc>>> {
     Ok(row
         .get::<_, Option<i64>>(idx)?
         .map(DateTime::from_timestamp_nanos))
@@ -173,7 +173,7 @@ fn object_from_row(row: &Row<'_>) -> rusqlite::Result<ContentObject> {
 }
 
 impl StateDb {
-    fn lock_conn(&self) -> Result<MutexGuard<'_, Connection>> {
+    pub(super) fn lock_conn(&self) -> Result<MutexGuard<'_, Connection>> {
         self.conn.lock().map_err(|e| anyhow!("lock poisoned: {e}"))
     }
 

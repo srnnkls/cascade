@@ -66,6 +66,9 @@ wasm-bindgen = { workspace = true }
 wasm-bindgen-futures = { workspace = true }
 num-traits = { version = "0.2.19", default-features = false }
 
+[target.'cfg(cascade_loom)'.dependencies]
+loom.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = "3"

@@ -22,6 +22,7 @@ struct InMemoryBackend {
     files: Mutex<HashMap<String, FileEntry>>,
     content: Mutex<HashMap<String, Vec<u8>>>,
     next_id: Mutex<u64>,
+    downloads: std::sync::atomic::AtomicUsize,
 }
 
 impl InMemoryBackend {
@@ -31,6 +32,7 @@ impl InMemoryBackend {
             files: Mutex::new(HashMap::new()),
             content: Mutex::new(HashMap::new()),
             next_id: Mutex::new(0),
+            downloads: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -75,6 +77,8 @@ impl Backend for InMemoryBackend {
     }
 
     async fn download(&self, file: &FileEntry) -> anyhow::Result<Vec<u8>> {
+        self.downloads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let content = self
             .content
             .lock()
@@ -320,6 +324,167 @@ async fn enumerate_items_fails_for_unknown_backend() {
         .await
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::NotFound);
+}
+
+/// Stand up handlers over the daemon's tree shape: a neutral root with
+/// `alpha` and `beta` mounted under it, `alpha` holding one file.
+fn make_neutral_root_handlers() -> (EngineHandlers, Arc<InMemoryBackend>, tempfile::TempDir) {
+    let alpha = Arc::new(InMemoryBackend::new("alpha"));
+    let beta = Arc::new(InMemoryBackend::new("beta"));
+    let mut tree = VfsTree::new(Arc::new(cascade_engine::backend::NullBackend::new(
+        cascade_engine::vfs::NEUTRAL_ROOT_ID,
+    )));
+    tree.mount(PathBuf::from("alpha"), alpha.clone());
+    tree.mount(PathBuf::from("beta"), beta);
+
+    let db = Arc::new(StateDb::open_in_memory().unwrap());
+    db.register_backend("alpha", "stub", "Alpha", Some("alpha"), None)
+        .unwrap();
+    db.register_backend("beta", "stub", "Beta", Some("beta"), None)
+        .unwrap();
+
+    let file_id = ItemId::new("alpha", "f1");
+    let file_entry = FileEntry {
+        id: file_id.clone(),
+        parent_id: ItemId::new("alpha", "root"),
+        name: "a.txt".to_string(),
+        path: "alpha/a.txt".to_string(),
+        is_dir: false,
+        size: Some(5),
+        mod_time: Some(Utc::now()),
+        mime_type: Some("text/plain".to_string()),
+        hash: None,
+    };
+    alpha.insert(file_entry.clone());
+    db.upsert_file(&file_entry).unwrap();
+    alpha
+        .content
+        .lock()
+        .unwrap()
+        .insert(file_id.0, b"alpha".to_vec());
+
+    let cache_dir = tempfile::tempdir().unwrap();
+    let handlers = EngineHandlers::new(
+        Arc::new(RwLock::new(tree)),
+        db,
+        cache_dir.path().to_path_buf(),
+        make_feed(),
+    );
+    (handlers, alpha, cache_dir)
+}
+
+#[tokio::test]
+async fn enumerate_items_maps_extension_root_to_mounted_backends_as_dataless() {
+    let (handlers, alpha, _tempdir) = make_neutral_root_handlers();
+
+    let root = handlers.enumerate_items("root", None).await.unwrap();
+    let mut mounts: Vec<(String, String, String, bool)> = root
+        .items
+        .into_iter()
+        .map(|item| (item.id, item.parent_id, item.filename, item.is_directory))
+        .collect();
+    mounts.sort();
+    assert_eq!(
+        mounts,
+        vec![
+            (
+                "alpha:root".to_string(),
+                "root".to_string(),
+                "alpha".to_string(),
+                true
+            ),
+            (
+                "beta:root".to_string(),
+                "root".to_string(),
+                "beta".to_string(),
+                true
+            ),
+        ]
+    );
+    assert!(root.next_page.is_none());
+
+    let listing = handlers.enumerate_items("alpha:root", None).await.unwrap();
+    assert_eq!(listing.items.len(), 1);
+    assert_eq!(listing.items[0].id, "alpha:f1");
+    assert_eq!(listing.items[0].cache_state, CacheState::Online);
+    assert_eq!(
+        alpha.downloads.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "listing must not read file content"
+    );
+}
+
+#[tokio::test]
+async fn get_item_maps_extension_root_to_root_directory() {
+    let (handlers, _alpha, _tempdir) = make_neutral_root_handlers();
+    let root = handlers.get_item("root").await.unwrap();
+    assert_eq!(root.id, "root");
+    assert!(root.is_directory);
+}
+
+#[tokio::test]
+async fn get_item_resolves_mount_point_ids_from_root_listing() {
+    let (handlers, _alpha, _tempdir) = make_neutral_root_handlers();
+
+    let root = handlers.enumerate_items("root", None).await.unwrap();
+    for listed in root.items {
+        let item = handlers.get_item(&listed.id).await.unwrap();
+        assert_eq!(item, listed);
+    }
+}
+
+#[tokio::test]
+async fn enumerate_items_lists_at_root_mount_children_under_extension_root() {
+    let home = Arc::new(InMemoryBackend::new("home"));
+    let work = Arc::new(InMemoryBackend::new("work"));
+    let mut tree = VfsTree::new(Arc::new(cascade_engine::backend::NullBackend::new(
+        cascade_engine::vfs::NEUTRAL_ROOT_ID,
+    )));
+    tree.mount(PathBuf::new(), home.clone());
+    tree.mount(PathBuf::from("work"), work);
+    for (native, name) in [("d1", "Documents"), ("w1", "work")] {
+        home.insert(FileEntry {
+            id: ItemId::new("home", native),
+            parent_id: ItemId::new("home", "root"),
+            name: name.to_string(),
+            path: name.to_string(),
+            is_dir: true,
+            size: None,
+            mod_time: None,
+            mime_type: None,
+            hash: None,
+        });
+    }
+    let cache_dir = tempfile::tempdir().unwrap();
+    let handlers = EngineHandlers::new(
+        Arc::new(RwLock::new(tree)),
+        Arc::new(StateDb::open_in_memory().unwrap()),
+        cache_dir.path().to_path_buf(),
+        make_feed(),
+    );
+
+    let root = handlers.enumerate_items("root", None).await.unwrap();
+    let mut listed: Vec<(String, String, String)> = root
+        .items
+        .into_iter()
+        .map(|item| (item.id, item.parent_id, item.filename))
+        .collect();
+    listed.sort();
+    assert_eq!(
+        listed,
+        vec![
+            (
+                "home:d1".to_string(),
+                "root".to_string(),
+                "Documents".to_string()
+            ),
+            (
+                "work:root".to_string(),
+                "root".to_string(),
+                "work".to_string()
+            ),
+        ]
+    );
 }
 
 #[tokio::test]

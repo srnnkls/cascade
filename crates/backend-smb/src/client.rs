@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use cascade_engine::backend::TransientError;
+use cascade_engine::backend::{BackendError, TransientError};
 use smb::{
     Client, ClientConfig, ConnectionConfig, DirAccessMask, FileCreateArgs, Resource, UncPath,
 };
@@ -33,6 +33,9 @@ enum ErrorKind {
 }
 
 fn classify(err: &anyhow::Error) -> ErrorKind {
+    if err.is::<BackendError>() {
+        return ErrorKind::ServerReply;
+    }
     match err.chain().find_map(|e| e.downcast_ref::<smb::Error>()) {
         Some(
             smb::Error::ConnectionStopped

@@ -1,6 +1,8 @@
 #[cfg(feature = "native")]
 pub mod content;
 #[cfg(feature = "native")]
+pub mod replica;
+#[cfg(feature = "native")]
 pub mod schema;
 
 #[cfg(feature = "native")]

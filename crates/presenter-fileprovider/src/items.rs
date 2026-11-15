@@ -1,6 +1,28 @@
 use anyhow::{Context, Result};
 use cascade_engine::types::{CacheState, ItemId, VfsItem};
+use cascade_engine::vfs::neutral_root_item_id;
 use serde::{Deserialize, Serialize};
+
+/// Wire id the extension sends for `NSFileProviderItemIdentifier.rootContainer`.
+///
+/// It names the neutral VFS root, whose children are the top-level mounts.
+pub const EXTENSION_ROOT_ID: &str = "root";
+
+fn to_wire_id(id: ItemId) -> String {
+    if id == neutral_root_item_id() {
+        EXTENSION_ROOT_ID.to_string()
+    } else {
+        id.0
+    }
+}
+
+fn from_wire_id(id: String) -> ItemId {
+    if id == EXTENSION_ROOT_ID {
+        neutral_root_item_id()
+    } else {
+        ItemId(id)
+    }
+}
 
 /// File Provider-facing representation of a VFS item.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,8 +40,8 @@ pub struct FileProviderItem {
 impl From<VfsItem> for FileProviderItem {
     fn from(item: VfsItem) -> Self {
         Self {
-            id: item.id.0,
-            parent_id: item.parent_id.0,
+            id: to_wire_id(item.id),
+            parent_id: to_wire_id(item.parent_id),
             filename: item.name,
             is_directory: item.is_dir,
             size: item.size,
@@ -44,8 +66,8 @@ impl TryFrom<FileProviderItem> for VfsItem {
             .transpose()?;
 
         Ok(Self {
-            id: ItemId(item.id),
-            parent_id: ItemId(item.parent_id),
+            id: from_wire_id(item.id),
+            parent_id: from_wire_id(item.parent_id),
             // Path defaults to name at this phase; later phases thread the
             // mount-prefixed VFS path through the File Provider item.
             path: item.filename.clone(),

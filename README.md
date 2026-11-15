@@ -78,7 +78,9 @@ cargo build --release --features presenter-fileprovider  # macOS only
 
 # Including Swift extensions (macOS)
 cargo build --release
-xcodebuild -project swift/CascadeFileProvider.xcodeproj -scheme CascadeFileProviderHost -configuration Release -destination "platform=macOS" build
+xcodebuild -project swift/CascadeFileProvider.xcodeproj -scheme CascadeFileProviderHost -configuration Release -destination "platform=macOS" -allowProvisioningUpdates DEVELOPMENT_TEAM=<team-id> build
+# Unsigned compile check, no team needed
+xcodebuild -project swift/CascadeFileProvider.xcodeproj -scheme CascadeFileProviderHost -configuration Release -destination "platform=macOS" CODE_SIGNING_ALLOWED=NO build
 cd swift/CascadeFSKit && xcodebuild
 ```
 

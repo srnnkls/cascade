@@ -3,7 +3,10 @@
 
 use std::fmt;
 
+pub mod anchor;
 pub mod range_map;
+pub mod replica;
+pub mod scan;
 #[cfg(unix)]
 pub mod store;
 

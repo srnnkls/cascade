@@ -2,7 +2,7 @@
 
 ## Status
 
-**wired** — the Xcode project builds clean and produces both a `.app` and an embedded `.appex`. The inbound RPC handlers on the Rust side are wired: the engine dispatches `getItem`, `enumerateItems`, `fetchContents`, `importDocument`, `createDirectory`, `deleteItem`, and `moveItem` to its VFS and `StateDb` handlers, and `currentSyncCursor` / `enumerateChanges` are connected so the replicated File Provider enumeration protocol carries live cursors. What remains before a production-signed release is a real signing identity, an App Group provisioning profile, and a distribution mechanism for the host app.
+**wired** — the Xcode project builds clean and produces both a `.app` and an embedded `.appex`. The inbound RPC handlers on the Rust side are wired: the engine dispatches `getItem`, `enumerateItems`, `fetchContents`, `importDocument`, `createDirectory`, `deleteItem`, and `moveItem` to its VFS and `StateDb` handlers, and `currentSyncCursor` / `enumerateChanges` are connected so the replicated File Provider enumeration protocol carries live cursors. What remains before a release is a distribution mechanism for the host app.
 
 ## Build environment
 
@@ -10,7 +10,7 @@ Verified on:
 
 - macOS 26.1 (build 25B78)
 - Xcode 26.2 (build 17C52)
-- Apple Swift 6.2.3 (`swiftlang-6.2.3.3.21`), targeting `arm64-apple-macosx12.0` for both the host app and the extension
+- Apple Swift 6.2.3 (`swiftlang-6.2.3.3.21`), targeting `arm64-apple-macosx26.0` for both the host app and the extension
 - Rust 1.95.0 (Homebrew), workspace edition 2024
 
 ## Build steps
@@ -29,8 +29,12 @@ xcodebuild \
     -scheme CascadeFileProviderHost \
     -configuration Debug \
     -destination "platform=macOS" \
+    -allowProvisioningUpdates \
+    DEVELOPMENT_TEAM=<your-team-id> \
     build
 ```
+
+An unsigned compile check needs no team: replace the last three lines with `CODE_SIGNING_ALLOWED=NO build`. The unsigned extension carries no App Group and cannot reach the daemon.
 
 `Release` works identically — substitute `-configuration Release`.
 
@@ -84,35 +88,18 @@ The old `Package.swift` is deleted. SwiftPM cannot describe the host/extension t
 
 - Host:        `io.cascade.CascadeFileProviderHost`        (`.app`)
 - Extension:   `io.cascade.CascadeFileProviderHost.FileProvider` (`.appex`)
-- App Group:   `group.io.cascade.shared` is *not* declared on the entitlements files at rest. The wire is still the Unix domain socket so an App Group adds no functional value yet; declaring it would require a provisioning profile and break `xcodebuild` on clones without an Apple developer account. The entitlements files carry an inline commented-out block to restore once a team identity is configured.
-- Deployment:  macOS 12.0 for both targets
+- App Group:   `$(TeamIdentifierPrefix)group.io.cascade.shared`, declared in both `*.entitlements` files
+- Deployment:  macOS 26.0 for both targets
 - Swift:       `SWIFT_VERSION = 5.0` (the language mode, not the toolchain version — Swift 6.2.3 builds Swift 5 mode by default)
-- Signing:     `CODE_SIGN_IDENTITY = "-"`, `CODE_SIGN_STYLE = Manual`, `DEVELOPMENT_TEAM = ""`, `CODE_SIGNING_ALLOWED = YES`, `CODE_SIGNING_REQUIRED = NO`
+- Signing:     `CODE_SIGN_STYLE = Automatic`, `CODE_SIGN_IDENTITY = "Apple Development"`, `DEVELOPMENT_TEAM` supplied on the command line
 
-Ad-hoc signing with `CODE_SIGNING_ALLOWED = YES` produces a real (locally-signed) `.appex` so `NSFileProviderManager.add(_:completionHandler:)` will accept it — `CODE_SIGNING_ALLOWED = NO` would emit an unsigned binary that macOS refuses to register. `CODE_SIGNING_REQUIRED = NO` keeps the project building on any clone without a developer account; combined with `CODE_SIGN_IDENTITY = "-"`, every clone gets a signed-but-not-trusted artefact, which is enough for local development and CI but not for distribution.
-
-To produce a signed, distributable build, override these at the command line:
-
-```bash
-xcodebuild \
-    -project swift/CascadeFileProvider.xcodeproj \
-    -scheme CascadeFileProviderHost \
-    -configuration Release \
-    -destination "platform=macOS" \
-    DEVELOPMENT_TEAM=<your-team-id> \
-    CODE_SIGN_STYLE=Automatic \
-    CODE_SIGNING_ALLOWED=YES \
-    CODE_SIGNING_REQUIRED=YES \
-    build
-```
-
-The App Group `group.io.cascade.shared` must be provisioned for the team beforehand. The bundle identifiers can be renamed by editing the four `PRODUCT_BUNDLE_IDENTIFIER` / `extensionBundleIdentifier` references — the host's `ContentView` carries the extension identifier so the host can refer to it.
+Signing, App Group provisioning, and verifying the signed entitlements are covered step by step in [`fileprovider-smoke-test.md`](fileprovider-smoke-test.md#step-2--build-the-host-app-and-extension). The bundle identifiers can be renamed by editing the four `PRODUCT_BUNDLE_IDENTIFIER` / `extensionBundleIdentifier` references — the host's `ContentView` carries the extension identifier so the host can refer to it.
 
 ## Rust to Swift bridge
 
 There is no C ABI / FFI surface. The bridge is a Unix domain socket using Cascade's length-prefixed JSON protocol (`cascade_engine::protocol::{Request, Response}` with `encode_message`). Source: `crates/presenter-fileprovider/src/bridge.rs`.
 
-The default socket path resolves to `$HOME/.config/cascade/fp.sock`. The Rust `FileProviderPresenter` pushes these notifications to Swift:
+The socket is `fp.sock` inside the App Group container the extension is entitled to; the daemon is started with `--app-group` naming that container (see [`fileprovider-smoke-test.md`](fileprovider-smoke-test.md#step-4--start-the-cascade-daemon)). The Rust `FileProviderPresenter` pushes these notifications to Swift:
 
 - `upsertItem({ item })`
 - `deleteItem({ id })`
@@ -137,7 +124,6 @@ Both sets coexist on the same socket; the engine routes incoming requests to its
 ## Follow-ups
 
 - Add a `setAttributes` RPC for capability and metadata round-trips; `ActionHandler.modifyItem` currently re-reads the item rather than persisting attribute-only changes.
-- Replace ad-hoc signing with a real signing identity once the project has a team and a provisioned App Group: flip `CODE_SIGN_STYLE` to `Automatic`, set `DEVELOPMENT_TEAM`, set `CODE_SIGNING_REQUIRED = YES`, and uncomment the `com.apple.security.application-groups` block in both `*.entitlements` files. The four bundle identifiers must match what the team has registered.
 - Decide a distribution mechanism for the host app (Sparkle, App Store, signed `.zip`, embedded in the daemon installer). The host is only useful to register the domain; once registered, it can be quit.
 
 ## Sources

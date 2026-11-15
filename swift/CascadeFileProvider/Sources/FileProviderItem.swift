@@ -37,11 +37,16 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
     }
 
     var itemIdentifier: NSFileProviderItemIdentifier {
-        NSFileProviderItemIdentifier(item.id)
+        Self.systemIdentifier(for: item.id)
     }
 
     var parentItemIdentifier: NSFileProviderItemIdentifier {
-        item.parentID == "root" ? .rootContainer : NSFileProviderItemIdentifier(item.parentID)
+        Self.systemIdentifier(for: item.parentID)
+    }
+
+    /// The engine names the root container `rootIdentifier`; every other id passes through.
+    private static func systemIdentifier(for engineID: String) -> NSFileProviderItemIdentifier {
+        engineID == rootIdentifier ? .rootContainer : NSFileProviderItemIdentifier(engineID)
     }
 
     var filename: String {

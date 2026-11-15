@@ -119,6 +119,9 @@ nix = { version = "0.31", features = ["signal", "process"] }
 # Copy-on-write clones with an explicit copy fallback (engine content cache)
 reflink-copy = "0.1"
 
+# Concurrency model checker for the engine content cache, under cfg(cascade_loom)
+loom = "0.7"
+
 # Platform config / cache paths
 dirs = "6"
 

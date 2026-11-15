@@ -19,20 +19,20 @@ use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use cascade_engine::backend::Backend;
-use cascade_engine::types::{Change, Cursor, FileEntry, FileId, ItemId, Quota};
+use cascade_engine::backend::{Backend, BackendError};
+use cascade_engine::types::{Change, Cursor, FileEntry, FileId, ItemId, Quota, Revision};
 use chrono::{DateTime, Utc};
-use futures_util::StreamExt;
-use smb::binrw_util::file_time::FileTime;
 use smb::{
-    Client, DirAccessMask, Directory, File, FileAccessMask, FileCreateArgs,
-    FileFullDirectoryInformation, FileNetworkOpenInformation, ReadAt, Resource, UncPath,
+    Client, DirAccessMask, File, FileAccessMask, FileCreateArgs, FileNetworkOpenInformation,
+    ReadAt, Resource, Status, UncPath,
 };
 
 mod client;
 mod config;
+mod listing;
 
 use client::{MAX_REQUEST, REQUEST_DEADLINE, SmbClient};
+use listing::file_time_to_utc;
 
 /// A file handle and the client it was opened on.
 type OpenFile = (Arc<Client>, Arc<File>);
@@ -123,10 +123,6 @@ fn child_native_id(parent: &str, name: &str) -> String {
     }
 }
 
-fn file_time_to_utc(time: FileTime) -> Option<DateTime<Utc>> {
-    (!time.is_zero()).then(|| DateTime::<Utc>::from(std::time::SystemTime::from(time)))
-}
-
 impl SmbBackend {
     /// Build a backend without connecting.
     ///
@@ -164,13 +160,22 @@ impl SmbBackend {
         native_id: &str,
         access: FileAccessMask,
     ) -> anyhow::Result<Resource> {
-        let resource = client
+        client
             .create_file(
                 &self.unc_for(native_id),
                 &FileCreateArgs::make_open_existing(access),
             )
-            .await?;
-        Ok(resource)
+            .await
+            .map_err(|err| match err {
+                smb::Error::ReceivedErrorMessage(status, _)
+                | smb::Error::UnexpectedMessageStatus(status)
+                    if status == Status::U32_OBJECT_NAME_NOT_FOUND
+                        || status == Status::U32_OBJECT_PATH_NOT_FOUND =>
+                {
+                    BackendError::NotFound(native_id.to_string()).into()
+                }
+                other => other.into(),
+            })
     }
 
     fn entry_for(
@@ -195,7 +200,7 @@ impl SmbBackend {
         entry
     }
 
-    async fn list_dir(&self, native_id: &str) -> anyhow::Result<Vec<FileEntry>> {
+    async fn list_dir(&self, native_id: &str) -> anyhow::Result<Vec<(FileEntry, Revision)>> {
         self.client
             .run(|client| async move { self.list_dir_on(&client, native_id).await })
             .await
@@ -205,34 +210,30 @@ impl SmbBackend {
         &self,
         client: &Client,
         native_id: &str,
-    ) -> anyhow::Result<Vec<FileEntry>> {
+    ) -> anyhow::Result<Vec<(FileEntry, Revision)>> {
         let access = DirAccessMask::new()
             .with_list_directory(true)
+            .with_read_attributes(true)
             .with_synchronize(true)
             .into();
         let Resource::Directory(dir) = self.open(client, native_id, access).await? else {
             anyhow::bail!("SMB path {native_id} is not a directory");
         };
         let dir = Arc::new(dir);
-        let mut entries = Vec::new();
-        {
-            let mut stream = Directory::query::<FileFullDirectoryInformation>(&dir, "*").await?;
-            while let Some(info) = stream.next().await {
-                let info = info?;
-                let name = info.file_name.to_string();
-                if name == "." || name == ".." {
-                    continue;
-                }
-                entries.push(self.entry_for(
-                    &child_native_id(native_id, &name),
-                    info.file_attributes.directory(),
-                    info.end_of_file,
-                    file_time_to_utc(info.last_write_time),
-                ));
-            }
-        }
+        let listed = listing::list(&dir).await;
         dir.close().await?;
-        Ok(entries)
+        Ok(listed?
+            .into_iter()
+            .map(|listed| {
+                let entry = self.entry_for(
+                    &child_native_id(native_id, &listed.name),
+                    listed.is_dir,
+                    listed.revision.size.unwrap_or(0),
+                    listed.revision.last_write_time,
+                );
+                (entry, listed.revision)
+            })
+            .collect())
     }
 
     /// Read `length` bytes at `offset`, or to the end of the file when `None`,
@@ -312,7 +313,7 @@ impl SmbBackend {
         let mut all = Vec::new();
         let mut pending = vec![ROOT_ID.to_string()];
         while let Some(dir) = pending.pop() {
-            for entry in self.list_dir(&dir).await? {
+            for (entry, _) in self.list_dir(&dir).await? {
                 if entry.is_dir {
                     pending.push(entry.id.native_id().to_string());
                 }
@@ -430,7 +431,39 @@ impl Backend for SmbBackend {
     }
 
     async fn list_children(&self, parent_native_id: &str) -> anyhow::Result<Vec<FileEntry>> {
+        Ok(self
+            .list_dir(parent_native_id)
+            .await?
+            .into_iter()
+            .map(|(entry, _)| entry)
+            .collect())
+    }
+
+    async fn list_children_with_revisions(
+        &self,
+        parent_native_id: &str,
+    ) -> anyhow::Result<Vec<(FileEntry, Revision)>> {
         self.list_dir(parent_native_id).await
+    }
+
+    async fn revision(&self, entry: &FileEntry) -> anyhow::Result<Revision> {
+        let native_id = entry.id.native_id();
+        let access = FileAccessMask::new()
+            .with_file_read_attributes(true)
+            .with_synchronize(true);
+        self.client
+            .run(|client| async move {
+                let (revision, close) = match self.open(&client, native_id, access).await? {
+                    Resource::File(file) => (listing::revision_of(&file).await, file.close().await),
+                    Resource::Directory(dir) => {
+                        (listing::revision_of(&dir).await, dir.close().await)
+                    }
+                    Resource::Pipe(_) => anyhow::bail!("SMB path {native_id} is a pipe"),
+                };
+                close?;
+                Ok(revision?.0)
+            })
+            .await
     }
 
     async fn poll_interval(&self) -> Option<Duration> {

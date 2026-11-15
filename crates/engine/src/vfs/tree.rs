@@ -6,7 +6,7 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 
 use crate::backend::Backend;
-use crate::types::{DirEntry, FileEntry, FileId, ItemId, SyncCursor};
+use crate::types::{CacheState, DirEntry, FileEntry, FileId, ItemId, SyncCursor, VfsItem};
 
 /// Backend id of the neutral VFS root.
 ///
@@ -28,6 +28,43 @@ pub const NEUTRAL_ROOT_ID: &str = "__cascade_root__";
 #[must_use]
 pub fn neutral_root_item_id() -> ItemId {
     ItemId::new(NEUTRAL_ROOT_ID, "root")
+}
+
+/// Build the synthetic mount-point directory a top-level mount contributes to
+/// the neutral root, or `None` when the mount contributes no such directory.
+///
+/// A mount-point directory exists only for a backend mounted directly beneath
+/// the neutral root — a single-segment prefix such as `personal`. Its
+/// `parent_id` is [`neutral_root_item_id`] so presenters list it under the
+/// absolute root; its `id` is the backend's root container so a request that
+/// descends into it routes straight to the owning backend; and its `path` is the
+/// mount prefix itself.
+///
+/// Returns `None` for:
+/// - the empty prefix (a backend mounted at `/`), which *is* the root rather
+///   than a directory under it, so it injects nothing; and
+/// - a multi-segment prefix (a nested mount), whose mount-point directory is a
+///   child of another backend's subtree — [`VfsTree::read_dir`] injects that one
+///   lazily into the parent backend's listing.
+#[must_use]
+pub fn mount_point_item(prefix: &Path, root_id: &ItemId) -> Option<VfsItem> {
+    let mut components = prefix.components();
+    let first = components.next()?;
+    if components.next().is_some() {
+        return None;
+    }
+    let name = first.as_os_str().to_string_lossy().into_owned();
+    Some(VfsItem {
+        id: root_id.clone(),
+        parent_id: neutral_root_item_id(),
+        name,
+        path: prefix.to_string_lossy().into_owned(),
+        is_dir: true,
+        size: None,
+        mod_time: None,
+        cache_state: CacheState::Online,
+        mime_type: None,
+    })
 }
 
 /// VFS tree that routes operations to the correct backend by longest-prefix match.
@@ -200,6 +237,28 @@ impl VfsTree {
     #[must_use]
     pub fn children(&self) -> &[(PathBuf, Arc<dyn Backend>)] {
         &self.children
+    }
+
+    /// The mount-point directories of the backends mounted directly under the
+    /// neutral root, as built by [`mount_point_item`].
+    #[must_use]
+    pub fn mount_point_items(&self) -> Vec<VfsItem> {
+        self.children
+            .iter()
+            .filter_map(|(prefix, backend)| {
+                mount_point_item(prefix, &ItemId::new(backend.id(), backend.root_native_id()))
+            })
+            .collect()
+    }
+
+    /// The backend mounted at `/` (the empty prefix), whose top-level children
+    /// list directly under the neutral root.
+    #[must_use]
+    pub fn at_root_backend(&self) -> Option<&Arc<dyn Backend>> {
+        self.children
+            .iter()
+            .find(|(prefix, _)| prefix.as_os_str().is_empty())
+            .map(|(_, backend)| backend)
     }
 
     /// Find a registered backend by its `id()`.

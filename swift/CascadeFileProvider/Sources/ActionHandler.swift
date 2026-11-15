@@ -2,9 +2,27 @@ import Darwin
 import FileProvider
 import Foundation
 import os
+import Security
 
-private let cascadeSocketPath = "\(NSHomeDirectory())/.config/cascade/fp.sock"
-private let rootIdentifier = "root"
+private let appGroupsEntitlement = "com.apple.security.application-groups"
+private let socketFileName = "fp.sock"
+let rootIdentifier = "root"
+
+/// Path of the daemon socket inside the App Group container this process is
+/// entitled to, or `nil` when the signature carries no App Group.
+///
+/// The group identifier is read from the signed entitlements because its team
+/// prefix is only known once the build is signed.
+func appGroupSocketPath() -> String? {
+    guard let task = SecTaskCreateFromSelf(nil),
+          let groups = SecTaskCopyValueForEntitlement(task, appGroupsEntitlement as CFString, nil) as? [String],
+          let group = groups.first,
+          let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group)
+    else {
+        return nil
+    }
+    return container.appendingPathComponent(socketFileName).path
+}
 
 private let actionLogger = Logger(subsystem: "com.cascade.fileprovider", category: "ActionHandler")
 
@@ -208,11 +226,11 @@ private func makeResponseDecoder() -> JSONDecoder {
 // MARK: - Engine client
 
 actor EngineClient {
-    private let socketPath: String
+    private let socketPath: String?
     private var nextID: UInt32 = 1
     private let decoder = makeResponseDecoder()
 
-    init(socketPath: String = cascadeSocketPath) {
+    init(socketPath: String? = appGroupSocketPath()) {
         self.socketPath = socketPath
     }
 
@@ -238,6 +256,7 @@ actor EngineClient {
             "params": params,
         ]
         let requestBody = try JSONSerialization.data(withJSONObject: request)
+        actionLogger.info("RPC \(method, privacy: .public) for \(itemID ?? "-", privacy: .public)")
         let responseBody = try await writeFrameAndReadResponse(body: requestBody)
 
         let envelope: RpcResponse<Result>
@@ -260,7 +279,10 @@ actor EngineClient {
     }
 
     private func writeFrameAndReadResponse(body: Data) async throws -> Data {
-        try await Task.detached(priority: .userInitiated) { [socketPath] in
+        guard let socketPath else {
+            throw CascadeFileProviderError.socket("no App Group container is entitled")
+        }
+        return try await Task.detached(priority: .userInitiated) {
             let fd = socket(AF_UNIX, SOCK_STREAM, 0)
             guard fd >= 0 else {
                 throw CascadeFileProviderError.socket(String(cString: strerror(errno)))

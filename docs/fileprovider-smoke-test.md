@@ -6,27 +6,19 @@ local backend. All commands are copy-pasteable. No cloud account is required —
 local backend exposes an ordinary directory over the File Provider bridge so every
 step is fully offline-testable.
 
+The [walking-skeleton check](#walking-skeleton-check-ac-1) at the end records the
+team-signed build against the Docker Samba share.
+
 ## Prerequisites
 
-- macOS 15.4 (Sequoia) or later — required by FSKit and the replicated File Provider API.
-  Earlier releases support `NSFileProviderReplicatedExtension` but not the sync-cursor API.
-- Xcode 16.0 or later with the Command Line Tools installed:
-
-  ```bash
-  xcode-select --install
-  ```
-
-- A valid local code-signing identity. Ad-hoc signing (`"-"`) is enough for local
-  development and is the project default. Check what is available:
-
-  ```bash
-  security find-identity -v -p codesigning
-  ```
-
-  A "Mac Developer" or "Apple Development" certificate covers everything needed here.
-  Ad-hoc signing (`-`) works for local registration but will be rejected by Gatekeeper on
-  machines that did not build the binary. For CI or distribution, pass an explicit
-  `CODE_SIGN_IDENTITY` override (see below).
+- macOS 26 or later — the deployment target of the host app and the extension.
+- Xcode 26 or later, signed in to an Apple account under Xcode → Settings → Accounts.
+- A development team id (the ten-character id shown in Xcode's account settings, or
+  under Membership on developer.apple.com). Signing is automatic; the team id is the
+  only setting you supply. The extension and the host share the App Group
+  `<team id>.group.io.cascade.shared`, which only a team-signed build carries, and
+  the extension finds the daemon socket in that group's container. An ad-hoc or
+  unsigned build compiles but cannot reach the daemon.
 
 - The Rust toolchain at the version pinned in `rust-toolchain.toml` — `rustup` installs
   it on first use.
@@ -45,23 +37,22 @@ separate build step is needed.
 
 ## Step 2 — Build the host app and extension
 
+Run the build in a local session on the Mac (not over `ssh`, where the keychain holding
+the signing key is locked):
+
 ```bash
 xcodebuild \
     -project swift/CascadeFileProvider.xcodeproj \
     -scheme CascadeFileProviderHost \
     -configuration Debug \
     -destination "platform=macOS" \
+    -allowProvisioningUpdates \
+    DEVELOPMENT_TEAM=<your-team-id> \
     build
 ```
 
-Or use the Makefile target:
-
-```bash
-make fileprovider-smoke
-```
-
-The `make` target runs the build and then opens the resulting host app so you can
-proceed directly to registration.
+`-allowProvisioningUpdates` lets Xcode register the bundle ids and the App Group and
+create the development profiles on first use.
 
 The artefacts land in Xcode's standard DerivedData tree:
 
@@ -73,19 +64,16 @@ The artefacts land in Xcode's standard DerivedData tree:
                 CascadeFileProvider.appex/
 ```
 
-To use a real signing identity instead of ad-hoc:
+Confirm the App Group made it into the extension's signature:
 
 ```bash
-xcodebuild \
-    -project swift/CascadeFileProvider.xcodeproj \
-    -scheme CascadeFileProviderHost \
-    -configuration Debug \
-    -destination "platform=macOS" \
-    DEVELOPMENT_TEAM=<your-team-id> \
-    CODE_SIGN_STYLE=Automatic \
-    CODE_SIGNING_REQUIRED=YES \
-    build
+codesign -d --entitlements - \
+    ~/Library/Developer/Xcode/DerivedData/CascadeFileProvider-*/Build/Products/Debug/\
+CascadeFileProviderHost.app/Contents/PlugIns/CascadeFileProvider.appex
 ```
+
+The output lists `com.apple.security.application-groups` with
+`<your-team-id>.group.io.cascade.shared`.
 
 ## Step 3 — Configure a local backend
 
@@ -119,18 +107,21 @@ the File Provider socket. The two are alternatives, not a fallback chain — bot
 macOS-native and self-mounting — so pick one:
 
 ```bash
-./target/release/cascade start --file-provider
+GROUP=~/Library/Group\ Containers/<your-team-id>.group.io.cascade.shared
+mkdir -p "$GROUP"
+./target/release/cascade start --file-provider --app-group "$GROUP"
 ```
 
 Unlike the FSKit and WebDAV strategies, this does not mount anything itself. It stands up
 the File Provider RPC server and runs the sync runner so the state database and the
 engine's change feed stay populated; the Swift extension owns the Finder mount once its
-domain is registered (step 5). The daemon prints the RPC socket path on startup.
+domain is registered (step 5). The daemon prints the RPC socket path on startup; state,
+cache and staging live in the same container.
 
 Confirm the socket exists before continuing:
 
 ```bash
-ls -l ~/.config/cascade/fp.sock
+ls -l "$GROUP/fp.sock"
 ```
 
 If the socket is missing, the daemon did not start the File Provider server — check that
@@ -391,9 +382,8 @@ child of `fileproviderd`). If absent, check the system log for
 `subsystem == "com.apple.fileprovider"` for load errors.
 
 **"Register File Provider" returns an error.** The most common cause is a
-code-signing problem — the `.appex` must be signed for `NSFileProviderManager.add`
-to accept it. Rebuild with a real signing identity (step 2) or verify that ad-hoc
-signing produced a signed binary:
+code-signing problem — the `.appex` must be team-signed for `NSFileProviderManager.add`
+to accept it. Rebuild with your team id (step 2) and check the signature:
 
 ```bash
 codesign -dv \
@@ -402,9 +392,11 @@ CascadeFileProviderHost.app/Contents/PlugIns/CascadeFileProvider.appex
 ```
 
 **Finder shows "Unable to connect"** or the extension crashes immediately after
-registration. The daemon is not running or the socket does not exist. Run
-`./target/release/cascade start` and confirm `~/.config/cascade/fp.sock`
-exists before clicking Register.
+registration. The daemon is not running, the socket does not exist, or the extension
+was built without the App Group. Run `./target/release/cascade start --file-provider
+--app-group "$GROUP"` and confirm `"$GROUP/fp.sock"` exists before clicking Register.
+The extension logs `no App Group container is entitled` when its signature carries no
+App Group.
 
 **enumerateChanges never fires.** The system only calls `enumerateChanges` when it
 believes the sync anchor may be stale. Navigate away from the Cascade location and
@@ -412,3 +404,88 @@ back, or trigger a full sync via Finder → Go → Connect to Server (this reloa
 domain). If the engine restarted between calls the anchor it held in memory is gone
 and the extension falls back to a full re-enumeration — this is correct behaviour,
 not a bug.
+
+## Walking-skeleton check (AC-1)
+
+This check requires the `smb` backend type in the CLI (SEC-008); run it once that has
+landed. Before then the daemon refuses `type = "smb"` and does not start.
+
+Lists a folder of the Docker Samba share through a team-signed build and confirms the
+entries are dataless placeholders whose listing read no file content.
+
+1. Start the share (needs Docker):
+
+   ```bash
+   docker compose -f test/smb/compose.yml up -d --wait
+   ```
+
+2. Configure the share as the only backend:
+
+   ```bash
+   mkdir -p ~/.config/cascade
+   cat > ~/.config/cascade/config.toml <<'EOF'
+   [backends.nas]
+   type = "smb"
+   EOF
+   cat > ~/.config/cascade/nas.toml <<'EOF'
+   type = "smb"
+   id = "nas"
+   host = "127.0.0.1"
+   port = 1445
+   share = "data"
+   username = "cascade"
+   password = "cascade"
+   EOF
+   ```
+
+3. Build and sign the host app with your team id (step 2), then start the daemon in the
+   App Group container with debug logging, keeping the log:
+
+   ```bash
+   GROUP=~/Library/Group\ Containers/<your-team-id>.group.io.cascade.shared
+   mkdir -p "$GROUP"
+   ./target/release/cascade start --file-provider --app-group "$GROUP" -v \
+       2>&1 | tee /tmp/cascade-ac1.log
+   ```
+
+4. Open the host app and click Register File Provider (step 5).
+
+5. In Finder, open Cascade under Locations, then `nas`, then `sub`. The root shows
+   `nas`; `sub` shows `hello.txt`.
+
+6. Check that the listed file is a dataless placeholder:
+
+   ```bash
+   stat -f %Sf ~/Library/CloudStorage/*Cascade*/nas/sub/hello.txt
+   ```
+
+   The output contains `dataless`. Run this before opening the file; opening it
+   downloads the content.
+
+7. Check that no file content was read while listing. The extension logs every RPC it
+   sends, and the daemon logs `fetchContents` with the item id before every backend
+   content download:
+
+   ```bash
+   log show --last 10m --info \
+       --predicate 'subsystem == "com.cascade.fileprovider"' \
+       --style compact | grep fetchContents
+   grep fetchContents /tmp/cascade-ac1.log
+   ```
+
+   Both commands print nothing.
+
+8. Record the result:
+
+   | Field | Value |
+   |-------|-------|
+   | Date | |
+   | macOS version | |
+   | Xcode version | |
+   | Team type (Personal Team or paid Apple Developer Program) | |
+   | Team id | |
+   | Root listed `nas` (yes/no) | |
+   | `stat -f %Sf` output for `hello.txt` | |
+   | Content reads in the extension and daemon logs (none, or the lines) | |
+   | Result (pass/fail) | |
+   | Notes | |
