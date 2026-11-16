@@ -396,8 +396,10 @@ fn v8_exec_sessions(conn: &Connection) -> Result<()> {
 ///
 /// `replica_items` maps a daemon-assigned `uid` to the backend's stable id and
 /// keeps the last remote revision seen (`remote_size`, `remote_mtime`,
-/// `remote_ctime`) beside the presented attributes. `replica_tombstones` and
-/// the single-row `replica_meta` back change enumeration from a sync anchor.
+/// `remote_ctime`) beside the presented attributes; an item is pinned while
+/// it is pinned explicitly (`pinned`) or by a pin rule (`rule_pinned`).
+/// `replica_tombstones` and the single-row `replica_meta` back change
+/// enumeration from a sync anchor.
 ///
 /// `content_objects` holds one cached sparse file per row with its
 /// `source_revision` (`source_*` columns) and write-back state; the upload's
@@ -430,6 +432,7 @@ fn v9_replica_and_content(conn: &Connection) -> Result<()> {
             uploaded          BOOLEAN NOT NULL DEFAULT TRUE,
             listed_at         INTEGER,
             pinned            BOOLEAN NOT NULL DEFAULT FALSE,
+            rule_pinned       BOOLEAN NOT NULL DEFAULT FALSE,
             revision          INTEGER NOT NULL,
             UNIQUE (backend_id, stable_id)
         );

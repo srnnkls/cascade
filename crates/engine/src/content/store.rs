@@ -6,6 +6,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use super::ObjectId;
+use crate::db::StateDb;
 
 /// How [`ObjectStore::clone_to`] produced the target file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,5 +131,11 @@ impl ObjectStore {
             Err(e) if e.kind() != ErrorKind::NotFound => Err(e),
             _ => Ok(()),
         }
+    }
+
+    /// Removes a cached object: its row with its ranges, then its file.
+    pub(crate) fn remove(&self, db: &StateDb, id: ObjectId) -> anyhow::Result<()> {
+        db.delete_content_object(id)?;
+        Ok(self.delete(id)?)
     }
 }

@@ -19,7 +19,7 @@ use crate::types::{FileEntry, Revision};
 
 const ITEM_COLUMNS: &str = "uid, parent_uid, name, kind, native_id, stable_id, size, mtime, \
      remote_size, remote_mtime, remote_ctime, content_version, metadata_version, uploaded, \
-     pinned, listed_at IS NOT NULL";
+     pinned OR rule_pinned, listed_at IS NOT NULL";
 
 /// Kind of a replica item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,7 +82,7 @@ pub struct ReplicaItem {
     pub metadata_version: String,
     /// Whether the presented content is on the backend.
     pub uploaded: bool,
-    /// Whether the item is pinned.
+    /// Whether the item is pinned explicitly or by a pin rule.
     pub pinned: bool,
     /// Whether the folder was listed by a presenter.
     pub listed: bool,
@@ -493,6 +493,70 @@ fn item_in(tx: &Transaction<'_>, uid: u64) -> Result<ReplicaItem> {
     .ok_or_else(|| anyhow!("no replica item {uid}"))
 }
 
+/// The source of an item's pin: an item is pinned while either holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinSource {
+    /// Pinned on the item itself, as Keep Downloaded does.
+    Explicit,
+    /// Pinned because a pin rule matches the item.
+    Rule,
+}
+
+impl PinSource {
+    const fn column(self) -> &'static str {
+        match self {
+            Self::Explicit => "pinned",
+            Self::Rule => "rule_pinned",
+        }
+    }
+}
+
+/// The explicit and the rule pin of an item.
+fn pins_in(tx: &Transaction<'_>, uid: u64) -> Result<(bool, bool)> {
+    tx.query_row(
+        "SELECT pinned, rule_pinned FROM replica_items WHERE uid = ?1",
+        [id_to_sql(uid)?],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()?
+    .ok_or_else(|| anyhow!("no replica item {uid}"))
+}
+
+fn set_pin_in(tx: &Transaction<'_>, uid: u64, source: PinSource, pinned: bool) -> Result<()> {
+    let mut pending = PendingRevision::open(tx)?;
+    tx.execute(
+        &format!(
+            "UPDATE replica_items SET {} = ?2, revision = ?3 WHERE uid = ?1",
+            source.column()
+        ),
+        params![id_to_sql(uid)?, pinned, pending.take()?],
+    )?;
+    pending.commit(tx)
+}
+
+/// Whether pinning the unpinned `item` keeps the presented sizes of all
+/// pinned items, each counted once, within `max_pinned_bytes`.
+fn pin_fits_in(tx: &Transaction<'_>, item: &ReplicaItem, max_pinned_bytes: u64) -> Result<bool> {
+    let others: u64 = tx.query_row(
+        "SELECT COALESCE(SUM(size), 0) FROM replica_items
+         WHERE (pinned OR rule_pinned) AND uid != ?1",
+        [id_to_sql(item.uid)?],
+        |row| u64_column(row, 0),
+    )?;
+    Ok(others.saturating_add(item.size.unwrap_or_default()) <= max_pinned_bytes)
+}
+
+/// Items a reconciliation of the rule pins pinned, refused and unpinned.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PinReport {
+    /// Items pinned, in the order they were given.
+    pub pinned: Vec<u64>,
+    /// Matching items left unpinned because the budget was used.
+    pub refused: Vec<u64>,
+    /// Items no rule matches any more and that are not pinned explicitly.
+    pub unpinned: Vec<u64>,
+}
+
 /// Point the item at the backend file `entry` with `revision`, keeping its
 /// uid and content version. Any other item holding that file, or the item's
 /// name in its folder, is removed: the file replaced it.
@@ -807,6 +871,93 @@ impl StateDb {
                 item_from_row,
             )
             .optional()?)
+    }
+
+    /// Return every item of a backend in uid order.
+    pub fn replica_items_of(&self, backend_id: &str) -> Result<Vec<ReplicaItem>> {
+        let conn = self.lock_conn()?;
+        let mut statement = conn.prepare(&format!(
+            "SELECT {ITEM_COLUMNS} FROM replica_items WHERE backend_id = ?1 ORDER BY uid"
+        ))?;
+        let items = statement
+            .query_map([backend_id], item_from_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(items)
+    }
+
+    /// Pin an item explicitly unless the presented sizes of all pinned
+    /// items would then exceed `max_pinned_bytes`. Returns whether the item
+    /// is pinned; a changed flag moves the item to a new revision.
+    pub fn pin_replica_item(&self, uid: u64, max_pinned_bytes: u64) -> Result<bool> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        let item = item_in(&tx, uid)?;
+        let (explicit, _) = pins_in(&tx, uid)?;
+        if explicit {
+            return Ok(true);
+        }
+        if !item.pinned && !pin_fits_in(&tx, &item, max_pinned_bytes)? {
+            return Ok(false);
+        }
+        set_pin_in(&tx, uid, PinSource::Explicit, true)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Clear the explicit pin of an item, leaving a rule pin; a changed flag
+    /// moves the item to a new revision.
+    pub fn unpin_replica_item(&self, uid: u64) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        if pins_in(&tx, uid)?.0 {
+            set_pin_in(&tx, uid, PinSource::Explicit, false)?;
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
+    /// Make `wanted` the items pinned by rules: clears the rule pin of every
+    /// other item, then pins the items of `wanted` in order while the
+    /// presented sizes of all pinned items stay within `max_pinned_bytes`;
+    /// once one is refused, the rest are refused as well. A changed flag
+    /// moves the item to a new revision.
+    pub fn reconcile_rule_pins(&self, wanted: &[u64], max_pinned_bytes: u64) -> Result<PinReport> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        let wanted_set: HashSet<u64> = wanted.iter().copied().collect();
+        let held: Vec<(u64, bool)> = {
+            let mut statement =
+                tx.prepare("SELECT uid, pinned FROM replica_items WHERE rule_pinned ORDER BY uid")?;
+            statement
+                .query_map([], |row| Ok((u64_column(row, 0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let mut report = PinReport::default();
+        for (uid, explicit) in held {
+            if !wanted_set.contains(&uid) {
+                set_pin_in(&tx, uid, PinSource::Rule, false)?;
+                if !explicit {
+                    report.unpinned.push(uid);
+                }
+            }
+        }
+        for &uid in wanted {
+            let item = item_in(&tx, uid)?;
+            let (explicit, by_rule) = pins_in(&tx, uid)?;
+            if by_rule {
+                continue;
+            }
+            if explicit {
+                set_pin_in(&tx, uid, PinSource::Rule, true)?;
+            } else if report.refused.is_empty() && pin_fits_in(&tx, &item, max_pinned_bytes)? {
+                set_pin_in(&tx, uid, PinSource::Rule, true)?;
+                report.pinned.push(uid);
+            } else {
+                report.refused.push(uid);
+            }
+        }
+        tx.commit()?;
+        Ok(report)
     }
 
     /// Return the id of the backend holding the item with the given uid.

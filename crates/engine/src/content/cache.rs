@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::io::ErrorKind;
-use std::ops::Range;
+use std::ops::{ControlFlow, Range};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError};
@@ -19,6 +19,7 @@ use std::sync::{Arc, PoisonError};
 use anyhow::{Result, anyhow};
 use tokio::sync::broadcast;
 
+use super::evict::{Eviction, ReadGuard};
 use super::names::check_name;
 use super::range_map::{RangeMap, align};
 use super::replica::{ItemKind, Replica, ReplicaItem, ReplicaStore};
@@ -61,7 +62,7 @@ pub struct Handoff {
 
 /// An object that holds every byte of the item's current version.
 #[derive(Debug, Clone)]
-struct Complete {
+pub(super) struct Complete {
     uid: u64,
     object_id: ObjectId,
     size: u64,
@@ -79,9 +80,11 @@ impl From<&ContentObject> for Complete {
     }
 }
 
-enum Source {
-    Complete(Complete),
-    Transfer(Arc<Transfer>),
+/// Where a request is served from, with the reader guard that keeps the
+/// object from eviction while it is served.
+pub(super) enum Source {
+    Complete(Complete, ReadGuard),
+    Transfer(Arc<Transfer>, ReadGuard),
     /// The remote changed; the request starts over.
     Changed,
 }
@@ -99,6 +102,7 @@ pub(super) struct Shared {
     carried: std::sync::Mutex<HashMap<u64, RangeMap>>,
     handoffs: AtomicU64,
     pub(super) writeback: WriteBack,
+    pub(super) eviction: Eviction,
 }
 
 /// Cache of the replica store's content: one sparse object per cached item
@@ -148,6 +152,7 @@ impl ContentCache {
                 carried: std::sync::Mutex::default(),
                 handoffs: AtomicU64::new(0),
                 writeback: WriteBack::new(config.upload_transfers),
+                eviction: Eviction::default(),
             }),
         })
     }
@@ -209,22 +214,28 @@ impl ContentCache {
     /// Fails when the item is unknown, the backend fails or the item keeps
     /// changing while it is read.
     pub async fn read(&self, uid: u64, offset: u64, len: u32) -> Result<Vec<u8>> {
-        for _ in 0..MAX_RESTARTS {
-            let item = self
-                .item(uid)?
-                .ok_or_else(|| BackendError::NotFound(format!("item {uid}")))?;
-            let replica = self.replica(uid)?;
-            match self.source(&replica, &item).await? {
-                Source::Complete(object) => return self.read_complete(&object, offset, len),
-                Source::Transfer(transfer) => {
-                    if let Some(bytes) = self.read_through(&transfer, offset, len).await? {
-                        return Ok(bytes);
-                    }
+        let admit = |item: Option<ReplicaItem>| {
+            item.map(ControlFlow::Continue)
+                .ok_or_else(|| BackendError::NotFound(format!("item {uid}")).into())
+        };
+        self.restarting(uid, admit, |source| async move {
+            match source {
+                Source::Complete(object, _guard) => {
+                    let bytes = self.read_complete(&object, offset, len)?;
+                    self.shared.eviction.touch(object.object_id);
+                    Ok(Some(bytes))
                 }
-                Source::Changed => {}
+                Source::Transfer(transfer, _guard) => {
+                    let bytes = self.read_through(&transfer, offset, len).await?;
+                    if bytes.is_some() {
+                        self.shared.eviction.touch(transfer.object_id);
+                    }
+                    Ok(bytes)
+                }
+                Source::Changed => Ok(None),
             }
-        }
-        Err(TransferError::VersionNoLongerAvailable.into())
+        })
+        .await
     }
 
     /// Hands out a clone of the whole item once every byte is present.
@@ -261,27 +272,62 @@ impl ContentCache {
         uid: u64,
         requested_version: Option<&str>,
         strict: bool,
-        range_of: impl Fn(u64) -> Range<u64>,
+        range_of: impl Fn(u64) -> Range<u64> + Send + Sync,
     ) -> Result<Handoff> {
-        for _ in 0..MAX_RESTARTS {
-            let Some(item) = self.item(uid)? else {
-                return Err(TransferError::VersionNoLongerAvailable.into());
-            };
-            if strict && requested_version.is_some_and(|version| version != item.content_version) {
-                return Err(TransferError::VersionNoLongerAvailable.into());
+        let admit = |item: Option<ReplicaItem>| match item {
+            Some(item)
+                if !strict
+                    || requested_version.is_none_or(|version| version == item.content_version) =>
+            {
+                Ok(ControlFlow::Continue(item))
             }
-            let replica = self.replica(uid)?;
-            match self.source(&replica, &item).await? {
-                Source::Complete(object) => {
-                    return self.hand_off_complete(&object, range_of(object.size));
+            _ => Err(TransferError::VersionNoLongerAvailable.into()),
+        };
+        let range_of = &range_of;
+        self.restarting(uid, admit, |source| async move {
+            match source {
+                Source::Complete(object, _guard) => {
+                    let handoff = self.hand_off_complete(&object, range_of(object.size))?;
+                    self.shared.eviction.touch(object.object_id);
+                    Ok(Some(handoff))
                 }
-                Source::Transfer(transfer) => {
+                Source::Transfer(transfer, _guard) => {
                     let range = range_of(transfer.size);
-                    if let Some(handoff) = self.hand_off(&transfer, range).await? {
-                        return Ok(handoff);
+                    let handoff = self.hand_off(&transfer, range).await?;
+                    if handoff.is_some() {
+                        self.shared.eviction.touch(transfer.object_id);
                     }
+                    Ok(handoff)
                 }
-                Source::Changed => {}
+                Source::Changed => Ok(None),
+            }
+        })
+        .await
+    }
+
+    /// Serves a request from the source of the item's current version,
+    /// starting over while the remote changes it. Before each attempt
+    /// `admit` takes the item as the replica holds it and continues with it
+    /// or ends the request; `attempt` answers `None` when the remote
+    /// changed.
+    pub(super) async fn restarting<T, F>(
+        &self,
+        uid: u64,
+        admit: impl Fn(Option<ReplicaItem>) -> Result<ControlFlow<T, ReplicaItem>>,
+        attempt: impl Fn(Source) -> F,
+    ) -> Result<T>
+    where
+        F: Future<Output = Result<Option<T>>>,
+    {
+        for _ in 0..MAX_RESTARTS {
+            let item = match admit(self.item(uid)?)? {
+                ControlFlow::Break(done) => return Ok(done),
+                ControlFlow::Continue(item) => item,
+            };
+            let replica = self.replica(uid)?;
+            let source = self.source(&replica, &item).await?;
+            if let Some(done) = attempt(source).await? {
+                return Ok(done);
             }
         }
         Err(TransferError::VersionNoLongerAvailable.into())
@@ -347,22 +393,34 @@ impl ContentCache {
     }
 
     /// The object serving the item's current version: a complete object, the
-    /// transfer in progress, or a new or resumed transfer.
-    async fn source(&self, replica: &Arc<Replica>, item: &ReplicaItem) -> Result<Source> {
+    /// transfer in progress, or a new or resumed transfer. Its reader guard is
+    /// taken under the item's slot lock, which eviction also holds; an object
+    /// being evicted answers [`Source::Changed`].
+    pub(super) async fn source(
+        &self,
+        replica: &Arc<Replica>,
+        item: &ReplicaItem,
+    ) -> Result<Source> {
         let slot = self.slot(item.uid);
         let mut current = slot.lock().await;
+        let eviction = &self.shared.eviction;
         if let Some(transfer) = current.take() {
             if !transfer.is_discarded() && transfer.content_version == item.content_version {
+                let Some(guard) = eviction.guard(transfer.object_id) else {
+                    *current = Some(transfer);
+                    return Ok(Source::Changed);
+                };
                 if transfer.is_complete() {
-                    return Ok(Source::Complete(Complete {
+                    let object = Complete {
                         uid: transfer.uid,
                         object_id: transfer.object_id,
                         size: transfer.size,
                         content_version: transfer.content_version.clone(),
-                    }));
+                    };
+                    return Ok(Source::Complete(object, guard));
                 }
                 *current = Some(Arc::clone(&transfer));
-                return Ok(Source::Transfer(transfer));
+                return Ok(Source::Transfer(transfer, guard));
             }
             self.discard(&transfer, false).await?;
         }
@@ -374,14 +432,21 @@ impl ContentCache {
         if let Some(object) = &existing
             && (object.state == ContentState::Complete || object.dirty)
         {
-            return Ok(Source::Complete(Complete::from(object)));
+            return Ok(eviction
+                .guard(object.object_id)
+                .map_or(Source::Changed, |guard| {
+                    Source::Complete(Complete::from(object), guard)
+                }));
         }
         let Some(transfer) = self.start(replica, item, existing).await? else {
             return Ok(Source::Changed);
         };
+        let Some(guard) = eviction.guard(transfer.object_id) else {
+            return Ok(Source::Changed);
+        };
         let transfer = Arc::new(transfer);
         *current = Some(Arc::clone(&transfer));
-        Ok(Source::Transfer(transfer))
+        Ok(Source::Transfer(transfer, guard))
     }
 
     /// Starts a download of the item, resuming `existing` when the backend
@@ -414,8 +479,7 @@ impl ContentCache {
                 Ok(Some(Transfer::new(source, present, &carried)))
             }
             (Some(object), _) => {
-                self.db().delete_content_object(object.object_id)?;
-                self.shared.store.delete(object.object_id)?;
+                self.shared.store.remove(self.db(), object.object_id)?;
                 self.refresh_parent(replica, item.uid).await?;
                 Ok(None)
             }
@@ -432,9 +496,10 @@ impl ContentCache {
                     size,
                 })?;
                 if let Err(error) = self.shared.store.create(object_id, size) {
-                    self.db().delete_content_object(object_id)?;
+                    self.shared.store.remove(self.db(), object_id)?;
                     return Err(error.into());
                 }
+                self.shared.eviction.touch(object_id);
                 let source = source(object_id, entry, revision, size);
                 Ok(Some(Transfer::new(source, RangeMap::default(), &carried)))
             }
@@ -443,19 +508,9 @@ impl ContentCache {
 
     /// Path of the item relative to the backend root.
     pub(super) fn item_path(&self, uid: u64) -> Result<Option<PathBuf>> {
-        let mut names = Vec::new();
-        let mut next = uid;
-        loop {
-            let Some(item) = self.item(next)? else {
-                return Ok(None);
-            };
-            let Some(parent_uid) = item.parent_uid else {
-                break;
-            };
-            names.push(item.name);
-            next = parent_uid;
-        }
-        Ok(Some(names.into_iter().rev().collect()))
+        super::replica::item_path(uid, |uid| {
+            Ok(self.item(uid)?.map(|item| (item.parent_uid, item.name)))
+        })
     }
 
     /// The entry and revision at the item's current path, or `None` when the
@@ -651,7 +706,7 @@ impl ContentCache {
         Ok(Some(buf))
     }
 
-    fn ensure_download(&self, transfer: &Arc<Transfer>) {
+    pub(super) fn ensure_download(&self, transfer: &Arc<Transfer>) {
         if transfer.want() {
             tokio::spawn(self.clone().download(Arc::clone(transfer)));
         }

@@ -131,6 +131,7 @@ async fn daemon_wired_node_accepts_authorised_management_over_the_wire() {
             backends,
             cache_dir: None,
             staging_dir: None,
+            cache: None,
             enable_p2p: false,
             p2p_data_dir: None,
             p2p_posture: None,

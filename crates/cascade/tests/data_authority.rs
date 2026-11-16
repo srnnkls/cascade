@@ -79,6 +79,7 @@ fn make_engine() -> (tempfile::TempDir, Arc<NativeEngine>, DeviceIdentity) {
             )))],
             cache_dir: None,
             staging_dir: None,
+            cache: None,
             enable_p2p: true,
             p2p_data_dir: Some(p2p_dir),
             p2p_posture: None,

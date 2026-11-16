@@ -170,10 +170,11 @@ fn eviction_candidates_are_clean_unpinned_and_least_recent_first() {
     let dirty = insert(&db, 4, 100);
     let pinned = insert(&db, 5, 100);
 
-    db.set_content_last_access(recent, DateTime::from_timestamp_nanos(2_000))
-        .unwrap();
-    db.set_content_last_access(old, DateTime::from_timestamp_nanos(1_000))
-        .unwrap();
+    db.persist_content_recency(&[
+        (recent, DateTime::from_timestamp_nanos(2_000)),
+        (old, DateTime::from_timestamp_nanos(1_000)),
+    ])
+    .unwrap();
     db.add_content_range(old, 0..10).unwrap();
     db.add_content_range(old, 5..30).unwrap();
     save(&db, 4, dirty, 100);

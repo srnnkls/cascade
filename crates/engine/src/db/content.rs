@@ -353,12 +353,20 @@ impl StateDb {
         )
     }
 
-    /// Persist the recency of an object.
-    pub fn set_content_last_access(&self, object_id: ObjectId, at: DateTime<Utc>) -> Result<()> {
-        self.update_object(
-            "UPDATE content_objects SET last_access = ?2 WHERE object_id = ?1",
-            params![object_id_to_sql(object_id)?, time_to_sql(Some(at))],
-        )
+    /// Persist the recency of several objects in one transaction, skipping
+    /// objects that are gone.
+    pub fn persist_content_recency(&self, accesses: &[(ObjectId, DateTime<Utc>)]) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        {
+            let mut update =
+                tx.prepare("UPDATE content_objects SET last_access = ?2 WHERE object_id = ?1")?;
+            for &(object_id, at) in accesses {
+                update.execute(params![object_id_to_sql(object_id)?, time_to_sql(Some(at))])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Delete an object and its ranges.
@@ -379,7 +387,7 @@ impl StateDb {
         let mut statement = conn.prepare(&format!(
             "SELECT {OBJECT_COLUMNS}, {POPULATED_BYTES}
              FROM content_objects o LEFT JOIN replica_items i ON i.uid = o.uid
-             WHERE NOT o.dirty AND NOT COALESCE(i.pinned, FALSE)
+             WHERE NOT o.dirty AND NOT COALESCE(i.pinned OR i.rule_pinned, FALSE)
              ORDER BY o.last_access IS NOT NULL, o.last_access, o.object_id"
         ))?;
         let candidates = statement

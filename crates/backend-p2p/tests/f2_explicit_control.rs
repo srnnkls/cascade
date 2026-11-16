@@ -92,6 +92,7 @@ fn make_engine_with_real_device_id(
             )))],
             cache_dir: None,
             staging_dir: None,
+            cache: None,
             enable_p2p: true,
             p2p_data_dir: Some(p2p_dir),
             p2p_posture: None,

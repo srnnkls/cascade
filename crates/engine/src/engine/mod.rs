@@ -68,6 +68,9 @@ pub struct EngineConfig {
     pub cache_dir: Option<PathBuf>,
     /// Directory the content cache stages handoff clones in.
     pub staging_dir: Option<PathBuf>,
+    /// Cache settings of the resolved root `.cascade` config; its `max_size`
+    /// bounds the cache manager's sweep and the content cache's pinned bytes.
+    pub cache: Option<cascade_config::types::CacheConfig>,
     /// Whether to enable P2P block sharing.
     #[cfg(feature = "p2p")]
     pub enable_p2p: bool,
@@ -114,7 +117,8 @@ impl fmt::Debug for EngineConfig {
             .field("mount_point", &self.mount_point)
             .field("backends", &backends_count)
             .field("cache_dir", &self.cache_dir)
-            .field("staging_dir", &self.staging_dir);
+            .field("staging_dir", &self.staging_dir)
+            .field("cache", &self.cache);
         #[cfg(feature = "p2p")]
         {
             let relay_count = format!("[{} endpoint(s)]", self.p2p_relay_endpoints.len());
@@ -155,7 +159,8 @@ pub struct Engine<R: RuntimeHandle, C: Clock> {
     /// Wall-clock port — injected so the core names no platform time API.
     clock: C,
     vfs: Arc<RwLock<VfsTree>>,
-    cache: CacheManager<R>,
+    /// Cache manager shared with the background loop [`Engine::start`] runs.
+    cache: Arc<CacheManager<R>>,
     config: Arc<ConfigResolver>,
     #[cfg(feature = "p2p")]
     p2p: Option<P2pBridge>,
@@ -262,11 +267,11 @@ impl Engine<TokioRuntimeHandle, NativeClock> {
         let clock = NativeClock;
 
         let config_resolver = Arc::new(ConfigResolver::new(config.mount_point.clone()));
-        let cache = CacheManager::new(
+        let cache = Arc::new(CacheManager::new(
             storage.clone(),
             runtime.clone(),
-            CacheManagerConfig::default(),
-        );
+            CacheManagerConfig::from_settings(config.cache.as_ref()),
+        ));
 
         // P2P bridge (optional) — a native-and-`p2p` concern needing the db.
         #[cfg(feature = "p2p")]
@@ -325,7 +330,8 @@ impl Engine<TokioRuntimeHandle, NativeClock> {
     }
 
     /// The content cache, opened on first use over the replica store with
-    /// every mounted backend registered.
+    /// every mounted backend registered. The cache manager is attached to
+    /// it, so its sweeps and pin rules reach the cache from then on.
     ///
     /// # Errors
     ///
@@ -360,12 +366,38 @@ impl Engine<TokioRuntimeHandle, NativeClock> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .children()
             .iter()
-            .map(|(_, backend)| Arc::clone(backend))
+            .map(|(prefix, backend)| (prefix.clone(), Arc::clone(backend)))
             .collect();
-        for backend in backends {
+        let mut mounts = Vec::with_capacity(backends.len());
+        for (prefix, backend) in backends {
+            mounts.push((backend.id().to_owned(), prefix));
             cache.register(backend)?;
         }
+        self.cache.attach_content(cache.clone(), mounts);
         Ok(cache)
+    }
+
+    /// Pins the content cache's items that the stored pin rules or the
+    /// `.cascade` pin rules of `resolved` match, in path order until the
+    /// cache maximum; the rest are logged. Returns `None` when no content
+    /// cache is configured.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the content cache cannot be opened or the state database
+    /// fails.
+    #[cfg(unix)]
+    pub async fn apply_pin_rules(
+        &self,
+        resolved: &cascade_config::types::ResolvedConfig,
+    ) -> Result<Option<crate::content::evict::PinReport>> {
+        if self.content_dirs.is_none() {
+            return Ok(None);
+        }
+        self.content_cache()?;
+        self.cache
+            .apply_pins(&resolved.pins, &resolved.unpins)
+            .await
     }
 
     /// Inject the exec capability provider, returning the engine.
@@ -456,11 +488,11 @@ impl<R: RuntimeHandle, C: Clock> Engine<R, C> {
         info!(backends = backends.len(), "VFS tree initialised");
 
         let config_resolver = Arc::new(ConfigResolver::new(config.mount_point.clone()));
-        let cache = CacheManager::new(
+        let cache = Arc::new(CacheManager::new(
             storage.clone(),
             runtime.clone(),
-            CacheManagerConfig::default(),
-        );
+            CacheManagerConfig::from_settings(config.cache.as_ref()),
+        ));
         let cancel = Arc::new(AtomicBool::new(false));
 
         Ok(Self {
@@ -631,11 +663,7 @@ impl<R: RuntimeHandle, C: Clock> Engine<R, C> {
     /// to build one with the real presenter, then spawn it yourself.
     pub fn start(&self) -> Result<EngineHandle> {
         let cancel = self.cancel.clone();
-        let cache = CacheManager::new(
-            self.storage.clone(),
-            self.runtime.clone(),
-            CacheManagerConfig::default(),
-        );
+        let cache = Arc::clone(&self.cache);
         let cache_handle = self.runtime.spawn_joinable(Box::pin(async move {
             cache.run_with_flag(cancel).await;
         }));

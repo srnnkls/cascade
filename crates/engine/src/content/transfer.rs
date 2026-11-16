@@ -561,9 +561,7 @@ impl Transfer {
         for range in &self.carried {
             handed_out.insert(range.clone());
         }
-        let deleted = db
-            .delete_content_object(self.object_id)
-            .and_then(|()| Ok(store.delete(self.object_id)?));
+        let deleted = store.remove(db, self.object_id);
         drop(gate);
         self.waiters.close(&Failure::Changed);
         deleted.map(|()| Some(handed_out))
@@ -601,6 +599,10 @@ impl Transfer {
 pub enum CacheSignal {
     /// A backend call succeeded after one failed as unreachable.
     ErrorResolved,
+    /// A sweep chose the cached object of this materialised item; the host
+    /// app evicts the item, and the object is deleted once the item leaves
+    /// the materialised set.
+    Evict(u64),
 }
 
 /// Bounds backend calls by a deadline and raises
@@ -625,6 +627,13 @@ impl Remote {
 
     pub(crate) fn subscribe(&self) -> broadcast::Receiver<CacheSignal> {
         self.signals.subscribe()
+    }
+
+    /// Raises `signal`; without a subscriber it is dropped.
+    pub(crate) fn signal(&self, signal: CacheSignal) {
+        if self.signals.send(signal).is_err() {
+            tracing::debug!(?signal, "signal raised with no subscriber");
+        }
     }
 
     pub(crate) async fn call<T>(&self, op: impl Future<Output = Result<T>>) -> Result<T> {
@@ -653,10 +662,8 @@ impl Remote {
         });
         match &result {
             Ok(_) => {
-                if self.unreachable.swap(false, StdOrdering::AcqRel)
-                    && self.signals.send(CacheSignal::ErrorResolved).is_err()
-                {
-                    tracing::debug!("error resolved with no subscriber");
+                if self.unreachable.swap(false, StdOrdering::AcqRel) {
+                    self.signal(CacheSignal::ErrorResolved);
                 }
             }
             Err(error) if is_unreachable(error) => {

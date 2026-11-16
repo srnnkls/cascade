@@ -2,7 +2,28 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 
+use cascade_config::ResolvedConfig;
+use cascade_engine::engine::NativeEngine;
+
 use super::backends::load_main_config;
+
+/// The resolved `.cascade` config of the mount root.
+pub(super) fn root_config(mount_path: &Path) -> ResolvedConfig {
+    cascade_config::merge::resolve(mount_path, mount_path)
+}
+
+/// Applies the pin rules of the root `.cascade` config to the engine's
+/// content cache; a platform without a content cache has none to apply.
+pub(super) async fn apply_root_pins(engine: &NativeEngine, root: &ResolvedConfig) -> Result<()> {
+    #[cfg(unix)]
+    engine
+        .apply_pin_rules(root)
+        .await
+        .context("apply the pin rules of the root .cascade config")?;
+    #[cfg(not(unix))]
+    let _ = (engine, root);
+    Ok(())
+}
 
 /// Resolve a mount point path, expanding ~ and environment variables.
 pub(super) fn resolve_mount_path(path: &str) -> PathBuf {

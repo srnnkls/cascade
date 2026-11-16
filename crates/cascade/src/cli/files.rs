@@ -39,6 +39,7 @@ pub fn build_engine(ctx: &CliContext) -> Result<NativeEngine> {
         backends,
         cache_dir: None,
         staging_dir: None,
+        cache: None,
         enable_p2p: false,
         p2p_data_dir: None,
         p2p_posture: None,

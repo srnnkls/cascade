@@ -22,6 +22,7 @@ fn make_test_engine() -> NativeEngine {
         )))],
         cache_dir: None,
         staging_dir: None,
+        cache: None,
         backend_factory: None,
         #[cfg(feature = "p2p")]
         enable_p2p: false,
@@ -129,6 +130,7 @@ async fn engine_new_requires_at_least_one_backend() {
         backends: vec![],
         cache_dir: None,
         staging_dir: None,
+        cache: None,
         backend_factory: None,
         #[cfg(feature = "p2p")]
         enable_p2p: false,
@@ -160,6 +162,7 @@ async fn engine_at_root_mount_uses_empty_prefix() {
         )],
         cache_dir: None,
         staging_dir: None,
+        cache: None,
         backend_factory: None,
         #[cfg(feature = "p2p")]
         enable_p2p: false,
@@ -201,6 +204,7 @@ async fn engine_named_mount_binds_at_configured_prefix() {
         )],
         cache_dir: None,
         staging_dir: None,
+        cache: None,
         backend_factory: None,
         #[cfg(feature = "p2p")]
         enable_p2p: false,
@@ -233,6 +237,7 @@ async fn engine_defaults_mount_to_backend_id_when_unset() {
         )))],
         cache_dir: None,
         staging_dir: None,
+        cache: None,
         backend_factory: None,
         #[cfg(feature = "p2p")]
         enable_p2p: false,
@@ -267,6 +272,7 @@ async fn engine_rejects_duplicate_mount_paths() {
         ],
         cache_dir: None,
         staging_dir: None,
+        cache: None,
         backend_factory: None,
         #[cfg(feature = "p2p")]
         enable_p2p: false,
@@ -307,6 +313,7 @@ async fn engine_hydrates_mount_from_db_on_restart() {
             )],
             cache_dir: None,
             staging_dir: None,
+            cache: None,
             backend_factory: None,
             #[cfg(feature = "p2p")]
             enable_p2p: false,
@@ -336,6 +343,7 @@ async fn engine_hydrates_mount_from_db_on_restart() {
         )))],
         cache_dir: None,
         staging_dir: None,
+        cache: None,
         backend_factory: None,
         #[cfg(feature = "p2p")]
         enable_p2p: false,
@@ -372,6 +380,7 @@ async fn engine_with_multiple_backends() {
         ],
         cache_dir: None,
         staging_dir: None,
+        cache: None,
         backend_factory: None,
         #[cfg(feature = "p2p")]
         enable_p2p: false,

@@ -50,6 +50,7 @@ impl Harness {
             )],
             cache_dir: None,
             staging_dir: None,
+            cache: None,
             enable_p2p: true,
             p2p_data_dir: Some(dir.path().join("p2p")),
             p2p_posture: None,

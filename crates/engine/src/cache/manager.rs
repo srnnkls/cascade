@@ -10,17 +10,56 @@
 //! instead of concrete tokio/rusqlite types so it compiles to both native
 //! and WASM targets. The cancel mechanism is runtime-specific: a tokio
 //! `watch` channel on native, an `AtomicBool` flag on portable.
+//!
+//! On native unix builds a [`ContentCache`] can be attached: size eviction
+//! then runs as its sweep, and the stored and `.cascade` pin rules decide
+//! which replica items are pinned by rules.
 
 use crate::cache::lifecycle::{EvictionDecision, LifecycleEvaluator};
 use crate::cache::pin::{self, PinMatcher};
+#[cfg(all(feature = "native", unix))]
+use crate::content::cache::ContentCache;
+#[cfg(all(feature = "native", unix))]
+use crate::content::evict::PinReport;
 #[cfg(feature = "p2p")]
 use crate::p2p_bridge::P2pBridge;
 use crate::portable::{RuntimeHandle, StateStorage};
 use crate::types::CacheState;
 use anyhow::Result;
 use std::path::Path;
+#[cfg(all(feature = "native", unix))]
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
+
+/// A content cache attached to the manager, with the VFS prefix of each
+/// backend it serves.
+#[cfg(all(feature = "native", unix))]
+#[derive(Debug, Clone)]
+struct ContentLink {
+    cache: ContentCache,
+    mounts: Vec<(String, PathBuf)>,
+}
+
+#[cfg(all(feature = "native", unix))]
+impl ContentLink {
+    /// The VFS path of a backend-relative path.
+    fn vfs_path(&self, backend_id: &str, relative: &Path) -> Option<PathBuf> {
+        self.mounts
+            .iter()
+            .find(|(id, _)| id == backend_id)
+            .map(|(_, prefix)| prefix.strip_prefix("/").unwrap_or(prefix).join(relative))
+    }
+}
+
+/// The `.cascade` pins and unpins of the last applied resolved config, as
+/// pin rules without conditions.
+#[cfg(all(feature = "native", unix))]
+#[derive(Debug, Default)]
+struct ConfigPins {
+    pins: Vec<crate::db::PinRuleRecord>,
+    unpins: Vec<crate::db::PinRuleRecord>,
+}
 
 /// Configuration for the cache manager.
 #[derive(Debug, Clone, Copy)]
@@ -43,6 +82,20 @@ impl Default for CacheManagerConfig {
     }
 }
 
+impl CacheManagerConfig {
+    /// The default configuration bounded by the `max_size` of the resolved
+    /// `.cascade` cache settings.
+    #[must_use]
+    pub fn from_settings(settings: Option<&cascade_config::types::CacheConfig>) -> Self {
+        Self {
+            max_size: settings
+                .and_then(|settings| settings.max_size)
+                .map(cascade_config::types::MaxSize::as_bytes),
+            ..Self::default()
+        }
+    }
+}
+
 /// Manages file caching, pinning, and eviction.
 pub struct CacheManager<R: RuntimeHandle> {
     storage: Arc<dyn StateStorage>,
@@ -50,6 +103,10 @@ pub struct CacheManager<R: RuntimeHandle> {
     config: CacheManagerConfig,
     #[cfg(feature = "p2p")]
     p2p: Option<Arc<P2pBridge>>,
+    #[cfg(all(feature = "native", unix))]
+    content: std::sync::RwLock<Option<ContentLink>>,
+    #[cfg(all(feature = "native", unix))]
+    config_pins: tokio::sync::Mutex<ConfigPins>,
 }
 
 impl<R: RuntimeHandle> std::fmt::Debug for CacheManager<R> {
@@ -73,7 +130,95 @@ impl<R: RuntimeHandle> CacheManager<R> {
             config,
             #[cfg(feature = "p2p")]
             p2p: None,
+            #[cfg(all(feature = "native", unix))]
+            content: std::sync::RwLock::default(),
+            #[cfg(all(feature = "native", unix))]
+            config_pins: tokio::sync::Mutex::default(),
         }
+    }
+
+    /// Attaches the content cache serving the backends mounted at `mounts`
+    /// (backend id and VFS prefix), replacing an earlier attachment. A
+    /// configured `max_size` becomes the cache maximum.
+    #[cfg(all(feature = "native", unix))]
+    pub fn attach_content(&self, cache: ContentCache, mounts: Vec<(String, PathBuf)>) {
+        if let Some(max_size) = self.config.max_size {
+            cache.set_max_size(max_size);
+        }
+        *self
+            .content
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(ContentLink { cache, mounts });
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    fn content(&self) -> Option<ContentLink> {
+        self.content
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Keeps `pins` and `unpins` as the `.cascade` pin rules and reconciles
+    /// the rule pins of the attached content cache to them; see
+    /// [`reconcile_pins`](Self::reconcile_pins). Returns `None` without an
+    /// attached content cache.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the rules or the state database cannot be read.
+    #[cfg(all(feature = "native", unix))]
+    pub async fn apply_pins(
+        &self,
+        pins: &[cascade_config::types::PinRule],
+        unpins: &[cascade_config::types::PinRule],
+    ) -> Result<Option<PinReport>> {
+        let config = ConfigPins {
+            pins: config_rules(pins),
+            unpins: config_rules(unpins),
+        };
+        self.reconcile_pins(Some(config)).await
+    }
+
+    /// Reconciles the rule pins of the attached content cache to the items
+    /// the stored pin rules or the `.cascade` pins match and no `.cascade`
+    /// unpin matches, replacing the `.cascade` rules with `update` first.
+    /// New matches are pinned in path order until the cache maximum; the
+    /// rest are logged. Rules with conditions are not applied. Returns
+    /// `None` without an attached content cache.
+    #[cfg(all(feature = "native", unix))]
+    async fn reconcile_pins(&self, update: Option<ConfigPins>) -> Result<Option<PinReport>> {
+        let mut config = self.config_pins.lock().await;
+        if let Some(update) = update {
+            *config = update;
+        }
+        let Some(link) = self.content() else {
+            return Ok(None);
+        };
+        let mut rules: Vec<_> = PinMatcher::load(&*self.storage)
+            .await?
+            .rules()
+            .iter()
+            .filter(|rule| rule.conditions.as_deref().is_none_or(str::is_empty))
+            .cloned()
+            .collect();
+        rules.extend(config.pins.iter().cloned());
+        let pinned = PinMatcher::from_rules(rules);
+        let excluded = PinMatcher::from_rules(config.unpins.clone());
+        let report = link.cache.reconcile_rule_pins(|backend_id, relative| {
+            link.vfs_path(backend_id, relative)
+                .is_some_and(|path| pinned.is_pinned(&path) && !excluded.is_pinned(&path))
+        })?;
+        drop(config);
+        if !report.refused.is_empty() {
+            info!(
+                pinned = report.pinned.len(),
+                refused = report.refused.len(),
+                "pin rules exceed the cache maximum"
+            );
+        }
+        Ok(Some(report))
     }
 
     /// Attach a P2P bridge for content fetching.
@@ -107,11 +252,8 @@ impl<R: RuntimeHandle> CacheManager<R> {
     /// Pin a path — all files matching the glob will be kept offline.
     pub async fn pin(&self, path_glob: &str, recursive: bool) -> Result<()> {
         let _matcher = pin::add_pin_rule(&*self.storage, path_glob, recursive).await?;
-
-        // Transition matching files to Pinned state.
-        // For now, we just record the rule. Actual file download is deferred
-        // to the background worker which will detect Pinned-state files that
-        // aren't yet cached and queue downloads.
+        #[cfg(all(feature = "native", unix))]
+        self.reconcile_pins(None).await?;
         info!("pin rule added: {} (recursive={})", path_glob, recursive);
         Ok(())
     }
@@ -121,6 +263,8 @@ impl<R: RuntimeHandle> CacheManager<R> {
         let removed = pin::remove_pin_rule(&*self.storage, path_glob).await?;
         if removed {
             info!("pin rule removed: {}", path_glob);
+            #[cfg(all(feature = "native", unix))]
+            self.reconcile_pins(None).await?;
         }
         Ok(removed)
     }
@@ -160,8 +304,17 @@ impl<R: RuntimeHandle> CacheManager<R> {
             }
         }
 
-        // 2. Evict LRU files if cache exceeds max_size.
-        if let Some(max_size) = self.config.max_size {
+        // 2. Evict LRU objects of the attached content cache, or else LRU
+        //    files, if the cache exceeds max_size.
+        #[cfg(all(feature = "native", unix))]
+        let content = self.content();
+        #[cfg(not(all(feature = "native", unix)))]
+        let content: Option<()> = None;
+        #[cfg(all(feature = "native", unix))]
+        if let Some(link) = &content {
+            report.bytes_freed = link.cache.sweep().await?;
+        }
+        if let (None, Some(max_size)) = (&content, self.config.max_size) {
             let current_size = u64::try_from(
                 self.storage
                     .cache_size()
@@ -280,6 +433,22 @@ impl<R: RuntimeHandle> CacheManager<R> {
             }
         }
     }
+}
+
+/// Stored pin rules for `.cascade` pin entries without conditions; each one
+/// covers its path and everything below it.
+#[cfg(all(feature = "native", unix))]
+fn config_rules(rules: &[cascade_config::types::PinRule]) -> Vec<crate::db::PinRuleRecord> {
+    rules
+        .iter()
+        .filter(|rule| rule.conditions.is_empty())
+        .map(|rule| crate::db::PinRuleRecord {
+            id: 0,
+            path_glob: rule.path.trim_matches('/').to_owned(),
+            recursive: true,
+            conditions: None,
+        })
+        .collect()
 }
 
 /// Cache statistics.

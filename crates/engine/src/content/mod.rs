@@ -8,6 +8,8 @@ use crate::backend::BackendError;
 pub mod anchor;
 #[cfg(unix)]
 pub mod cache;
+#[cfg(unix)]
+pub mod evict;
 #[cfg(all(test, cascade_loom, unix))]
 mod loom_model;
 pub mod names;

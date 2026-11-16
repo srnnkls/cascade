@@ -6,7 +6,7 @@ use cascade_engine::engine::{EngineConfig, NativeEngine};
 use cascade_presenter_nfs::nfs::server::{NfsCacheMode, NfsServer, NfsServerConfig};
 
 use super::backends::cli_backend_factory;
-use super::helpers::{ensure_directory, is_mounted, write_pid_file};
+use super::helpers::{apply_root_pins, ensure_directory, is_mounted, root_config, write_pid_file};
 use super::{
     CliContext, PresenterResources, ResolvedP2pConfig, WebOptions, finish_shutdown, mark_web_ready,
     start_web, stop_web, wait_for_shutdown_signal,
@@ -28,12 +28,15 @@ pub(super) async fn try_nfs(
     web: &WebOptions,
 ) -> Result<()> {
     let paths = ctx.app_paths()?;
+    let root = root_config(mount_path);
+
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
         mount_point: mount_path.to_path_buf(),
         backends,
         cache_dir: Some(paths.cache_dir),
         staging_dir: Some(paths.staging_dir),
+        cache: root.cache,
         enable_p2p: p2p.enable_p2p,
         p2p_data_dir: None,
         p2p_posture: p2p.posture,
@@ -46,6 +49,7 @@ pub(super) async fn try_nfs(
     // remote management (the P2P backend). Done before the presenter starts so
     // an inbound ManageRequest is authorised and executed rather than refused.
     engine.wire_manage_dispatch().await;
+    apply_root_pins(&engine, &root).await?;
 
     // Clone the engine handle for the HTTP API before the engine is moved into
     // the presenter resources; the API server is started only once the winning

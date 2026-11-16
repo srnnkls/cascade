@@ -5,7 +5,7 @@
 //! backend; a [`Replica`] is the unit of listing and scanning for one.
 
 use std::collections::HashSet;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
@@ -25,6 +25,27 @@ pub const TEMP_UPLOAD_PREFIX: &str = ".cascade-tmp-";
 #[must_use]
 pub fn is_temp_upload(name: &str) -> bool {
     name.starts_with(TEMP_UPLOAD_PREFIX)
+}
+
+/// Path of the item `uid` relative to its backend root, given the parent
+/// uid and name of an item; `None` when the item or an ancestor is unknown.
+pub(crate) fn item_path(
+    uid: u64,
+    mut parent_and_name: impl FnMut(u64) -> Result<Option<(Option<u64>, String)>>,
+) -> Result<Option<PathBuf>> {
+    let mut names = Vec::new();
+    let mut next = uid;
+    loop {
+        let Some((parent, name)) = parent_and_name(next)? else {
+            return Ok(None);
+        };
+        let Some(parent) = parent else {
+            break;
+        };
+        names.push(name);
+        next = parent;
+    }
+    Ok(Some(names.into_iter().rev().collect()))
 }
 
 /// Changes since an anchor.

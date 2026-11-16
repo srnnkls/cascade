@@ -403,14 +403,14 @@ impl ContentCache {
         let size = match placed {
             Ok(size) => size,
             Err(error) => {
-                self.db().delete_content_object(object_id)?;
-                store.delete(object_id)?;
+                store.remove(self.db(), object_id)?;
                 return Err(error.into());
             }
         };
         let (saved, superseded) =
             self.db()
                 .accept_content_save(uid, object_id, size, Utc::now())?;
+        self.shared().eviction.touch(object_id);
         drop(current);
         for object in superseded {
             store.delete(object)?;
