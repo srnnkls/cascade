@@ -11,6 +11,8 @@
 
 Rust (edition 2024) · Swift (macOS File Provider extension) · SQLite state · Tokio async runtime
 
+This fork (`srnnkls/cascade`) supports macOS only. Its product is the macOS host app with the File Provider extension and the embedded daemon, which serves a File Provider folder and an NFS volume from one content cache (see [Content cache, protocol v2 and the local-wins rule](#content-cache-protocol-v2-and-the-local-wins-rule)); the fork's CI runs the macOS Rust and Swift jobs only. The Linux, Windows, wasm and iOS code stays in the tree unmaintained, and the cross-platform statements below describe the upstream project.
+
 ## Why
 
 Every cloud provider ships their own desktop client. They all share the same shape — pick a folder, sync it, hope your disk is bigger than the data. Google Drive for Desktop has a stream mode that loads files on demand, but it's macOS- and Windows-only, leaves you guessing what's actually local, and behaves badly offline. Dropbox, OneDrive, iCloud — same story, each with their own client, their own quirks, their own opinions about your filesystem layout.
@@ -33,7 +35,7 @@ The bet is that one filesystem client that works the same on every laptop is mor
 
 - Rust toolchain pinned in [`rust-toolchain.toml`](rust-toolchain.toml) (currently 1.96.0, edition 2024). `rustup` installs it automatically on first build.
     - **rustup (recommended)** — the project pins its Rust toolchain in `rust-toolchain.toml`. Install rustup from <https://rustup.rs/> so local builds, the pre-push hook, and CI all use the same compiler.
-- macOS: Xcode Command Line Tools (for Swift File Provider and FSKit extensions). FSKit requires macOS 15.4+ (Sequoia).
+- macOS: Xcode 26 or later with an Apple account signed in, for the File Provider host app and extension, which target macOS 26; the Command Line Tools suffice for the Rust workspace and `swift test --package-path swift/CascadeFileProviderKit`. FSKit requires macOS 15.4+ (Sequoia).
 - Linux: `libfuse3` runtime libraries for the FUSE presenter (`apt install libfuse3-dev` on Debian/Ubuntu, `yum install fuse3-devel` on RHEL/Fedora). NFS fallback additionally needs root to bind a privileged port.
 - Windows: the built-in `WebClient` service for the WebDAV mount. It ships with Windows but is often set to manual start — `sc config WebClient start= auto` (in an elevated shell) makes it come up automatically. A native ProjFS presenter (`presenter-projfs`) is implemented and tried first by `cascade start` — it serves directory browsing and on-demand file reads through an engine-backed content provider — with WebDAV as the fallback if ProjFS cannot start (for example when the Client-ProjFS optional feature is disabled).
 
@@ -76,13 +78,14 @@ cargo build --release
 cargo build --release --features presenter-nfs
 cargo build --release --features presenter-fileprovider  # macOS only
 
-# Including Swift extensions (macOS)
-cargo build --release
-xcodebuild -project swift/CascadeFileProvider.xcodeproj -scheme CascadeFileProviderHost -configuration Release -destination "platform=macOS" -allowProvisioningUpdates DEVELOPMENT_TEAM=<team-id> build
+# macOS host app with the File Provider extension and the embedded daemon, signed
+make fileprovider-build TEAM=<team id> CONFIGURATION=Release
 # Unsigned compile check, no team needed
 xcodebuild -project swift/CascadeFileProvider.xcodeproj -scheme CascadeFileProviderHost -configuration Release -destination "platform=macOS" CODE_SIGNING_ALLOWED=NO build
 cd swift/CascadeFSKit && xcodebuild
 ```
+
+`make fileprovider-build` runs `xcodebuild` with `-allowProvisioningUpdates`, which lets Xcode register the bundle identifiers and the App Group for the team and create the development profiles; it needs an Apple account signed into Xcode. The host app's script phase `embed-cascade.sh` compiles `cascade` with cargo, places it in `Contents/MacOS` and signs it with the app's identity.
 
 The `Makefile` wraps the common workflows:
 
@@ -93,6 +96,9 @@ make start     # build then run the daemon
 make stop      # stop a running daemon
 make dev       # cargo watch with debug logging
 make debug     # run the release binary with RUST_LOG=debug
+make fileprovider-build TEAM=<team id>     # signed host app build (CONFIGURATION ?= Debug)
+make fileprovider-app-path TEAM=<team id>  # print the built CascadeFileProviderHost.app path
+make fileprovider-smoke TEAM=<team id>     # build, then open the host app
 ```
 
 ### Run
@@ -157,6 +163,21 @@ The design is documented in full at [`docs/design.md`](docs/design.md). This sec
 
 Communication between the platform layer and the engine uses a Unix domain socket with a length-prefixed JSON protocol, shared by the CLI, the macOS File Provider and FSKit extensions, and any future GUI.
 
+### Content cache, protocol v2 and the local-wins rule
+
+On macOS the host app `CascadeFileProviderHost` runs as a menu-bar agent. It registers itself as a login item, registers the Cascade File Provider domain, embeds the extension and the `cascade` binary, and runs one daemon, `cascade start --app-group <container>`, from its own bundle. That daemon serves File Provider protocol v2 on `fp.sock` in the team-prefixed App Group container and the NFS volume at the mount point, both from one content cache, and the host app relays the daemon's signals to `NSFileProviderManager`. The signed build and its manual checks are in [`docs/fileprovider-smoke-test.md`](docs/fileprovider-smoke-test.md).
+
+Local edit wins: when a file changed on the server and on the Mac, the upload replaces the server's version under the same name; no conflict copy is made, and a file deleted on the server is recreated. Names SMB cannot hold and symbolic links created in the File Provider folder stay on the Mac as excluded from sync.
+
+The SMB backend (`crates/backend-smb`, SMB2/3 with NTLM) is configured per backend in `~/.config/cascade/<name>.toml` with `type = "smb"`, `host`, `share`, `username`, `password`, and optionally `port` (default 445), `prefix` (a sub-directory of the share) and `id`; without `id` the backend takes the name it is configured under. The password is stored in the TOML file.
+
+Details are in the design document:
+
+- [Content cache](docs/design.md#content-cache): objects and ranges, [ranged reads](docs/design.md#reads), [identity and versions](docs/design.md#identity-and-versions), [change detection](docs/design.md#change-detection), [write-back](docs/design.md#write-back), [local edit wins](docs/design.md#local-edit-wins) and [eviction and pins](docs/design.md#eviction-and-pins).
+- [App Group container and the daemon process](docs/design.md#app-group-container-and-the-daemon-process): the host app, the container layout and the `--app-group` flags.
+- [SMB backend](docs/design.md#smb-backend): deadlines, reconnect and request sizes.
+- [Wire protocol](docs/design.md#wire-protocol): protocol v2 methods, streams and error codes, and protocol v1.
+
 ### Workspace structure
 
 ```
@@ -180,7 +201,8 @@ crates/
   cascade/                Binary crate (CLI entry point and daemon)
   relay-server/           Opaque byte-pipe relay (binary): pairs two WebSocket clients by session ID for WAN NAT traversal, HMAC-gated, never inspects payload
 swift/
-  CascadeFileProvider/    macOS File Provider extension
+  CascadeFileProvider/    macOS host app (menu-bar agent) and File Provider extension, thin adapters
+  CascadeFileProviderKit/ Swift package with the extension and host logic: protocol v2 client, items, enumeration, daemon supervision
   CascadeFSKit/           macOS FSKit extension (15.4+)
 workers/
   announce/               Stateless announce-server Cloudflare Worker (workers-rs, KV soft state)
@@ -200,7 +222,7 @@ Integration tests live inside each crate's `tests/` directory rather than at wor
 
 ### State database
 
-SQLite at `~/.config/cascade/state.db`. Tables: `files`, `backends`, `pin_rules`, `lifecycle_policies`, `config_cache`, `sync_cursors`, `p2p_peers`, `p2p_block_index`, `grants`, `manage_audit`. Full schema in [`docs/design.md`](docs/design.md).
+SQLite at `~/.config/cascade/state.db`, or `state.db` in the App Group container under `--app-group`. Tables include `files`, `backends`, `pin_rules`, `lifecycle_policies`, `config_cache`, `sync_cursors`, `p2p_peers`, `p2p_block_index`, `grants`, `manage_audit`, and, from schema v9, the content cache's `replica_items`, `replica_tombstones`, `replica_meta`, `content_objects`, `content_ranges`, `content_written`, `materialized_items` and `replica_deletes`. Full schema in [`docs/design.md`](docs/design.md).
 
 ## Conventions
 
@@ -222,7 +244,8 @@ SQLite at `~/.config/cascade/state.db`. Tables: `files`, `backends`, `pin_rules`
 - **Google Drive rate limits** — ~10,000 requests per 100 seconds per user. The backend uses a token-bucket rate limiter and batch requests where possible.
 - **Cross-backend moves** are not atomic — they download from source, upload to destination, then delete the original. A failure partway through can leave duplicates.
 - **P2P block sizes are adaptive**: 128KB for files under 250MB, 512KB for 250MB–1GB, 1MB for files over 1GB. This is not configurable per-file.
-- **Conflict copies are never auto-deleted.** The losing version is renamed with the device name and date (e.g. `report (work-laptop 2026-05-27).conflict`). P2P-only folders use last-write-wins per-block.
+- **Conflict copies are never auto-deleted.** The losing version is renamed with the device name and date (e.g. `report (work-laptop 2026-05-27).conflict`). P2P-only folders use last-write-wins per-block. The content cache under `cascade start --app-group` makes no conflict copies: the Mac's edit wins and replaces the server's version.
+- The NFS volume of `cascade start --app-group` reads and writes through the content cache: writes edit the cached object in place and are uploaded as one save after five quiet seconds.
 - **Shadowing in nested mounts**: if a child mount point exists in the parent backend with files, the child takes over and the parent's files are hidden (not deleted). Removing the child reveals them.
 - **Nested-mount listing and shadowing** work across all three on-demand presenters — NFS, WebDAV, and FUSE. A backend mounted inside another's subtree (`work/projects`) appears as a directory when you list the parent (`/work`), shadowing a same-named entry, and a multi-segment mount prefix is shown nested at the right level rather than flat. Reads and writes route into the nested mount by longest-prefix match.
 - **Pre-1.0 path-shape change (uniform-backend-mounts refactor).** Each configured backend now mounts at a named prefix under a neutral VFS root rather than at the bare root. A single backend named `gdrive` appears at `gdrive/Documents/…` instead of `Documents/…`. To keep the old layout, add `mount = "/"` to that backend's config — an at-root mount is a first-class configuration, not a special case. Pin rules, lifecycle policies, and any stored `files.path` values written before this change need updating to include the mount prefix (e.g. `Documents/**` → `gdrive/Documents/**`). The state database schema is unchanged; only the semantics of `files.path` changed from a backend-relative path to a full VFS-absolute path.
@@ -244,6 +267,7 @@ SQLite at `~/.config/cascade/state.db`. Tables: `files`, `backends`, `pin_rules`
 | v9 | Full P2P (WAN discovery, NAT traversal), implemented |
 | v10 | Node management plane (capability grants, remote administration over BEP), implemented |
 | v11 | OS background service (`cascade service install|start|stop|status|uninstall`): per-user LaunchAgent on macOS, systemd `--user` unit on Linux, logon Scheduled Task on Windows, implemented |
+| Fork | macOS content cache: one cache for File Provider and NFS, protocol v2, SMB backend, host app with the embedded daemon, implemented |
 
 Full timeline estimates, dependency list, and reference implementations in [`docs/design.md`](docs/design.md).
 

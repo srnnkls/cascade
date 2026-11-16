@@ -1,7 +1,7 @@
 //! Eviction and pins, after rclone's `vfs/vfscache/cache.go` purge and dios
 //! `pool/epoch.rs` (`FrameGuard`) and `pool/clock.rs`.
 //!
-//! Every reader of an object holds a [`ReadGuard`]; an object is evictable
+//! Every reader of an object holds a `ReadGuard`; an object is evictable
 //! when it is clean, unpinned and without a live guard. Recency is kept in
 //! memory and written to `last_access` only by the sweep. A sweep removes
 //! whole objects in recency order until the populated bytes fall under the

@@ -162,7 +162,7 @@ impl<R: RuntimeHandle> CacheManager<R> {
 
     /// Keeps `pins` and `unpins` as the `.cascade` pin rules and reconciles
     /// the rule pins of the attached content cache to them; see
-    /// [`reconcile_pins`](Self::reconcile_pins). Returns `None` without an
+    /// `reconcile_pins`. Returns `None` without an
     /// attached content cache.
     ///
     /// # Errors

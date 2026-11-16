@@ -13,6 +13,7 @@ A cross-platform cloud storage filesystem client built in Rust. Combines on-dema
 - [`.cascade` config system](#cascade-config-system)
 - [Expression language](#expression-language)
 - [Cache manager](#cache-manager)
+- [Content cache](#content-cache)
 - [P2P engine](#p2p-engine)
 - [State database](#state-database)
 - [CLI interface](#cli-interface)
@@ -62,6 +63,8 @@ A cross-platform cloud storage filesystem client built in Rust. Combines on-dema
 
 Communication between the platform layer and the engine uses a Unix domain socket with a length-prefixed JSON protocol. The same protocol is shared by the CLI, the macOS File Provider extension, and any future GUI.
 
+The fork `srnnkls/cascade` supports macOS only. On macOS the host app runs `cascade start --app-group <container>`, which serves the File Provider domain over protocol v2 and the NFS volume from one [content cache](#content-cache); the SMB backend is the backend it is built and tested against. The Linux, Windows, wasm and iOS code stays in the tree unmaintained, and the fork's CI runs the macOS Rust and Swift jobs only.
+
 ## Workspace layout
 
 ```
@@ -81,6 +84,7 @@ cascade/
 │   │       │   ├── store.rs      # CacheStore — disk operations
 │   │       │   └── lifecycle.rs  # LifecyclePolicy evaluation
 │   │       ├── backend.rs        # Backend trait definition
+│   │       ├── content/          # ContentCache: replica, sparse objects, transfers, write-back, eviction
 │   │       ├── sync/
 │   │       │   ├── mod.rs
 │   │       │   ├── change.rs     # Change detection and reconciliation
@@ -148,6 +152,7 @@ cascade/
 │   ├── backend-dropbox/          # Dropbox Files API
 │   ├── backend-onedrive/         # OneDrive Graph API
 │   ├── backend-local/            # Local filesystem (adopt-and-sync)
+│   ├── backend-smb/              # SMB share (SMB2/3, NTLM): reads, writes, file-id identity, reconnect
 │   ├── presenter-nfs/            # NFS server + FUSE presenter
 │   │   └── src/
 │   │       ├── lib.rs
@@ -162,7 +167,9 @@ cascade/
 │   ├── presenter-fileprovider/   # macOS File Provider bridge (Rust side)
 │   │   └── src/
 │   │       ├── lib.rs
-│   │       └── bridge.rs         # Unix domain socket server for Swift extension
+│   │       ├── wire.rs           # Protocol v1 and v2 messages, error codes, signals
+│   │       ├── server.rs         # Socket servers: ContentServer (v2) and FileProviderServer (v1)
+│   │       └── engine_handlers.rs # Protocol v1 handlers
 │   ├── presenter-projfs/         # Windows ProjFS presenter (native, via windows crate Win32_Storage_ProjectedFileSystem)
 │   └── cascade/                  # Binary crate
 │       └── src/
@@ -177,11 +184,13 @@ cascade/
 │           │   └── config.rs     # cascade config
 │           └── daemon.rs         # Background daemon management
 ├── swift/
-│   └── CascadeFileProvider/
-│       ├── CascadeFileProviderExtension.swift
-│       ├── CascadeEngineClient.swift    # Unix socket client
-│       ├── CascadeFileProviderItem.swift # NSFileProviderItem bridging
-│       └── Info.plist
+│   ├── CascadeFileProvider.xcodeproj    # Host app and extension targets
+│   ├── CascadeFileProvider/
+│   │   ├── Host/                        # Menu-bar agent: login item, domain, daemon, signal relay
+│   │   ├── Sources/                     # NSFileProviderReplicatedExtension adapter
+│   │   ├── Resources/                   # Info.plists and entitlements
+│   │   └── Scripts/embed-cascade.sh     # Build phase: compiles and signs the embedded daemon
+│   └── CascadeFileProviderKit/          # Swift package: protocol v2 client, items, enumeration, supervision
 ├── windows/
 │   └── CascadeShellExt/                 # (optional, later)
 └── tests/
@@ -633,7 +642,7 @@ No file badges or native placeholder support — CLI provides visibility instead
 
 ### macOS File Provider presenter
 
-See [macOS File Provider extension](#macos-file-provider-extension) below.
+See [macOS File Provider extension](#macos-file-provider-extension) below. Under `cascade start --app-group` the NFS presenter and the File Provider presenter both read and write through the [content cache](#content-cache): NFS `LOOKUP`, `READDIR` and `CREATE` resolve paths through the replica, `READ` is a ranged read of the cache, and `WRITE` edits the cached object in place. An NFS `CREATE` or `RENAME` to a name SMB cannot hold is refused with `NFS3ERR_INVAL` or `NFS4ERR_INVAL`.
 
 ### Platform context providers
 
@@ -1012,15 +1021,12 @@ struct PeerContext {
 
 ### Background worker
 
-Runs on a configurable interval (default: 5 minutes). Each tick:
+Runs every 5 minutes, the first tick 5 minutes after the engine starts. Each tick:
 
-1. **Scan pinned paths** — ensure everything under a pinned directory is fully cached. Queue downloads for any that aren't.
-2. **Check max size** — if total cache exceeds `cache.max_size`, evict the least-recently-accessed non-pinned files until under the limit.
-3. **Check max age** — evict any non-pinned file where `last_access + max_age < now`, subject to matching lifecycle policy conditions.
-4. **Upload dirty files** — push any locally-modified files back to the backend.
-5. **Sync remote changes** — poll backend's `changes()` API and reconcile.
+1. Lifecycle eviction: cached files that a lifecycle policy evicts return to `Online`.
+2. Size eviction: with a [content cache](#content-cache) attached, its sweep runs; otherwise, when the cached files exceed `cache.max_size`, the least-recently-accessed non-pinned files return to `Online` until the total is under the limit.
 
-Eviction is always LRU among non-pinned files. Pinned files are only removed by explicit `unpin`.
+Uploads and remote changes are not part of this worker: the content cache's write-back worker and change scanner handle them under `--app-group`, and the sync runner polls the backends otherwise. `cascade cache evict` builds its own cache manager on the state database without a content cache, so it never runs the content cache's sweep.
 
 ### Lifecycle policy evaluation
 
@@ -1053,6 +1059,91 @@ impl CacheManager {
     }
 }
 ```
+
+## Content cache
+
+`ContentCache` (`crates/engine/src/content/`, native Unix builds only) holds the content of every mounted backend for the File Provider domain and the NFS volume of `cascade start --app-group`. Both presenters, write-back and eviction read the same state: one object per item and content version, its present byte ranges in the database.
+
+### Objects and ranges
+
+Each cached object is a sparse file in the cache directory, named by its object id and created with its full logical size and no allocated blocks. The `content_ranges` table is the authority for the bytes present, kept merged; `SEEK_DATA` is not used, because APFS zero-fills gaps under 16 MiB. A fetched range is never overwritten while a clone of the object may exist; a changed remote produces a new object. A crash loses ranges written after the last database commit, which are fetched again.
+
+The File Provider extension receives content as an APFS clone of the object, made in `staging/` in the App Group container and moved by the extension into the domain's temporary directory. A clone shares its blocks with the object, so a file opened through Finder occupies its space once. A clone is handed out only when the requested range is fully present, since holes read as zeros. The cache directory, the App Group container and the extension's temporary directory must share one APFS volume; across volumes the clone falls back to a copy, which occupies the space twice.
+
+### Reads
+
+An NFS `READ` calls `read(uid, offset, len)`: it fetches the missing part of the range plus 8 MiB of read-ahead and serves it, without starting a download of the whole file.
+
+A File Provider `fetch` or `fetchRange` starts one download of the whole file, in requests of at most 1 MiB. Ranges with waiting readers are fetched first, in arrival order, each as its own request; with no waiter the download fills from the lowest missing offset. A `fetchRange` is answered with a clone once its aligned range is present. A download nobody waits on stops after one minute without a request; ten consecutive failed reads fail its waiters.
+
+The download records the backend revision of the item when it starts and reads it again before each clone handoff, before serving a range fetched for NFS and after its last read. A different stable id, size, last-write time or change time, or a path that no longer resolves, discards the object, updates the replica and restarts on the new version; a strict fetch for the old version fails with `versionNoLongerAvailable`. A complete object is handed out at its recorded version without contacting the backend. Every backend call carries a 15 s deadline.
+
+### Identity and versions
+
+`replica_items.uid` is assigned by the daemon, mapped to `(backend_id, stable_id)`, and is the File Provider item identifier. Backends report a revision (stable id, size, last-write time, change time) through default `Backend` trait methods; the SMB backend's stable id is the volume serial and the file id, so a rename or an in-place overwrite on the server keeps the item, its cached content and its pin, while a replace-by-rename produces a new id. Backends without a stable id fall back to the native id.
+
+`content_version` is a token the daemon mints when a scan finds size or last-write time changed, when it finds change time moved while size, last-write time, name and parent are unchanged, and when a local save is accepted. `metadata_version` follows name, parent and attributes. A rename therefore changes the metadata version only, and the system's copy of the daemon's own upload stays current.
+
+### Change detection
+
+The scan set holds every folder listed through File Provider or NFS and every folder containing a materialised item. Every 60 seconds a scanner lists each, parents first, and stats every file that is materialised or has a cached object. Differences advance a per-store revision; deletions become tombstones. Sync anchors encode `store_id:revision`, and pruned tombstones raise a floor below which anchors expire with `syncAnchorExpired`. After a scan that changed anything the daemon signals `workingSet`. NFS `LOOKUP`, `READDIR` and `CREATE` resolve paths through the replica and register missing ancestors, which is how a folder used only over NFS enters the scan set. A change in a folder never listed is seen once the folder is opened. `.cascade-tmp-*` names are never listed.
+
+### Write-back
+
+Write-back state is kept on the cached object, after rclone's VFS cache. A save through File Provider (`create` or `modify` with contents) arrives as a clone the extension placed in `staging/`; it is moved into a new object, marked `dirty`, given a new content version and committed before the reply, which carries the item with `uploaded = false`. Reads of the item are served from the dirty object. A save into an object that is already dirty replaces its content and cancels an upload in progress, so two saves before an upload give one upload of the second.
+
+NFS `WRITE` and size changes edit the object in place: the written range becomes present and the object `dirty` and `edited` without a backend call. Further writes go into the same object; once five seconds pass without a further write, the missing ranges are fetched and the edit is accepted as one save with one content version.
+
+A worker uploads a dirty object five seconds after its last save, up to four at once. The upload writes `.cascade-tmp-<uid>` in the target's folder, records the temporary name and file id on the object, and renames it over the target. After the rename the uid is re-linked to the new file id and the replica takes the renamed file's revision; the content version minted at the save stays. A failed upload, including `Access Denied` while another client holds the target open, is retried with a delay that doubles up to five minutes. Dirty objects survive restarts: start-up recovery finishes or resumes recorded uploads and removes stray `.cascade-tmp-*` files before the first scan.
+
+Renames, moves, deletes and folder creates run directly against the backend. While it is unreachable they fail with `serverUnreachable`; File Provider keeps the change pending and issues it again after the daemon signals `errorResolved`, which it does on the first successful backend call after an unreachable one. An NFS caller receives an I/O error.
+
+### Local edit wins
+
+When a file changed on the server and on the Mac, the Mac's edit wins: the upload replaces whatever the server holds under the same name and recreates a file deleted there. No conflict copy is made, and an edit made on the server to a file also edited on the Mac is lost when the upload completes. A delete in Finder of a file changed on the server deletes it there.
+
+A created symbolic link, and a created item whose name SMB cannot hold, stay on the Mac and report `excludedFromSync`; nothing is created on the server. A rename of a synced item to such a name is answered with the item under its current name and leaves the server unchanged.
+
+### Eviction and pins
+
+Every reader of an object holds a guard; an object is evictable when it is clean, unpinned and without a live guard. Recency is kept in memory and written to `content_objects.last_access` by the sweep. The sweep runs on the cache manager's tick, every five minutes from five minutes after start, and removes evictable objects in least-recently-used order until the populated bytes, counted from `content_ranges`, are at most `cache.max_size`. The object of an item outside the materialised set is deleted directly. For a materialised item the daemon signals `evict`, the host app calls `evictItem`, and the object is deleted once the extension's next `materializedSet` no longer contains the item; until then the sweep moves on to the next candidate.
+
+Keep Downloaded and `.cascade` pin rules set `replica_items.pinned`, reported to the system as `downloadEagerlyAndKeepDownloaded`; a pinned file downloads without being read and is never evicted. A pin that would raise pinned bytes above `cache.max_size` is refused with `NSFileWriteOutOfSpaceError`; a pin rule matching more pins its matches in path order until the budget is used and logs the rest. Remove Download unpins the item, asks the system to evict it, and then sends `evict`, which deletes the object, or answers busy for a dirty or open one.
+
+`cache.max_size` and the pin rules are read at daemon start from the `.cascade` files in the mount-point directory, before the NFS volume is mounted over it, and from the stored pin rules.
+
+### App Group container and the daemon process
+
+The host app `CascadeFileProviderHost` is an unsandboxed menu-bar agent registered as a login item through `SMAppService`. It embeds the extension and the `cascade` binary, which the build phase `swift/CascadeFileProvider/Scripts/embed-cascade.sh` compiles with cargo and signs with the team identity and the hardened runtime. On launch it registers the domain `io.cascade.fileprovider.default`, starts `cascade start --app-group <container>` with its output appended to `daemon.log` in the container, adopts a daemon already serving the socket, restarts the daemon five seconds after it exits, and sends it `SIGTERM` on Quit. It subscribes to the daemon's signal stream and relays `workingSet`, `errorResolved`, `evict` and `requestDownload` to `NSFileProviderManager`; only a process whose main bundle embeds the extension can signal the domain.
+
+The container is the team-prefixed App Group `<team id>.group.io.cascade.shared` under `~/Library/Group Containers/`, which the sandboxed extension can reach and which only a team-signed build is entitled to. `cascade start --app-group <container>` places its state there; configuration stays in the `--config` directory (`~/.config/cascade`):
+
+| Path in the container | Content |
+|-----------------------|---------|
+| `state.db` | State database |
+| `cascade.pid` | Daemon process id |
+| `fp.sock` | Protocol v2 socket; the daemon refuses to start when its path exceeds 103 bytes, the 104-byte `sun_path` less the terminating NUL |
+| `cache/` | Object files |
+| `staging/` | Clones handed to and received from the extension |
+| `daemon.log` | Daemon output, appended by the host app |
+
+`--app-group` implies `--file-provider` and also mounts the NFS volume at the mount point (`~/Cloud` unless `[mount] point` is set; `--no-mount` skips it). The CLI reaches the same state with `--app-group <container>`.
+
+### SMB backend
+
+`crates/backend-smb` serves an SMB2/3 share with NTLM authentication. Its per-backend file `~/.config/cascade/<name>.toml` holds:
+
+| Key | Meaning |
+|-----|---------|
+| `type` | `"smb"` |
+| `host` | Server host name or address |
+| `share` | Share name |
+| `username`, `password` | NTLM credentials, stored in the file |
+| `port` | TCP port, default 445 |
+| `prefix` | Optional sub-directory of the share to serve |
+| `id` | Backend id; without it the backend takes the name it is configured under |
+
+The client sits behind a lock that a reconnect replaces. Connecting has a 5 s deadline and each request 10 s; a timeout or a dropped connection marks the client dead, the operation gets one reconnect and retry, and it fails at the latest 15 s after it began with `TransientError::Unreachable`. Reads and writes are split into requests of at most 1 MiB, because larger concurrent reads hang without an error. SMB offers no conditional write, which is why uploads go through a temporary name and a rename.
 
 ## P2P engine
 
@@ -1211,7 +1302,7 @@ The connectivity ladder is exercised end to end on Linux network namespaces. The
 
 ## State database
 
-SQLite, stored at `~/.config/cascade/state.db`:
+SQLite, stored at `~/.config/cascade/state.db`, or at `state.db` in the App Group container under `cascade start --app-group`:
 
 ```sql
 CREATE TABLE files (
@@ -1324,6 +1415,22 @@ they gate the BEP sync serve and accept directions per (peer, folder). See
 default-open ACL decision, the enforcement points in the sync path, and the
 receive-only / write-only conflict semantics.
 
+Schema v9 adds the tables of the [content cache](#content-cache) and leaves the
+existing tables and the meaning of `files.path` unchanged; its definitions are in
+`crates/engine/src/db/schema.rs` (`v9_replica_and_content`). Times are nanoseconds
+since the Unix epoch.
+
+| Table | Content |
+|-------|---------|
+| `replica_items` | One row per item: daemon-assigned `uid`, `backend_id`, `stable_id`, `native_id`, parent, name, kind, size and times, the last remote revision, `content_version`, `metadata_version`, `uploaded`, `pinned`, `rule_pinned`, `revision` |
+| `replica_tombstones` | Deleted uids with the revision of their deletion |
+| `replica_meta` | `store_id`, current revision, tombstone floor, whether the remote was last unreachable |
+| `content_objects` | One row per cached object: `uid`, `content_version`, source revision, `size`, `state` (`partial` or `complete`), `dirty`, `edited`, upload temporary name and file id, `last_access` |
+| `content_ranges` | Present byte ranges per object, merged |
+| `content_written` | Ranges written in place through NFS into an `edited` object |
+| `materialized_items` | Items the system reports as on disk |
+| `replica_deletes` | Items whose backend delete was issued and whose local state is not yet removed |
+
 ## CLI interface
 
 ```
@@ -1331,6 +1438,9 @@ cascade [command] [options]
 
 Commands:
   start                         Start the daemon and mount all configured backends
+  start --app-group <container> Serve File Provider protocol v2 and the NFS volume from the content cache,
+                                with state, cache, staging and fp.sock in the App Group container
+  start --file-provider         Serve File Provider protocol v1 (without the content cache)
   stop                          Stop the daemon and unmount
   restart                       Restart the daemon
   status                        Show mount status, cache usage, backend health
@@ -1491,54 +1601,52 @@ The VFS resolves by longest-prefix match. Children can nest arbitrarily deep. Mo
 
 ## macOS File Provider extension
 
-A Swift app extension (~1,000 lines) that bridges `NSFileProviderExtension` to the Rust engine over a Unix domain socket.
+An `NSFileProviderReplicatedExtension` with partial content fetching that forwards every call to the daemon over protocol v2. The extension and the host app are thin adapters over the Swift package `CascadeFileProviderKit`; the host app and the daemon process are described under [App Group container and the daemon process](#app-group-container-and-the-daemon-process). The signed build and its manual checks are in [`docs/fileprovider-smoke-test.md`](fileprovider-smoke-test.md).
 
 ### Architecture
 
 ```
-Finder ←→ NSFileProviderExtension (Swift) ←→ Unix socket ←→ Cascade Engine (Rust)
+Finder ←→ fileproviderd ←→ CascadeFileProvider.appex ←→ fp.sock ←→ cascade start --app-group (ContentCache)
+                                                                          │ subscribe: workingSet, errorResolved,
+                                                                          ▼ evict, requestDownload
+                            NSFileProviderManager ←── CascadeFileProviderHost.app
 ```
 
-The extension lives in `swift/CascadeFileProvider/`. It contains:
+- `swift/CascadeFileProvider/Sources/CascadeFileProvider.swift` — the extension. Each method calls the package and completes exactly once.
+- `swift/CascadeFileProvider/Host/` — the menu-bar agent: login item, domain registration, daemon supervision, signal relay.
+- `swift/CascadeFileProviderKit/` — the package: `DaemonLink` (one persistent connection, reopened with `hello` after the daemon hangs up), `DaemonClient` (requests, staging of saved contents, moving fetched contents into `temporaryDirectoryURL()`), `CascadeItem` (item mapping, `contentPolicy`, capabilities, `userInfo.pinned`), `CascadeEnumerator` (pages and sync anchors), `Errors` (wire codes to `NSFileProviderError` and Cocoa errors), `CompleteOnce`, `DaemonSupervisor`, `Manager` (signal relay and actions), `AppGroup`.
 
-- `CascadeFileProviderExtension.swift` — the `NSFileProviderExtension` subclass. Each method sends a request to the Rust engine and returns the result.
-- `CascadeEngineClient.swift` — Unix domain socket client. Serialises requests as JSON, reads JSON responses.
-- `CascadeFileProviderItem.swift` — bridges between the engine's `VfsItem` type and `NSFileProviderItem`.
+The extension reports the materialised set after `materializedItemsDidChange`, answers a symlink create with `excludedFromSync` without calling the daemon, and offers two actions: Keep Downloaded (`io.cascade.action.keepDownloaded`, for unpinned items), which pins, and Remove Download (`io.cascade.action.removeDownload`, for downloaded or pinned items), which unpins, calls `evictItem` and then the daemon's `evict`.
 
 ### Wire protocol
 
-The same protocol is used by the CLI, the File Provider extension, and any future GUI. JSON over Unix domain socket, length-prefixed:
+JSON over a Unix domain socket, each message a 4-byte big-endian length and a JSON body. A request carries `id`, `method` and `params`; a response carries `id` and either `result` or `error` with a `code` and a `message`.
 
-```rust
-// Each message: 4-byte big-endian length + JSON body
-struct Request {
-    id: u32,
-    method: String,
-    params: serde_json::Value,
-}
+Protocol v2 is served by `ContentServer` under `cascade start --app-group`. A connection opens with `hello` and the version 2; an older or newer version is refused with `olderExtensionVersionRunning` or `newerExtensionVersionFound`.
 
-struct Response {
-    id: u32,
-    result: Option<serde_json::Value>,
-    error: Option<String>,
-}
-```
+| Method | Purpose |
+|--------|---------|
+| `hello` | Version handshake |
+| `item` | One item by uid |
+| `list` | One page of a folder's children |
+| `workingSet` | One page of the working set |
+| `currentAnchor` | Current sync anchor (`store_id:revision`) |
+| `changes` | Changes since an anchor, or `syncAnchorExpired` |
+| `fetch` | Whole content as a clone in `staging/` |
+| `fetchRange` | Aligned range as a clone, optionally strict about the version |
+| `create` | Create a file or folder, with contents from `staging/` |
+| `modify` | Rename, move or save new contents |
+| `delete` | Delete an item, recursively for a folder |
+| `setPinned` | Pin or unpin items |
+| `evict` | Drop the object of an item, or answer busy |
+| `materializedSet` | Report the items the system holds on disk |
+| `cancel` | Cancel a running request |
+| `progress` | Stream of progress frames of a fetch |
+| `subscribe` | Stream of signals: `workingSet`, `errorResolved`, `evict`, `requestDownload` |
 
-Methods:
+Error codes are the Swift case names of `NSFileProviderError` codes (`notAuthenticated`, `filenameCollision`, `syncAnchorExpired`, `pageExpired`, `serverUnreachable`, `noSuchItem`, `deletionRejected`, `directoryNotEmpty`, `cannotSynchronize`, `nonEvictable`, `versionNoLongerAvailable`, `excludedFromSync`, `olderExtensionVersionRunning`, `newerExtensionVersionFound`) and of Cocoa codes (`fileWriteOutOfSpace`, `userCancelled`, `featureUnsupported`), which the extension maps 1:1.
 
-| Method | Params | Returns |
-|--------|--------|---------|
-| `getItem` | `{ id }` | `VfsItem` |
-| `fetchContents` | `{ id }` | `{ path }` |
-| `enumerateItems` | `{ parent_id, page }` | `[VfsItem]` |
-| `createDirectory` | `{ name, parent_id }` | `VfsItem` |
-| `importDocument` | `{ source_url, parent_id }` | `VfsItem` |
-| `moveItem` | `{ id, new_parent_id, new_name }` | `VfsItem` |
-| `deleteItem` | `{ id }` | `{}` |
-| `pinItem` | `{ id }` | `{}` |
-| `evictItem` | `{ id }` | `{}` |
-| `getThumbnail` | `{ id, size }` | `{ data }` |
-| `getStatus` | `{}` | `StatusInfo` |
+Protocol v1 remains for `cascade start --file-provider` without `--app-group`, served by `FileProviderServer` without the content cache, one connection per call. Its methods are `getItem`, `enumerateItems`, `fetchContents`, `importDocument`, `createDirectory`, `deleteItem`, `moveItem`, `currentSyncCursor` and `enumerateChanges`. The current extension speaks only v2.
 
 ### What File Provider gives you
 
@@ -1546,9 +1654,10 @@ Methods:
 |-----------|-----|---------------|
 | File state badges | ✗ | ✓ |
 | Placeholder files | Faked | Native |
-| Right-click pin/evict | CLI only | Native context menus |
+| Right-click pin/evict | CLI only | Keep Downloaded and Remove Download actions |
 | Spotlight indexing | ✗ | ✓ |
-| Quick Look previews | Triggers download | Extension provides thumbnails |
+| Quick Look previews | Triggers download | Triggers download; no thumbnails for dataless files |
+| Range reads without a whole-file download | ✓ | ✗ (a partial fetch starts one download of the whole file) |
 | Graceful offline | Mount dies | Cached files visible |
 | Adopt existing dirs | ✗ | ✓ (domain registration) |
 | Quarantine attrs | Bypassed | Applied automatically |
@@ -1617,6 +1726,8 @@ Conflict copies are never deleted automatically — the user resolves them manua
 
 For P2P-only folders (no cloud authority), last-write-wins on a per-block basis, with conflict copies for simultaneous full-file edits.
 
+The content cache of `cascade start --app-group` makes no conflict copies: the Mac's edit wins and replaces the server's version under the same name (see [Local edit wins](#local-edit-wins)).
+
 ## Background service
 
 `cascade service` manages the daemon as an OS background service. Each platform uses the standard per-user mechanism — no administrator rights required.
@@ -1659,7 +1770,7 @@ The daemon exits cleanly with a log message and exit code 0 when no backends are
 ### Prerequisites
 
 - Rust 1.85+ (edition 2024)
-- On macOS: Xcode Command Line Tools (for Swift compilation of File Provider extension)
+- On macOS: Xcode 26 or later with an Apple account signed in, for the host app and the File Provider extension (macOS 26 deployment target); the Command Line Tools suffice for the Rust workspace and the `CascadeFileProviderKit` package tests
 - On Linux: `libfuse3-dev` (for FUSE)
 - On Windows: WinFSP installed
 
@@ -1673,9 +1784,14 @@ cargo build --release
 cargo build --release --features presenter-nfs
 cargo build --release --features presenter-fileprovider  # macOS only
 
-# Build everything including Swift extension (macOS)
-cargo build --release
-cd swift/CascadeFileProvider && xcodebuild
+# Host app with the File Provider extension and the embedded daemon (macOS),
+# signed through -allowProvisioningUpdates; its script phase embed-cascade.sh
+# compiles cascade with cargo and signs it with the app's identity. Run in a
+# local GUI session, signing fails over ssh
+make fileprovider-build TEAM=<team id> CONFIGURATION=Release
+
+# Swift package tests
+swift test --package-path swift/CascadeFileProviderKit
 ```
 
 ### Run
@@ -1779,6 +1895,7 @@ Grants are kept as a local list with the connection's authenticated device ID as
 | v9 | Full P2P (WAN discovery, NAT traversal), implemented — includes rendezvous-by-presence | +8-12 weeks | +4,000 |
 | v10 | Node management plane (capability grants, remote administration over BEP), implemented — includes signed capability tokens, delegation chains, and revocation | +6-10 weeks | +3,000 |
 | v11 | OS background service (`cascade service install|start|stop|status|uninstall`): per-user LaunchAgent on macOS, systemd `--user` unit on Linux, logon Scheduled Task on Windows, implemented | +1-2 weeks | +500 |
+| Fork | macOS content cache: one cache for File Provider and NFS, protocol v2, SMB backend, host app with the embedded daemon, implemented | | |
 
 ## Dependencies
 

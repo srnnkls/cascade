@@ -1,4 +1,4 @@
-.PHONY: start stop build dev debug release fileprovider-smoke wasm
+.PHONY: start stop build dev debug release fileprovider-build fileprovider-app-path fileprovider-smoke wasm
 
 BINARY := ./target/release/cascade
 
@@ -23,33 +23,33 @@ dev:
 debug: release
 	exec env RUST_LOG="$${RUST_LOG:-debug}" $(BINARY) start
 
-# Build the macOS File Provider host app and extension, then open the host
-# app so the developer can click "Register File Provider" to register the
-# Cascade domain with macOS. No automated registration — that step requires
-# an interactive UI click in the host app window.
-#
-# Prerequisites: macOS 26+, Xcode, and an Apple development team id passed as
-# TEAM=<team id> (signing is automatic). See docs/fileprovider-smoke-test.md
-# for the full step-by-step guide including backend setup and Finder operations.
-fileprovider-smoke:
-	@test -n "$(TEAM)" || { echo "fileprovider-smoke: set TEAM=<development team id>"; exit 1; }
-	xcodebuild \
-		-project swift/CascadeFileProvider.xcodeproj \
-		-scheme CascadeFileProviderHost \
-		-configuration Debug \
-		-destination "platform=macOS" \
-		-allowProvisioningUpdates \
-		DEVELOPMENT_TEAM=$(TEAM) \
-		build
-	open "$$(xcodebuild \
-		-project swift/CascadeFileProvider.xcodeproj \
-		-scheme CascadeFileProviderHost \
-		-configuration Debug \
-		-destination "platform=macOS" \
-		-showBuildSettings \
-		DEVELOPMENT_TEAM=$(TEAM) \
-		2>/dev/null \
-		| awk '/BUILT_PRODUCTS_DIR/{print $$3}')/CascadeFileProviderHost.app"
+CONFIGURATION ?= Debug
+XCODEBUILD_HOST = xcodebuild \
+	-project swift/CascadeFileProvider.xcodeproj \
+	-scheme CascadeFileProviderHost \
+	-configuration $(CONFIGURATION) \
+	-destination "platform=macOS" \
+	DEVELOPMENT_TEAM=$(TEAM)
+HOST_APP_PATH = $$($(XCODEBUILD_HOST) -showBuildSettings 2>/dev/null | awk '$$1 == "BUILT_PRODUCTS_DIR" {print $$3; exit}')/CascadeFileProviderHost.app
+
+# Signed build of the macOS File Provider host app with the embedded extension
+# and cascade daemon. Requires macOS 26+, Xcode with an Apple account signed in
+# and TEAM=<development team id>; CONFIGURATION defaults to Debug.
+fileprovider-build:
+	@test -n "$(TEAM)" || { echo "fileprovider-build: set TEAM=<development team id>" >&2; exit 1; }
+	$(XCODEBUILD_HOST) -allowProvisioningUpdates build
+
+# Prints the path of the built CascadeFileProviderHost.app and nothing else,
+# for APP="$$(make -s fileprovider-app-path TEAM=<team id>)".
+fileprovider-app-path:
+	@test -n "$(TEAM)" || { echo "fileprovider-app-path: set TEAM=<development team id>" >&2; exit 1; }
+	@echo "$(HOST_APP_PATH)"
+
+# Builds and opens the host app, a menu-bar agent that registers the Cascade
+# File Provider domain and starts the embedded daemon itself. The manual
+# checklist is docs/fileprovider-smoke-test.md.
+fileprovider-smoke: fileprovider-build
+	open "$(HOST_APP_PATH)"
 
 # Build the cascade-wasm crate to wasm32-unknown-unknown and run wasm-bindgen
 # to generate the JS glue in crates/cascade-wasm/pkg/.
