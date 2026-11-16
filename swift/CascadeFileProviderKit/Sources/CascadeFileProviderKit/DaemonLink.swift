@@ -171,6 +171,13 @@ final class DaemonLink: @unchecked Sendable {
     }
 }
 
+/// Whether a daemon accepts connections on the socket at `path`.
+func socketAcceptsConnections(_ path: String) -> Bool {
+    guard let fd = try? connectSocket(path) else { return false }
+    Darwin.close(fd)
+    return true
+}
+
 private func connectSocket(_ path: String) throws -> Int32 {
     let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
     guard fd >= 0 else {

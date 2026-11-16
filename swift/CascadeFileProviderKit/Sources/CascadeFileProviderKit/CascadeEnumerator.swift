@@ -14,6 +14,16 @@ public final class CascadeEnumerator: NSObject, NSFileProviderEnumerator, @unche
         self.enumeratedItemIdentifier = enumeratedItemIdentifier
     }
 
+    /// The enumerator of `container`; Cascade has no trash, which the system
+    /// expects to learn from `featureUnsupported` in `NSCocoaErrorDomain`.
+    public static func forContainer(
+        _ container: NSFileProviderItemIdentifier,
+        client: DaemonClient
+    ) throws -> CascadeEnumerator {
+        guard container != .trashContainer else { throw CocoaError(.featureUnsupported) }
+        return CascadeEnumerator(client: client, enumeratedItemIdentifier: container)
+    }
+
     public func invalidate() {
         let tasks = lock.withLock {
             defer { running.removeAll() }
@@ -127,10 +137,12 @@ private final class PageCollector: NSObject, NSFileProviderEnumerationObserver, 
     }
 }
 
-struct Unchecked<Value>: @unchecked Sendable {
-    let value: Value
+/// A non-Sendable system object carried into a closure the system does not
+/// run concurrently with its own use of the object.
+public struct Unchecked<Value>: @unchecked Sendable {
+    public let value: Value
 
-    init(_ value: Value) {
+    public init(_ value: Value) {
         self.value = value
     }
 }

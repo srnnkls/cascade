@@ -230,3 +230,16 @@ func everyIdentifierOfAPagedMaterialisedEnumeratorReachesOneMaterializedSetReque
     let uids = daemon.requests.first?.params["uids"] as? [String] ?? []
     #expect(uids.sorted() == ["a", "b", "c", "d", "e", "root"])
 }
+
+@Test
+func theTrashContainerIsUnsupportedAndOtherContainersGetAnEnumerator() throws {
+    let client = DaemonClient(socketPath: "/tmp/cfpk-absent.sock")
+
+    let trash = #expect(throws: CocoaError.self) {
+        try CascadeEnumerator.forContainer(.trashContainer, client: client)
+    }
+    #expect(trash?.code == .featureUnsupported)
+    #expect(trash.map { ($0 as NSError).domain } == NSCocoaErrorDomain)
+    _ = try CascadeEnumerator.forContainer(.rootContainer, client: client)
+    _ = try CascadeEnumerator.forContainer(.workingSet, client: client)
+}

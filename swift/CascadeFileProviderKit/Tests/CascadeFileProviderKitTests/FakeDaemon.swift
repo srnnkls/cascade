@@ -43,6 +43,7 @@ final class FakeDaemon: @unchecked Sendable {
     private var listener: Int32 = -1
 
     init(
+        socketPath: String? = nil,
         batchSize: Int = 1,
         hello: @escaping @Sendable (Int) -> FakeReply = { _ in .hello(version: 2) },
         respond: @escaping @Sendable (WireRequest) -> FakeReply
@@ -50,8 +51,8 @@ final class FakeDaemon: @unchecked Sendable {
         self.batchSize = batchSize
         self.hello = hello
         self.respond = respond
-        socketPath = "/tmp/cfpk-\(UUID().uuidString.prefix(8)).sock"
-        listener = try Self.listen(at: socketPath)
+        self.socketPath = socketPath ?? "/tmp/cfpk-\(UUID().uuidString.prefix(8)).sock"
+        listener = try Self.listen(at: self.socketPath)
         let listener = listener
         Thread.detachNewThread { [self] in
             while true {

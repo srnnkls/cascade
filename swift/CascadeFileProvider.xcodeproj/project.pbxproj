@@ -7,12 +7,14 @@
 // config plus a generated file invites drift between them.
 //
 // Two native targets:
-//   * CascadeFileProviderHost (.app, host application)
+//   * CascadeFileProviderHost (.app, host agent)
 //   * CascadeFileProvider     (.appex, File Provider extension)
 //
-// The host embeds the extension via a PBXCopyFilesBuildPhase with
-// dstSubfolderSpec = 13 (PlugIns), which is what "Embed App
-// Extensions" produces in the Xcode UI.
+// Both link the local package CascadeFileProviderKit. The host embeds the
+// extension via a PBXCopyFilesBuildPhase with dstSubfolderSpec = 13
+// (PlugIns), which is what "Embed App Extensions" produces in the Xcode
+// UI, and runs CascadeFileProvider/Scripts/embed-cascade.sh, which builds
+// the cascade daemon with cargo into Contents/MacOS.
 //
 // Signing is automatic and needs a team: pass DEVELOPMENT_TEAM=<team id>
 // to xcodebuild. The App Group entitlement is team-prefixed, so an
@@ -23,16 +25,16 @@
 	archiveVersion = 1;
 	classes = {
 	};
-	objectVersion = 56;
+	objectVersion = 60;
 	objects = {
 
 /* Begin PBXBuildFile section */
 		A100000000000000000000A1 /* CascadeFileProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B1 /* CascadeFileProvider.swift */; };
-		A100000000000000000000A2 /* FileProviderItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B2 /* FileProviderItem.swift */; };
-		A100000000000000000000A3 /* FileProviderEnumerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B3 /* FileProviderEnumerator.swift */; };
-		A100000000000000000000A4 /* ActionHandler.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B4 /* ActionHandler.swift */; };
 		A100000000000000000000A5 /* CascadeFileProviderHostApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B5 /* CascadeFileProviderHostApp.swift */; };
 		A100000000000000000000A6 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B6 /* ContentView.swift */; };
+		A100000000000000000000A8 /* HostAgent.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000BB /* HostAgent.swift */; };
+		A100000000000000000000A9 /* CascadeFileProviderKit in Frameworks */ = {isa = PBXBuildFile; productRef = A1000000000000000000081A /* CascadeFileProviderKit */; };
+		A100000000000000000000AA /* CascadeFileProviderKit in Frameworks */ = {isa = PBXBuildFile; productRef = A1000000000000000000081B /* CascadeFileProviderKit */; };
 		A100000000000000000000A7 /* CascadeFileProvider.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = A100000000000000000000C1 /* CascadeFileProvider.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
 
@@ -52,15 +54,14 @@
 
 /* Begin PBXFileReference section */
 		A100000000000000000000B1 /* CascadeFileProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CascadeFileProvider.swift; sourceTree = "<group>"; };
-		A100000000000000000000B2 /* FileProviderItem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileProviderItem.swift; sourceTree = "<group>"; };
-		A100000000000000000000B3 /* FileProviderEnumerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileProviderEnumerator.swift; sourceTree = "<group>"; };
-		A100000000000000000000B4 /* ActionHandler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActionHandler.swift; sourceTree = "<group>"; };
 		A100000000000000000000B5 /* CascadeFileProviderHostApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CascadeFileProviderHostApp.swift; sourceTree = "<group>"; };
 		A100000000000000000000B6 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		A100000000000000000000B7 /* CascadeFileProvider-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "CascadeFileProvider-Info.plist"; sourceTree = "<group>"; };
 		A100000000000000000000B8 /* CascadeFileProvider.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = CascadeFileProvider.entitlements; sourceTree = "<group>"; };
 		A100000000000000000000B9 /* CascadeFileProviderHost-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "CascadeFileProviderHost-Info.plist"; sourceTree = "<group>"; };
 		A100000000000000000000BA /* CascadeFileProviderHost.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = CascadeFileProviderHost.entitlements; sourceTree = "<group>"; };
+		A100000000000000000000BB /* HostAgent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HostAgent.swift; sourceTree = "<group>"; };
+		A100000000000000000000BC /* embed-cascade.sh */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = "embed-cascade.sh"; sourceTree = "<group>"; };
 		A100000000000000000000C1 /* CascadeFileProvider.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = CascadeFileProvider.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		A100000000000000000000C2 /* CascadeFileProviderHost.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CascadeFileProviderHost.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -70,6 +71,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A100000000000000000000A9 /* CascadeFileProviderKit in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -77,6 +79,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A100000000000000000000AA /* CascadeFileProviderKit in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -89,6 +92,7 @@
 				A100000000000000000000F1 /* Sources */,
 				A100000000000000000000F2 /* Host */,
 				A100000000000000000000F3 /* Resources */,
+				A100000000000000000000F5 /* Scripts */,
 				A100000000000000000000F4 /* Products */,
 			);
 			path = CascadeFileProvider;
@@ -98,9 +102,6 @@
 			isa = PBXGroup;
 			children = (
 				A100000000000000000000B1 /* CascadeFileProvider.swift */,
-				A100000000000000000000B2 /* FileProviderItem.swift */,
-				A100000000000000000000B3 /* FileProviderEnumerator.swift */,
-				A100000000000000000000B4 /* ActionHandler.swift */,
 			);
 			path = Sources;
 			sourceTree = "<group>";
@@ -110,6 +111,7 @@
 			children = (
 				A100000000000000000000B5 /* CascadeFileProviderHostApp.swift */,
 				A100000000000000000000B6 /* ContentView.swift */,
+				A100000000000000000000BB /* HostAgent.swift */,
 			);
 			path = Host;
 			sourceTree = "<group>";
@@ -123,6 +125,14 @@
 				A100000000000000000000BA /* CascadeFileProviderHost.entitlements */,
 			);
 			path = Resources;
+			sourceTree = "<group>";
+		};
+		A100000000000000000000F5 /* Scripts */ = {
+			isa = PBXGroup;
+			children = (
+				A100000000000000000000BC /* embed-cascade.sh */,
+			);
+			path = Scripts;
 			sourceTree = "<group>";
 		};
 		A100000000000000000000F4 /* Products */ = {
@@ -149,6 +159,9 @@
 			dependencies = (
 			);
 			name = CascadeFileProvider;
+			packageProductDependencies = (
+				A1000000000000000000081A /* CascadeFileProviderKit */,
+			);
 			productName = CascadeFileProvider;
 			productReference = A100000000000000000000C1 /* CascadeFileProvider.appex */;
 			productType = "com.apple.product-type.app-extension";
@@ -160,6 +173,7 @@
 				A1000000000000000000020B /* Sources */,
 				A100000000000000000000E2 /* Frameworks (Host) */,
 				A100000000000000000000D1 /* Embed App Extensions */,
+				A1000000000000000000090B /* Embed cascade daemon */,
 			);
 			buildRules = (
 			);
@@ -167,6 +181,9 @@
 				A1000000000000000000030B /* PBXTargetDependency */,
 			);
 			name = CascadeFileProviderHost;
+			packageProductDependencies = (
+				A1000000000000000000081B /* CascadeFileProviderKit */,
+			);
 			productName = CascadeFileProviderHost;
 			productReference = A100000000000000000000C2 /* CascadeFileProviderHost.app */;
 			productType = "com.apple.product-type.application";
@@ -190,7 +207,7 @@
 				};
 			};
 			buildConfigurationList = A100000000000000000001A0 /* Build configuration list for PBXProject "CascadeFileProvider" */;
-			compatibilityVersion = "Xcode 14.0";
+			compatibilityVersion = "Xcode 15.0";
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
 			knownRegions = (
@@ -198,6 +215,9 @@
 				Base,
 			);
 			mainGroup = A100000000000000000000F0 /* CascadeFileProvider */;
+			packageReferences = (
+				A1000000000000000000080A /* XCLocalSwiftPackageReference "CascadeFileProviderKit" */,
+			);
 			productRefGroup = A100000000000000000000F4 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
@@ -208,15 +228,30 @@
 		};
 /* End PBXProject section */
 
+/* Begin PBXShellScriptBuildPhase section */
+		A1000000000000000000090B /* Embed cascade daemon */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+			);
+			name = "Embed cascade daemon";
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/bash;
+			shellScript = "\"${SRCROOT}/CascadeFileProvider/Scripts/embed-cascade.sh\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
 /* Begin PBXSourcesBuildPhase section */
 		A1000000000000000000020A /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
 				A100000000000000000000A1 /* CascadeFileProvider.swift in Sources */,
-				A100000000000000000000A2 /* FileProviderItem.swift in Sources */,
-				A100000000000000000000A3 /* FileProviderEnumerator.swift in Sources */,
-				A100000000000000000000A4 /* ActionHandler.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -226,6 +261,7 @@
 			files = (
 				A100000000000000000000A5 /* CascadeFileProviderHostApp.swift in Sources */,
 				A100000000000000000000A6 /* ContentView.swift in Sources */,
+				A100000000000000000000A8 /* HostAgent.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -417,6 +453,7 @@
 				COMBINE_HIDPI_IMAGES = YES;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = CascadeFileProvider/Resources/CascadeFileProviderHost-Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -442,6 +479,7 @@
 				COMBINE_HIDPI_IMAGES = YES;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = CascadeFileProvider/Resources/CascadeFileProviderHost-Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -487,6 +525,26 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		A1000000000000000000080A /* XCLocalSwiftPackageReference "CascadeFileProviderKit" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = CascadeFileProviderKit;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		A1000000000000000000081A /* CascadeFileProviderKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A1000000000000000000080A /* XCLocalSwiftPackageReference "CascadeFileProviderKit" */;
+			productName = CascadeFileProviderKit;
+		};
+		A1000000000000000000081B /* CascadeFileProviderKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A1000000000000000000080A /* XCLocalSwiftPackageReference "CascadeFileProviderKit" */;
+			productName = CascadeFileProviderKit;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = A1000000000000000000110A /* Project object */;
 }

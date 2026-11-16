@@ -1,186 +1,181 @@
 // SPDX-License-Identifier: Apache-2.0
-//
-// Cascade macOS File Provider extension.
-//
-// This is the principal class for the `.appex` bundle. macOS has only
-// ever supported `NSFileProviderReplicatedExtension` for non-iCloud
-// providers; the older `NSFileProviderExtension` is unavailable on
-// macOS regardless of deployment target.
-//
-// The replicated API is "pull" — the system asks us for items and
-// content, then mirrors them into a system-managed working set on
-// disk. We do not manage URLs, placeholders, or sandboxed copies of
-// our own.
-//
-// Each operation here forwards to the Cascade engine over the
-// existing Unix domain socket bridge (see `ActionHandler`). Where the
-// Rust side has not grown a matching method yet, the handler is
-// stubbed to return `NSFileProviderError.notAuthenticated` with a
-// TODO that names the bridge endpoint the Rust side needs.
 
+import CascadeFileProviderKit
 import FileProvider
 import Foundation
 
-final class CascadeFileProvider: NSObject, NSFileProviderReplicatedExtension {
+/// The Cascade domain's replicated extension: an adapter from the system's
+/// calls onto protocol v2 of the daemon behind `fp.sock` in the App Group
+/// container.
+final class CascadeFileProvider: NSObject, NSFileProviderReplicatedExtension, NSFileProviderPartialContentFetching,
+    NSFileProviderCustomAction
+{
     private let domain: NSFileProviderDomain
-    private let actions: ActionHandler
+    private let client: DaemonClient
 
     init(domain: NSFileProviderDomain) {
         self.domain = domain
-        self.actions = ActionHandler()
+        let container = appGroupContainer() ?? FileManager.default.temporaryDirectory
+        client = DaemonClient(socketPath: daemonSocket(in: container).path)
         super.init()
     }
 
-    func invalidate() {
-        // The replicated API guarantees `invalidate` is called once,
-        // before the extension is torn down. We hold no long-lived
-        // resources beyond the per-request socket connections opened
-        // by `ActionHandler`; nothing to do here today.
-    }
-
-    // MARK: - Item lookup
+    func invalidate() {}
 
     func item(
         for identifier: NSFileProviderItemIdentifier,
-        request: NSFileProviderRequest,
+        request _: NSFileProviderRequest,
         completionHandler: @escaping (NSFileProviderItem?, Error?) -> Void
     ) -> Progress {
-        let progress = Progress(totalUnitCount: 1)
-        Task {
-            do {
-                let item = try await actions.item(for: identifier)
-                progress.completedUnitCount = 1
-                completionHandler(item, nil)
-            } catch {
-                completionHandler(nil, mapEngineError(error))
-            }
+        completeOnce({ completionHandler($0.value, $0.failure) }) { [client] in
+            try await client.item(identifier)
         }
-        return progress
     }
 
-    // MARK: - Content fetch
+    func enumerator(
+        for containerItemIdentifier: NSFileProviderItemIdentifier,
+        request _: NSFileProviderRequest
+    ) throws -> NSFileProviderEnumerator {
+        try CascadeEnumerator.forContainer(containerItemIdentifier, client: client)
+    }
+
+    // MARK: Contents
 
     func fetchContents(
         for itemIdentifier: NSFileProviderItemIdentifier,
         version requestedVersion: NSFileProviderItemVersion?,
-        request: NSFileProviderRequest,
+        request _: NSFileProviderRequest,
         completionHandler: @escaping (URL?, NSFileProviderItem?, Error?) -> Void
     ) -> Progress {
         let progress = Progress(totalUnitCount: 1)
-        Task {
-            do {
-                let contentURL = try await actions.fetchContents(for: itemIdentifier)
-                let item = try await actions.item(for: itemIdentifier)
-                progress.completedUnitCount = 1
-                completionHandler(contentURL, item, nil)
-            } catch {
-                completionHandler(nil, nil, mapEngineError(error))
-            }
+        return completeOnce({ completionHandler($0.value?.0, $0.value?.1, $0.failure) }, progress: progress) {
+            [client, domain] in
+            try await client.fetch(
+                itemIdentifier,
+                requestedVersion: requestedVersion,
+                into: temporaryDirectory(of: domain),
+                progress: progress
+            )
         }
-        return progress
     }
 
-    // MARK: - Mutating operations
+    func fetchPartialContents(
+        for itemIdentifier: NSFileProviderItemIdentifier,
+        version requestedVersion: NSFileProviderItemVersion,
+        request _: NSFileProviderRequest,
+        minimalRange requestedRange: NSRange,
+        aligningTo alignment: Int,
+        options: NSFileProviderFetchContentsOptions,
+        completionHandler: @escaping (URL?, NSFileProviderItem?, NSRange, NSFileProviderMaterializationFlags, Error?)
+            -> Void
+    ) -> Progress {
+        let progress = Progress(totalUnitCount: 1)
+        return completeOnce(
+            { result in
+                let contents = result.value
+                completionHandler(
+                    contents?.url, contents?.item, contents?.range ?? requestedRange, [], result.failure
+                )
+            },
+            progress: progress
+        ) { [client, domain] in
+            try await client.fetchRange(
+                itemIdentifier,
+                requestedVersion: requestedVersion,
+                strict: options.contains(.strictVersioning),
+                range: requestedRange,
+                alignment: alignment,
+                into: temporaryDirectory(of: domain),
+                progress: progress
+            )
+        }
+    }
+
+    // MARK: Mutations
 
     func createItem(
         basedOn itemTemplate: NSFileProviderItem,
-        fields: NSFileProviderItemFields,
+        fields _: NSFileProviderItemFields,
         contents url: URL?,
         options: NSFileProviderCreateItemOptions,
-        request: NSFileProviderRequest,
+        request _: NSFileProviderRequest,
         completionHandler: @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void
     ) -> Progress {
-        let progress = Progress(totalUnitCount: 1)
-        Task {
-            do {
-                let created = try await actions.createItem(
-                    template: itemTemplate,
-                    contents: url
-                )
-                progress.completedUnitCount = 1
-                completionHandler(created, [], false, nil)
-            } catch {
-                completionHandler(nil, [], false, mapEngineError(error))
-            }
+        let template = Unchecked(itemTemplate)
+        let mayAlreadyExist = options.contains(.mayAlreadyExist)
+        return completeOnce({ completionHandler($0.value, [], false, $0.failure) }) { [client] in
+            try await client.create(template.value, contents: url, mayAlreadyExist: mayAlreadyExist)
         }
-        return progress
     }
 
     func modifyItem(
         _ item: NSFileProviderItem,
-        baseVersion version: NSFileProviderItemVersion,
+        baseVersion _: NSFileProviderItemVersion,
         changedFields: NSFileProviderItemFields,
         contents newContents: URL?,
-        options: NSFileProviderModifyItemOptions,
-        request: NSFileProviderRequest,
+        options _: NSFileProviderModifyItemOptions,
+        request _: NSFileProviderRequest,
         completionHandler: @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void
     ) -> Progress {
-        let progress = Progress(totalUnitCount: 1)
-        Task {
-            do {
-                let modified = try await actions.modifyItem(
-                    item: item,
-                    changedFields: changedFields,
-                    newContents: newContents
-                )
-                progress.completedUnitCount = 1
-                completionHandler(modified, [], false, nil)
-            } catch {
-                completionHandler(nil, [], false, mapEngineError(error))
-            }
+        let edited = Unchecked(item)
+        let contents = changedFields.contains(.contents) ? newContents : nil
+        return completeOnce({ completionHandler($0.value, [], false, $0.failure) }) { [client] in
+            try await client.modify(edited.value, changedFields: changedFields, contents: contents)
         }
-        return progress
     }
 
     func deleteItem(
         identifier: NSFileProviderItemIdentifier,
-        baseVersion version: NSFileProviderItemVersion,
+        baseVersion _: NSFileProviderItemVersion,
         options: NSFileProviderDeleteItemOptions,
-        request: NSFileProviderRequest,
+        request _: NSFileProviderRequest,
         completionHandler: @escaping (Error?) -> Void
     ) -> Progress {
-        let progress = Progress(totalUnitCount: 1)
-        Task {
-            do {
-                try await actions.deleteItem(identifier: identifier)
-                progress.completedUnitCount = 1
-                completionHandler(nil)
-            } catch {
-                completionHandler(mapEngineError(error))
-            }
+        let recursive = options.contains(.recursive)
+        return completeOnce({ completionHandler($0.failure) }) { [client] in
+            try await client.delete(identifier, recursive: recursive)
         }
-        return progress
     }
 
-    // MARK: - Enumeration
+    // MARK: Materialised set and actions
 
-    func enumerator(
-        for containerItemIdentifier: NSFileProviderItemIdentifier,
-        request: NSFileProviderRequest
-    ) throws -> NSFileProviderEnumerator {
-        FileProviderEnumerator(parentIdentifier: containerItemIdentifier, actions: actions)
+    func materializedItemsDidChange(completionHandler: @escaping () -> Void) {
+        completeOnce({ _ in completionHandler() }) { [client, domain] in
+            guard let manager = NSFileProviderManager(for: domain) else { return }
+            try await client.reportMaterializedSet(from: manager.enumeratorForMaterializedItems())
+        }
     }
 
-    // MARK: - Helpers
-
-    /// Promote a raw engine error to the File Provider error domain.
-    ///
-    /// macOS surfaces these via the Finder's "Unable to … (Error code)"
-    /// dialogue. Structured RPC errors are already mapped to specific
-    /// `NSFileProviderError` cases inside `ActionHandler`; those pass
-    /// through untouched. Local transport and decode failures collapse
-    /// to `.serverUnreachable` (socket gone) or `.cannotSynchronize`
-    /// (engine returned an unparseable response) so the user sees a
-    /// meaningful state regardless of which side of the bridge failed.
-    private func mapEngineError(_ error: Error) -> Error {
-        if let cascadeError = error as? CascadeFileProviderError {
-            switch cascadeError {
-            case .socket:
-                return NSFileProviderError(.serverUnreachable)
-            case .invalidResponse:
-                return NSFileProviderError(.cannotSynchronize)
+    func performAction(
+        identifier actionIdentifier: NSFileProviderExtensionActionIdentifier,
+        onItemsWithIdentifiers itemIdentifiers: [NSFileProviderItemIdentifier],
+        completionHandler: @escaping (Error?) -> Void
+    ) -> Progress {
+        completeOnce({ completionHandler($0.failure) }) { [client, domain] in
+            guard let manager = NSFileProviderManager(for: domain) else {
+                throw NSFileProviderError(.providerNotFound)
             }
+            try await CascadeFileProviderKit.performAction(
+                actionIdentifier, on: itemIdentifiers, client: client, manager: DomainManager(manager)
+            )
         }
-        return error
+    }
+}
+
+/// The directory the system takes fetched contents from.
+private func temporaryDirectory(of domain: NSFileProviderDomain) throws -> URL {
+    guard let manager = NSFileProviderManager(for: domain) else {
+        throw NSFileProviderError(.providerNotFound)
+    }
+    return try manager.temporaryDirectoryURL()
+}
+
+private extension Result {
+    var value: Success? {
+        try? get()
+    }
+
+    var failure: Failure? {
+        if case let .failure(error) = self { error } else { nil }
     }
 }

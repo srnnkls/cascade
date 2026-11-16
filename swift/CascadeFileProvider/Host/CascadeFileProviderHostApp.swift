@@ -1,22 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
-//
-// Cascade File Provider host app.
-//
-// macOS will not load a `.appex` File Provider extension unless the
-// extension is embedded in a containing `.app` and that app has
-// registered an `NSFileProviderDomain` at runtime via
-// `NSFileProviderManager.add(_:completionHandler:)`. This SwiftUI app
-// is the smallest plausible container — its single purpose is to be
-// installed, run once, and call the registration API.
 
 import SwiftUI
 
+/// The host app runs as a menu-bar agent: it embeds the extension and the
+/// `cascade` daemon and keeps both connected for as long as the user is
+/// logged in.
 @main
 struct CascadeFileProviderHostApp: App {
+    @NSApplicationDelegateAdaptor(HostAgent.self) private var agent
+
     var body: some Scene {
-        WindowGroup("Cascade File Provider") {
-            ContentView()
-                .frame(minWidth: 360, minHeight: 240)
+        MenuBarExtra("Cascade", systemImage: "externaldrive.connected.to.line.below") {
+            ContentView(agent: agent)
         }
     }
 }
