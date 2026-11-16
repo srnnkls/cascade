@@ -71,7 +71,9 @@ impl std::fmt::Debug for SmbBackend {
 /// Required keys: `host`, `share`, `username`, `password`.
 ///
 /// Optional keys:
-/// - `id` — unique backend identifier (default: `"smb"`)
+/// - `id` — unique backend identifier, supplied by the caller; the Cascade
+///   CLI sets it to the name the backend is configured under. The fallback
+///   `"smb"` applies only when the crate is used without the CLI.
 /// - `port` — TCP port (default: 445)
 /// - `prefix` — sub-directory of the share to serve
 ///

@@ -3,13 +3,42 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result};
 
 use cascade_config::ResolvedConfig;
-use cascade_engine::engine::NativeEngine;
+use cascade_engine::backend::MountedBackend;
+use cascade_engine::engine::{EngineConfig, NativeEngine};
 
-use super::backends::load_main_config;
+use super::backends::{cli_backend_factory, load_main_config};
+use super::{CliContext, ResolvedP2pConfig};
+use crate::cli::paths::AppPaths;
 
 /// The resolved `.cascade` config of the mount root.
 pub(super) fn root_config(mount_path: &Path) -> ResolvedConfig {
     cascade_config::merge::resolve(mount_path, mount_path)
+}
+
+/// The engine configuration of a daemon start serving `backends` at
+/// `mount_path`.
+pub(super) fn engine_config(
+    ctx: &CliContext,
+    mount_path: &Path,
+    backends: Vec<MountedBackend>,
+    paths: &AppPaths,
+    root: &ResolvedConfig,
+    p2p: &ResolvedP2pConfig,
+) -> EngineConfig {
+    EngineConfig {
+        db_path: ctx.db_path.clone(),
+        mount_point: mount_path.to_path_buf(),
+        backends,
+        cache_dir: Some(paths.cache_dir.clone()),
+        staging_dir: Some(paths.staging_dir.clone()),
+        cache: root.cache,
+        enable_p2p: p2p.enable_p2p,
+        p2p_data_dir: None,
+        p2p_posture: p2p.posture,
+        p2p_relay_endpoints: p2p.relay_endpoints.clone(),
+        p2p_relay_shared_secret: p2p.relay_shared_secret,
+        backend_factory: Some(cli_backend_factory()),
+    }
 }
 
 /// Applies the pin rules of the root `.cascade` config to the engine's

@@ -63,10 +63,21 @@ pub(super) fn create_backend(
             .with_context(|| format!("failed to create local backend `{name}`")),
         "p2p" => cascade_backend_p2p::create_backend(config)
             .with_context(|| format!("failed to create p2p backend `{name}`")),
-        "smb" => cascade_backend_smb::create_backend(config)
+        "smb" => cascade_backend_smb::create_backend(&with_default_id(config, name))
             .with_context(|| format!("failed to create smb backend `{name}`")),
         other => anyhow::bail!("unsupported backend type: {other}"),
     }
+}
+
+/// `config` with `id` set to the backend's configured `name` when it has none.
+fn with_default_id(config: &toml::Value, name: &str) -> toml::Value {
+    let mut config = config.clone();
+    if let Some(table) = config.as_table_mut() {
+        table
+            .entry("id")
+            .or_insert_with(|| toml::Value::String(name.to_owned()));
+    }
+    config
 }
 
 /// Rebuild backends from the main config in deterministic alphabetical order.

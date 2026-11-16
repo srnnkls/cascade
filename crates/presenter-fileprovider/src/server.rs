@@ -110,7 +110,8 @@ impl FileProviderServer {
 }
 
 /// Binds the socket at `socket_path` with mode [`SOCKET_MODE`], creating its
-/// parent and removing a stale socket first.
+/// parent and removing a stale socket first; a socket another listener
+/// still accepts on is refused.
 async fn bind(socket_path: &Path) -> Result<UnixListener> {
     if let Some(parent) = socket_path.parent() {
         tokio::fs::create_dir_all(parent)
@@ -118,6 +119,12 @@ async fn bind(socket_path: &Path) -> Result<UnixListener> {
             .with_context(|| format!("create socket parent directory {}", parent.display()))?;
     }
     if socket_path.exists() {
+        if UnixStream::connect(socket_path).await.is_ok() {
+            anyhow::bail!(
+                "socket {} is held by another listener",
+                socket_path.display()
+            );
+        }
         tokio::fs::remove_file(socket_path)
             .await
             .with_context(|| format!("remove stale socket {}", socket_path.display()))?;
@@ -418,7 +425,29 @@ impl ContentServer {
     ///
     /// Fails when the socket cannot be bound.
     pub async fn serve(&self, cancel: watch::Receiver<bool>) -> Result<()> {
-        let listener = bind(&self.socket_path).await?;
+        let listener = self.listen().await?;
+        self.serve_on(listener, cancel).await
+    }
+
+    /// Bind the listener as [`FileProviderServer::serve`] does.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the socket cannot be bound or another listener holds it.
+    pub async fn listen(&self) -> Result<UnixListener> {
+        bind(&self.socket_path).await
+    }
+
+    /// Serve connections accepted on `listener` until `cancel` fires.
+    ///
+    /// # Errors
+    ///
+    /// Never fails once the listener is bound.
+    pub async fn serve_on(
+        &self,
+        listener: UnixListener,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<()> {
         accept_until(listener, cancel, |stream| {
             let domain = Arc::clone(&self.domain);
             tokio::spawn(async move {

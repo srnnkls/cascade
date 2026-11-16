@@ -112,7 +112,8 @@ pub struct Cli {
     #[arg(long, global = true, default_value = "~/.config/cascade")]
     pub config: String,
 
-    /// App Group container holding state, cache, staging and the File Provider socket
+    /// App Group container holding state, cache, staging and the File Provider socket;
+    /// `start` with it serves File Provider protocol v2 and the NFS volume from one engine
     #[arg(long, global = true)]
     pub app_group: Option<PathBuf>,
 
@@ -1009,6 +1010,7 @@ impl Cli {
                     no_mount,
                     p2p_override,
                     file_provider,
+                    self.app_group.is_some(),
                     web_flags,
                 )
                 .await
@@ -1016,7 +1018,16 @@ impl Cli {
             Commands::Stop => mount::stop(ctx),
             Commands::Restart => {
                 mount::stop(ctx)?;
-                mount::start(ctx, None, false, None, false, mount::WebFlags::default()).await
+                mount::start(
+                    ctx,
+                    None,
+                    false,
+                    None,
+                    false,
+                    self.app_group.is_some(),
+                    mount::WebFlags::default(),
+                )
+                .await
             }
             Commands::Status => status::show(ctx),
             Commands::Tui => tui::run(ctx).await,

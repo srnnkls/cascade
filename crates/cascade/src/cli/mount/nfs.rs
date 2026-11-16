@@ -2,15 +2,43 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
-use cascade_engine::engine::{EngineConfig, NativeEngine};
+use cascade_engine::engine::NativeEngine;
+use cascade_presenter_nfs::nfs::context::NfsContext;
 use cascade_presenter_nfs::nfs::server::{NfsCacheMode, NfsServer, NfsServerConfig};
 
-use super::backends::cli_backend_factory;
-use super::helpers::{apply_root_pins, ensure_directory, is_mounted, root_config, write_pid_file};
+use super::helpers::{
+    apply_root_pins, engine_config, ensure_directory, is_mounted, root_config, write_pid_file,
+};
 use super::{
     CliContext, PresenterResources, ResolvedP2pConfig, WebOptions, finish_shutdown, mark_web_ready,
     start_web, stop_web, wait_for_shutdown_signal,
 };
+
+/// Starts an NFS server for `nfs` on a loopback port and, unless
+/// `no_mount`, mounts it at `mount_path`; a failed mount stops the server.
+pub(super) async fn start_nfs_volume(
+    mount_path: &Path,
+    no_mount: bool,
+    nfs: Arc<NfsContext>,
+) -> Result<NfsServer> {
+    let server_config = NfsServerConfig {
+        bind_addr: "127.0.0.1:0".parse()?,
+        export_path: "/".to_owned(),
+        cache_mode: NfsCacheMode::default(),
+    };
+    let server = NfsServer::start(server_config, nfs)
+        .await
+        .context("failed to start NFS server")?;
+    let nfs_port = server.local_addr.port();
+    tracing::info!(port = nfs_port, "NFS server started");
+    if !no_mount && let Err(error) = mount_nfs(mount_path, nfs_port) {
+        if let Err(stop_error) = server.stop() {
+            tracing::warn!(error = %stop_error, "NFS server stop returned an error");
+        }
+        return Err(error);
+    }
+    Ok(server)
+}
 
 /// Try to mount via the NFS presenter.
 ///
@@ -30,21 +58,9 @@ pub(super) async fn try_nfs(
     let paths = ctx.app_paths()?;
     let root = root_config(mount_path);
 
-    let engine_config = EngineConfig {
-        db_path: ctx.db_path.clone(),
-        mount_point: mount_path.to_path_buf(),
-        backends,
-        cache_dir: Some(paths.cache_dir),
-        staging_dir: Some(paths.staging_dir),
-        cache: root.cache,
-        enable_p2p: p2p.enable_p2p,
-        p2p_data_dir: None,
-        p2p_posture: p2p.posture,
-        p2p_relay_endpoints: p2p.relay_endpoints.clone(),
-        p2p_relay_shared_secret: p2p.relay_shared_secret,
-        backend_factory: Some(cli_backend_factory()),
-    };
-    let engine = Arc::new(NativeEngine::new(engine_config)?);
+    let engine = Arc::new(NativeEngine::new(engine_config(
+        ctx, mount_path, backends, &paths, &root, p2p,
+    ))?);
     // Wire the management-plane dispatcher into every backend that serves
     // remote management (the P2P backend). Done before the presenter starts so
     // an inbound ManageRequest is authorised and executed rather than refused.
@@ -78,26 +94,14 @@ pub(super) async fn try_nfs(
         sync_handle,
     };
 
-    let server_config = NfsServerConfig {
-        bind_addr: "127.0.0.1:0".parse()?,
-        export_path: "/".to_string(),
-        cache_mode: NfsCacheMode::default(),
-    };
-    let server = match NfsServer::start(server_config, nfs_ctx).await {
-        Ok(s) => s,
+    let server = match start_nfs_volume(mount_path, no_mount, nfs_ctx).await {
+        Ok(server) => server,
         Err(e) => {
             resources.shutdown();
-            return Err(e).context("failed to start NFS server");
+            return Err(e);
         }
     };
-
     let nfs_port = server.local_addr.port();
-    tracing::info!(port = nfs_port, "NFS server started");
-
-    if !no_mount && let Err(e) = mount_nfs(mount_path, nfs_port) {
-        resources.shutdown();
-        return Err(e);
-    }
 
     if let Err(e) = write_pid_file(&ctx.pid_path) {
         resources.shutdown();

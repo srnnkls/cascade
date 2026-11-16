@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
-use cascade_engine::engine::{EngineConfig, NativeEngine};
+use cascade_engine::engine::NativeEngine;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use cascade_engine::presenter::VfsPresenter;
 use cascade_presenter_webdav::WebDavPresenter;
@@ -19,13 +19,13 @@ mod fileprovider;
 mod helpers;
 mod nfs;
 
-use backends::cli_backend_factory;
 pub(super) use backends::{load_main_config, rebuild_backends};
 #[cfg(target_os = "macos")]
 use fileprovider::try_fileprovider;
 use helpers::{
-    apply_root_pins, ensure_directory, evict_stale_mount, mount_webdav, read_text_file,
-    resolve_mount_path, resolve_mount_path_from_config, root_config, unmount_path, write_pid_file,
+    apply_root_pins, engine_config, ensure_directory, evict_stale_mount, mount_webdav,
+    read_text_file, resolve_mount_path, resolve_mount_path_from_config, root_config, unmount_path,
+    write_pid_file,
 };
 use nfs::try_nfs;
 #[cfg(all(test, target_os = "linux"))]
@@ -440,16 +440,20 @@ async fn finish_shutdown(
 ///
 /// `p2p_override` lets the CLI flag (`--p2p` / `--no-p2p`) override the
 /// `[p2p].enabled` value from `config.toml`. `None` falls through to
-/// whatever the config file says.
+/// whatever the config file says. `app_group` serves File Provider protocol
+/// v2 and the NFS volume from one engine, as `--app-group` selects, and
+/// implies `file_provider`.
 pub async fn start(
     ctx: &CliContext,
     mount_point: Option<&str>,
     no_mount: bool,
     p2p_override: Option<bool>,
     file_provider: bool,
+    app_group: bool,
     web_flags: WebFlags,
 ) -> Result<()> {
     tracing::info!("Starting Cascade daemon");
+    let file_provider = file_provider || app_group;
 
     ensure_directory(&ctx.config_dir, "config directory")?;
 
@@ -574,6 +578,7 @@ pub async fn start(
             &mount_path,
             backends,
             no_mount,
+            app_group,
             &p2p_config,
             &web_options,
         )
@@ -754,21 +759,9 @@ async fn try_fskit(
     let paths = ctx.app_paths()?;
     let root = root_config(mount_path);
 
-    let engine_config = EngineConfig {
-        db_path: ctx.db_path.clone(),
-        mount_point: mount_path.to_path_buf(),
-        backends,
-        cache_dir: Some(paths.cache_dir),
-        staging_dir: Some(paths.staging_dir),
-        cache: root.cache,
-        enable_p2p: p2p.enable_p2p,
-        p2p_data_dir: None,
-        p2p_posture: p2p.posture,
-        p2p_relay_endpoints: p2p.relay_endpoints.clone(),
-        p2p_relay_shared_secret: p2p.relay_shared_secret,
-        backend_factory: Some(cli_backend_factory()),
-    };
-    let engine = Arc::new(NativeEngine::new(engine_config)?);
+    let engine = Arc::new(NativeEngine::new(engine_config(
+        ctx, mount_path, backends, &paths, &root, p2p,
+    ))?);
     // Wire the management-plane dispatcher into every backend that serves
     // remote management (the P2P backend). Done before the presenter starts so
     // an inbound ManageRequest is authorised and executed rather than refused.
@@ -875,21 +868,9 @@ async fn try_projfs(
 
     let root = root_config(mount_path);
 
-    let engine_config = EngineConfig {
-        db_path: ctx.db_path.clone(),
-        mount_point: mount_path.to_path_buf(),
-        backends,
-        cache_dir: Some(paths.cache_dir),
-        staging_dir: Some(paths.staging_dir),
-        cache: root.cache,
-        enable_p2p: p2p.enable_p2p,
-        p2p_data_dir: None,
-        p2p_posture: p2p.posture,
-        p2p_relay_endpoints: p2p.relay_endpoints.clone(),
-        p2p_relay_shared_secret: p2p.relay_shared_secret,
-        backend_factory: Some(cli_backend_factory()),
-    };
-    let engine = Arc::new(NativeEngine::new(engine_config)?);
+    let engine = Arc::new(NativeEngine::new(engine_config(
+        ctx, mount_path, backends, &paths, &root, p2p,
+    ))?);
     // Wire the management-plane dispatcher into every backend that serves
     // remote management (the P2P backend). Done before the presenter starts so
     // an inbound ManageRequest is authorised and executed rather than refused.
@@ -1027,21 +1008,9 @@ async fn try_webdav(
     let paths = ctx.app_paths()?;
     let root = root_config(mount_path);
 
-    let engine_config = EngineConfig {
-        db_path: ctx.db_path.clone(),
-        mount_point: mount_path.to_path_buf(),
-        backends,
-        cache_dir: Some(paths.cache_dir),
-        staging_dir: Some(paths.staging_dir),
-        cache: root.cache,
-        enable_p2p: p2p.enable_p2p,
-        p2p_data_dir: None,
-        p2p_posture: p2p.posture,
-        p2p_relay_endpoints: p2p.relay_endpoints.clone(),
-        p2p_relay_shared_secret: p2p.relay_shared_secret,
-        backend_factory: Some(cli_backend_factory()),
-    };
-    let engine = Arc::new(NativeEngine::new(engine_config)?);
+    let engine = Arc::new(NativeEngine::new(engine_config(
+        ctx, mount_path, backends, &paths, &root, p2p,
+    ))?);
     // Wire the management-plane dispatcher into every backend that serves
     // remote management (the P2P backend). Done before the presenter starts so
     // an inbound ManageRequest is authorised and executed rather than refused.
@@ -1177,21 +1146,9 @@ async fn try_fuse(
     let paths = ctx.app_paths()?;
     let root = root_config(mount_path);
 
-    let engine_config = EngineConfig {
-        db_path: ctx.db_path.clone(),
-        mount_point: mount_path.to_path_buf(),
-        backends,
-        cache_dir: Some(paths.cache_dir),
-        staging_dir: Some(paths.staging_dir),
-        cache: root.cache,
-        enable_p2p: p2p.enable_p2p,
-        p2p_data_dir: None,
-        p2p_posture: p2p.posture,
-        p2p_relay_endpoints: p2p.relay_endpoints.clone(),
-        p2p_relay_shared_secret: p2p.relay_shared_secret,
-        backend_factory: Some(cli_backend_factory()),
-    };
-    let engine = Arc::new(NativeEngine::new(engine_config)?);
+    let engine = Arc::new(NativeEngine::new(engine_config(
+        ctx, mount_path, backends, &paths, &root, p2p,
+    ))?);
     // Wire the management-plane dispatcher into every backend that serves
     // remote management (the P2P backend). Done before the presenter starts so
     // an inbound ManageRequest is authorised and executed rather than refused.
