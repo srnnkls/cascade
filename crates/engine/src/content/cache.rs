@@ -19,13 +19,15 @@ use std::sync::{Arc, PoisonError};
 use anyhow::{Result, anyhow};
 use tokio::sync::broadcast;
 
+use super::names::check_name;
 use super::range_map::{RangeMap, align};
-use super::replica::{Replica, ReplicaItem, ReplicaStore};
+use super::replica::{ItemKind, Replica, ReplicaItem, ReplicaStore};
 use super::store::ObjectStore;
 use super::transfer::{
     CacheSignal, Failure, Remote, Transfer, TransferConfig, TransferError, TransferSource,
     is_unreachable,
 };
+use super::writeback::WriteBack;
 use super::{ObjectId, is_not_found};
 use crate::backend::{Backend, BackendError};
 use crate::db::StateDb;
@@ -84,18 +86,19 @@ enum Source {
     Changed,
 }
 
-type Slot = Arc<tokio::sync::Mutex<Option<Arc<Transfer>>>>;
+pub(super) type Slot = Arc<tokio::sync::Mutex<Option<Arc<Transfer>>>>;
 
-struct Shared {
+pub(super) struct Shared {
     replicas: ReplicaStore,
     backends: std::sync::RwLock<HashMap<String, Arc<Replica>>>,
-    store: ObjectStore,
+    pub(super) store: ObjectStore,
     staging_dir: PathBuf,
-    config: TransferConfig,
-    remote: Remote,
+    pub(super) config: TransferConfig,
+    pub(super) remote: Remote,
     slots: std::sync::Mutex<HashMap<u64, Slot>>,
     carried: std::sync::Mutex<HashMap<u64, RangeMap>>,
     handoffs: AtomicU64,
+    pub(super) writeback: WriteBack,
 }
 
 /// Cache of the replica store's content: one sparse object per cached item
@@ -144,6 +147,7 @@ impl ContentCache {
                 slots: std::sync::Mutex::default(),
                 carried: std::sync::Mutex::default(),
                 handoffs: AtomicU64::new(0),
+                writeback: WriteBack::new(config.upload_transfers),
             }),
         })
     }
@@ -179,6 +183,22 @@ impl ContentCache {
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<CacheSignal> {
         self.shared.remote.subscribe()
+    }
+
+    /// Rescans the scan set of every registered backend, once start-up
+    /// [recovery](Self::recover) finished. Returns whether a replica's
+    /// revision advanced.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a listing or the state database fails.
+    pub async fn scan(&self) -> Result<bool> {
+        self.shared.writeback.recovered().await?;
+        let mut advanced = false;
+        for replica in self.replicas() {
+            advanced |= super::scan::scan(&replica).await?;
+        }
+        Ok(advanced)
     }
 
     /// Reads up to `len` bytes at `offset` of the item's current version,
@@ -267,12 +287,30 @@ impl ContentCache {
         Err(TransferError::VersionNoLongerAvailable.into())
     }
 
-    fn db(&self) -> &StateDb {
+    pub(super) fn shared(&self) -> &Shared {
+        &self.shared
+    }
+
+    pub(super) fn db(&self) -> &StateDb {
         self.shared.replicas.db()
     }
 
+    /// The replicas of every registered backend, ordered by backend id.
+    pub(super) fn replicas(&self) -> Vec<Arc<Replica>> {
+        let mut replicas: Vec<Arc<Replica>> = self
+            .shared
+            .backends
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect();
+        replicas.sort_by(|a, b| a.backend_id().cmp(b.backend_id()));
+        replicas
+    }
+
     /// The replica of the registered backend holding the item.
-    fn replica(&self, uid: u64) -> Result<Arc<Replica>> {
+    pub(super) fn replica(&self, uid: u64) -> Result<Arc<Replica>> {
         let backend_id = self
             .db()
             .replica_item_backend(uid)?
@@ -286,11 +324,11 @@ impl ContentCache {
             .ok_or_else(|| anyhow!("backend {backend_id} of item {uid} is not registered"))
     }
 
-    fn item(&self, uid: u64) -> Result<Option<ReplicaItem>> {
+    pub(super) fn item(&self, uid: u64) -> Result<Option<ReplicaItem>> {
         self.db().replica_item(uid)
     }
 
-    fn slot(&self, uid: u64) -> Slot {
+    pub(super) fn slot(&self, uid: u64) -> Slot {
         let mut slots = self
             .shared
             .slots
@@ -299,7 +337,7 @@ impl ContentCache {
         Arc::clone(slots.entry(uid).or_default())
     }
 
-    fn take_carried(&self, uid: u64) -> RangeMap {
+    pub(super) fn take_carried(&self, uid: u64) -> RangeMap {
         self.shared
             .carried
             .lock()
@@ -404,7 +442,7 @@ impl ContentCache {
     }
 
     /// Path of the item relative to the backend root.
-    fn item_path(&self, uid: u64) -> Result<Option<PathBuf>> {
+    pub(super) fn item_path(&self, uid: u64) -> Result<Option<PathBuf>> {
         let mut names = Vec::new();
         let mut next = uid;
         loop {
@@ -422,7 +460,11 @@ impl ContentCache {
 
     /// The entry and revision at the item's current path, or `None` when the
     /// path no longer resolves.
-    async fn lookup(&self, replica: &Replica, uid: u64) -> Result<Option<(FileEntry, Revision)>> {
+    pub(super) async fn lookup(
+        &self,
+        replica: &Replica,
+        uid: u64,
+    ) -> Result<Option<(FileEntry, Revision)>> {
         let Some(path) = self.item_path(uid)? else {
             return Ok(None);
         };
@@ -449,7 +491,7 @@ impl ContentCache {
     /// Discards the object of `transfer` and keeps the ranges handed out from
     /// it for its successor. With `refresh`, the item's folder is relisted
     /// first, so a waiter woken by the discard restarts on the new version.
-    async fn discard(&self, transfer: &Transfer, refresh: bool) -> Result<()> {
+    pub(super) async fn discard(&self, transfer: &Transfer, refresh: bool) -> Result<()> {
         if transfer.is_discarded() {
             return Ok(());
         }
@@ -476,7 +518,7 @@ impl ContentCache {
 
     /// Relists the folder of the item so the replica records its new version
     /// or its removal.
-    async fn refresh_parent(&self, replica: &Replica, uid: u64) -> Result<()> {
+    pub(super) async fn refresh_parent(&self, replica: &Replica, uid: u64) -> Result<()> {
         let Some(parent_uid) = self.item(uid)?.and_then(|item| item.parent_uid) else {
             return Ok(());
         };
@@ -746,6 +788,146 @@ impl ContentCache {
         if let Err(error) = outcome {
             tracing::warn!(uid = transfer.uid, error = %format!("{error:#}"), "download not finished");
         }
+    }
+}
+
+/// Renames, reparents, deletes and folder creates, applied directly against
+/// the backend. An unreachable backend fails them with
+/// [`TransientError::Unreachable`](crate::backend::TransientError), which the
+/// caller maps to `serverUnreachable`.
+impl ContentCache {
+    /// Moves the item into `parent_uid` under `name`.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`NameError`](super::names::NameError) for a name rejected by TR-10 before anything
+    /// is applied, when either item is unknown, and when the backend fails.
+    pub async fn rename(&self, uid: u64, parent_uid: u64, name: &str) -> Result<ReplicaItem> {
+        check_name(name)?;
+        let parent = self.folder(parent_uid)?;
+        let replica = self.replica(uid)?;
+        let _operation = self.shared.writeback.lock(uid).await;
+        let item_path = self
+            .item_path(uid)?
+            .ok_or_else(|| BackendError::NotFound(format!("item {uid}")))?;
+        if self.item(uid)?.and_then(|item| item.parent_uid) != Some(parent.uid) {
+            self.remove_temp_upload(&replica, uid, &item_path).await?;
+        }
+        let target = self
+            .item_path(parent.uid)?
+            .ok_or_else(|| BackendError::NotFound(format!("item {parent_uid}")))?
+            .join(name);
+        let remote = &self.shared.remote;
+        let backend = replica.backend();
+        let entry = remote.call(backend.move_entry(&item_path, &target)).await?;
+        let revision = remote.call(backend.revision(&entry)).await?;
+        self.db().upsert_replica_children(
+            replica.backend_id(),
+            parent.uid,
+            &[(entry, revision)],
+        )?;
+        self.item(uid)?
+            .ok_or_else(|| BackendError::NotFound(format!("item {uid}")).into())
+    }
+
+    /// Deletes the item with its descendants on the backend and in the
+    /// replica. The item is marked as being deleted before the backend
+    /// delete, so write-back skips it and a restart finishes the delete;
+    /// its objects stay until the backend delete returned. A failed backend
+    /// delete clears the mark and leaves the item as it was. An unknown item
+    /// is already deleted.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the backend or the state database fails.
+    pub async fn delete(&self, uid: u64) -> Result<()> {
+        if self.item(uid)?.is_none() {
+            return Ok(());
+        }
+        let replica = self.replica(uid)?;
+        let _operation = self.shared.writeback.lock(uid).await;
+        let Some(path) = self.item_path(uid)? else {
+            return Ok(());
+        };
+        self.db().mark_replica_delete(uid)?;
+        if let Err(error) = self.remove_remote(&replica, &path).await {
+            self.db().clear_replica_delete(uid)?;
+            for object in self.db().subtree_content_objects(uid)? {
+                if object.dirty {
+                    self.shared.writeback.add(object.uid);
+                }
+            }
+            return Err(error);
+        }
+        self.finish_delete(&replica, uid, &path).await
+    }
+
+    /// Removes what is left of the item at `path` after its backend delete
+    /// returned: the temporary file of its dirty object, the write-back
+    /// timers, objects and replica items of its subtree, and the mark. Runs
+    /// under the item's operation lock.
+    pub(super) async fn finish_delete(
+        &self,
+        replica: &Replica,
+        uid: u64,
+        path: &Path,
+    ) -> Result<()> {
+        self.remove_temp_upload(replica, uid, path).await?;
+        let writeback = &self.shared.writeback;
+        for object in self.db().subtree_content_objects(uid)? {
+            writeback.remove(object.uid);
+        }
+        let slot = self.slot(uid);
+        let mut current = slot.lock().await;
+        if let Some(transfer) = current.take() {
+            self.discard(&transfer, false).await?;
+        }
+        self.take_carried(uid);
+        for object in self.db().remove_replica_item(uid)? {
+            self.shared.store.delete(object)?;
+        }
+        drop(current);
+        Ok(())
+    }
+
+    /// Creates a folder named `name` in `parent_uid`.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`NameError`](super::names::NameError) for a name rejected by TR-10 before anything
+    /// is applied, when the parent is unknown, and when the backend fails.
+    pub async fn create_folder(&self, parent_uid: u64, name: &str) -> Result<ReplicaItem> {
+        check_name(name)?;
+        let parent = self.folder(parent_uid)?;
+        let replica = self.replica(parent_uid)?;
+        let path = self
+            .item_path(parent.uid)?
+            .ok_or_else(|| BackendError::NotFound(format!("item {parent_uid}")))?
+            .join(name);
+        let remote = &self.shared.remote;
+        let backend = replica.backend();
+        let entry = remote.call(backend.create_dir(&path)).await?;
+        let revision = remote.call(backend.revision(&entry)).await?;
+        let uids = self.db().upsert_replica_children(
+            replica.backend_id(),
+            parent.uid,
+            &[(entry, revision)],
+        )?;
+        uids.first()
+            .map(|&uid| self.item(uid))
+            .transpose()?
+            .flatten()
+            .ok_or_else(|| anyhow!("folder {name:?} not recorded"))
+    }
+
+    fn folder(&self, uid: u64) -> Result<ReplicaItem> {
+        let folder = self
+            .item(uid)?
+            .ok_or_else(|| BackendError::NotFound(format!("item {uid}")))?;
+        if folder.kind != ItemKind::Folder {
+            return Err(anyhow!("item {uid} is not a folder"));
+        }
+        Ok(folder)
     }
 }
 

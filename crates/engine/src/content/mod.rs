@@ -10,6 +10,7 @@ pub mod anchor;
 pub mod cache;
 #[cfg(all(test, cascade_loom, unix))]
 mod loom_model;
+pub mod names;
 pub mod range_map;
 pub mod replica;
 pub mod scan;
@@ -17,6 +18,8 @@ pub mod scan;
 pub mod store;
 #[cfg(unix)]
 pub mod transfer;
+#[cfg(unix)]
+pub mod writeback;
 
 /// Id of a cached object: its `content_objects` row and the name of its
 /// object file.

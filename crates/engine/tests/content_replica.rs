@@ -232,7 +232,7 @@ async fn scan_mints_version_for_timestamp_preserving_edit_and_only_follows_dirty
             .unwrap();
         db.mark_content_complete(object).unwrap();
         if uid == draft {
-            db.mark_content_dirty(object, &item.content_version, 8)
+            db.accept_content_save(uid, object, 8, chrono::Utc::now())
                 .unwrap();
         }
     }

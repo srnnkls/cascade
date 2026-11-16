@@ -10,7 +10,11 @@ use rusqlite::{OptionalExtension, Row, Transaction, params};
 use sha2::{Digest, Sha256};
 
 use super::StateDb;
-use super::content::{id_to_sql, optional_u64_column, time_column, time_to_sql, u64_column};
+use super::content::{
+    ContentState, id_to_sql, optional_u64_column, subtree_objects_in, time_column, time_to_sql,
+    u64_column,
+};
+use crate::content::ObjectId;
 use crate::types::{FileEntry, Revision};
 
 const ITEM_COLUMNS: &str = "uid, parent_uid, name, kind, native_id, stable_id, size, mtime, \
@@ -234,6 +238,33 @@ fn item_by_stable_id(
         .optional()?)
 }
 
+/// The item whose dirty object recorded an upload that became the file
+/// `stable_id`, re-linked to that file: its rename-over happened and the
+/// bookkeeping is still due.
+fn relink_recorded_upload(
+    tx: &Transaction<'_>,
+    backend_id: &str,
+    entry: &FileEntry,
+    stable_id: &str,
+) -> Result<Option<ReplicaItem>> {
+    let uid = tx
+        .query_row(
+            "SELECT i.uid FROM replica_items i JOIN content_objects o ON o.uid = i.uid
+             WHERE i.backend_id = ?1 AND o.dirty AND o.upload_file_id = ?2",
+            params![backend_id, stable_id],
+            |row| u64_column(row, 0),
+        )
+        .optional()?;
+    let Some(uid) = uid else {
+        return Ok(None);
+    };
+    tx.execute(
+        "UPDATE replica_items SET stable_id = ?2, native_id = ?3 WHERE uid = ?1",
+        params![id_to_sql(uid)?, stable_id, entry.id.native_id()],
+    )?;
+    item_in(tx, uid).map(Some)
+}
+
 fn has_dirty_object(tx: &Transaction<'_>, uid: u64) -> Result<bool> {
     Ok(tx.query_row(
         "SELECT EXISTS (SELECT 1 FROM content_objects WHERE uid = ?1 AND dirty)",
@@ -402,7 +433,328 @@ fn update_clean_item(
     Ok(())
 }
 
+/// Delete `uid` with its descendants, except those in `keep`, leaving a
+/// tombstone for each. Returns the deleted uids.
+fn tombstone_subtree(
+    tx: &Transaction<'_>,
+    uid: u64,
+    keep: &HashSet<u64>,
+    pending: &mut PendingRevision,
+) -> Result<Vec<u64>> {
+    let doomed: Vec<(u64, Option<u64>)> = {
+        let mut statement = tx.prepare(
+            "WITH RECURSIVE doomed(uid, parent_uid) AS (
+                 SELECT uid, parent_uid FROM replica_items WHERE uid = ?1
+                 UNION ALL
+                 SELECT i.uid, i.parent_uid FROM replica_items i
+                 JOIN doomed d ON i.parent_uid = d.uid)
+             SELECT uid, parent_uid FROM doomed",
+        )?;
+        statement
+            .query_map([id_to_sql(uid)?], |row| {
+                Ok((u64_column(row, 0)?, optional_u64_column(row, 1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|(doomed_uid, _)| !keep.contains(doomed_uid))
+            .collect()
+    };
+    if doomed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let revision = pending.take()?;
+    let mut deleted = Vec::with_capacity(doomed.len());
+    for (doomed_uid, doomed_parent) in doomed {
+        tx.execute(
+            "INSERT OR REPLACE INTO replica_tombstones (uid, parent_uid, revision)
+             VALUES (?1, ?2, ?3)",
+            params![
+                id_to_sql(doomed_uid)?,
+                doomed_parent.map(id_to_sql).transpose()?,
+                revision
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM replica_items WHERE uid = ?1",
+            [id_to_sql(doomed_uid)?],
+        )?;
+        deleted.push(doomed_uid);
+    }
+    Ok(deleted)
+}
+
+fn item_in(tx: &Transaction<'_>, uid: u64) -> Result<ReplicaItem> {
+    tx.query_row(
+        &format!("SELECT {ITEM_COLUMNS} FROM replica_items WHERE uid = ?1"),
+        [id_to_sql(uid)?],
+        item_from_row,
+    )
+    .optional()?
+    .ok_or_else(|| anyhow!("no replica item {uid}"))
+}
+
+/// Point the item at the backend file `entry` with `revision`, keeping its
+/// uid and content version. Any other item holding that file, or the item's
+/// name in its folder, is removed: the file replaced it.
+fn relink_in(
+    tx: &Transaction<'_>,
+    item: &ReplicaItem,
+    entry: &FileEntry,
+    revision: &Revision,
+    pending: &mut PendingRevision,
+) -> Result<()> {
+    let uid = id_to_sql(item.uid)?;
+    let backend_id: String = tx.query_row(
+        "SELECT backend_id FROM replica_items WHERE uid = ?1",
+        [uid],
+        |row| row.get(0),
+    )?;
+    let displaced: Vec<u64> = {
+        let mut statement = tx.prepare(
+            "SELECT uid FROM replica_items WHERE uid != ?1
+                 AND ((backend_id = ?2 AND stable_id = ?3) OR (parent_uid = ?4 AND name = ?5))",
+        )?;
+        statement
+            .query_map(
+                params![
+                    uid,
+                    backend_id,
+                    revision.stable_id,
+                    item.parent_uid.map(id_to_sql).transpose()?,
+                    item.name
+                ],
+                |row| u64_column(row, 0),
+            )?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    let mut keep = dirty_items_with_ancestors(tx)?;
+    keep.insert(item.uid);
+    for other in displaced {
+        tombstone_subtree(tx, other, &keep, pending)?;
+    }
+    tx.execute(
+        "UPDATE replica_items SET stable_id = ?2, native_id = ?3, remote_size = ?4,
+             remote_mtime = ?5, remote_ctime = ?6, revision = ?7
+         WHERE uid = ?1",
+        params![
+            uid,
+            revision.stable_id,
+            entry.id.native_id(),
+            revision.size.map(id_to_sql).transpose()?,
+            time_to_sql(revision.last_write_time),
+            time_to_sql(revision.change_time),
+            pending.take()?,
+        ],
+    )?;
+    Ok(())
+}
+
 impl StateDb {
+    /// Accept a local save held by `object_id`: the object becomes the
+    /// item's only, dirty and complete object, and the item takes a new
+    /// content version, the saved size and last-write time and
+    /// `uploaded = false`. Returns the item and the objects the save
+    /// superseded, whose files the caller removes.
+    pub fn accept_content_save(
+        &self,
+        uid: u64,
+        object_id: ObjectId,
+        size: u64,
+        mtime: DateTime<Utc>,
+    ) -> Result<(ReplicaItem, Vec<ObjectId>)> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        let mut pending = PendingRevision::open(&tx)?;
+        let content_version = pending.content_version.clone();
+        let item_revision = pending.take()?;
+        let item = item_in(&tx, uid)?;
+        let sql_uid = id_to_sql(uid)?;
+        let object = id_to_sql(object_id.get())?;
+        let changed = tx.execute(
+            "UPDATE content_objects SET dirty = TRUE, state = ?3, content_version = ?4, size = ?5
+             WHERE object_id = ?1 AND uid = ?2",
+            params![
+                object,
+                sql_uid,
+                ContentState::Complete.as_str(),
+                content_version,
+                id_to_sql(size)?
+            ],
+        )?;
+        if changed == 0 {
+            return Err(anyhow!("no content object {object_id} of item {uid}"));
+        }
+        let superseded: Vec<ObjectId> = {
+            let mut statement = tx.prepare(
+                "SELECT object_id FROM content_objects WHERE uid = ?1 AND object_id != ?2",
+            )?;
+            statement
+                .query_map(params![sql_uid, object], |row| {
+                    u64_column(row, 0).map(ObjectId::new)
+                })?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        tx.execute(
+            "DELETE FROM content_objects WHERE uid = ?1 AND object_id != ?2",
+            params![sql_uid, object],
+        )?;
+        tx.execute(
+            "UPDATE replica_items SET content_version = ?2, size = ?3, mtime = ?4,
+                 uploaded = FALSE, metadata_version = ?5, revision = ?6
+             WHERE uid = ?1",
+            params![
+                sql_uid,
+                content_version,
+                id_to_sql(size)?,
+                time_to_sql(Some(mtime)),
+                metadata_version(
+                    &item.name,
+                    item.parent_uid,
+                    item.kind,
+                    Some(size),
+                    Some(mtime)
+                ),
+                item_revision,
+            ],
+        )?;
+        let saved = item_in(&tx, uid)?;
+        pending.commit(&tx)?;
+        tx.commit()?;
+        Ok((saved, superseded))
+    }
+
+    /// Record a finished rename-over: the item is re-linked to the renamed
+    /// file, and when `object_id` is still its dirty object, the object
+    /// becomes clean with the renamed file's revision as its source and the
+    /// item is marked uploaded. Returns whether the object became clean.
+    pub fn finish_content_upload(
+        &self,
+        uid: u64,
+        object_id: ObjectId,
+        entry: &FileEntry,
+        revision: &Revision,
+    ) -> Result<bool> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        let mut pending = PendingRevision::open(&tx)?;
+        let item = item_in(&tx, uid)?;
+        relink_in(&tx, &item, entry, revision, &mut pending)?;
+        let cleaned = tx.execute(
+            "UPDATE content_objects SET dirty = FALSE, state = ?3, upload_temp_name = NULL,
+                 upload_file_id = NULL, source_stable_id = ?4, source_size = ?5,
+                 source_mtime = ?6, source_ctime = ?7
+             WHERE object_id = ?1 AND uid = ?2 AND dirty",
+            params![
+                id_to_sql(object_id.get())?,
+                id_to_sql(uid)?,
+                ContentState::Complete.as_str(),
+                revision.stable_id,
+                revision.size.map(id_to_sql).transpose()?,
+                time_to_sql(revision.last_write_time),
+                time_to_sql(revision.change_time),
+            ],
+        )? > 0;
+        if cleaned {
+            tx.execute(
+                "UPDATE replica_items SET uploaded = TRUE WHERE uid = ?1",
+                [id_to_sql(uid)?],
+            )?;
+        }
+        pending.commit(&tx)?;
+        tx.commit()?;
+        Ok(cleaned)
+    }
+
+    /// Point a folder item at a folder recreated on the backend.
+    pub fn relink_replica_item(
+        &self,
+        uid: u64,
+        entry: &FileEntry,
+        revision: &Revision,
+    ) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        let mut pending = PendingRevision::open(&tx)?;
+        let item = item_in(&tx, uid)?;
+        relink_in(&tx, &item, entry, revision, &mut pending)?;
+        pending.commit(&tx)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Mark an item and its descendants as being deleted, before the backend
+    /// delete is issued.
+    pub fn mark_replica_delete(&self, uid: u64) -> Result<()> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO replica_deletes (uid) VALUES (?1)",
+            [id_to_sql(uid)?],
+        )?;
+        Ok(())
+    }
+
+    /// Clear the delete mark of an item whose backend delete failed.
+    pub fn clear_replica_delete(&self, uid: u64) -> Result<()> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "DELETE FROM replica_deletes WHERE uid = ?1",
+            [id_to_sql(uid)?],
+        )?;
+        Ok(())
+    }
+
+    /// Return the items marked as being deleted, in uid order.
+    pub fn replica_deletes(&self) -> Result<Vec<u64>> {
+        let conn = self.lock_conn()?;
+        let mut statement = conn.prepare("SELECT uid FROM replica_deletes ORDER BY uid")?;
+        let uids = statement
+            .query_map([], |row| u64_column(row, 0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(uids)
+    }
+
+    /// Whether the item or one of its ancestors is marked as being deleted.
+    pub fn replica_item_deleting(&self, uid: u64) -> Result<bool> {
+        let conn = self.lock_conn()?;
+        Ok(conn.query_row(
+            "WITH RECURSIVE ancestors(uid) AS (
+                 SELECT ?1
+                 UNION ALL
+                 SELECT i.parent_uid FROM replica_items i JOIN ancestors a ON i.uid = a.uid
+                 WHERE i.parent_uid IS NOT NULL)
+             SELECT EXISTS (SELECT 1 FROM replica_deletes d JOIN ancestors a ON d.uid = a.uid)",
+            [id_to_sql(uid)?],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Delete an item with its descendants and their cached objects, leaving
+    /// tombstones, and clear its delete mark. Returns the deleted objects,
+    /// whose files the caller removes.
+    pub fn remove_replica_item(&self, uid: u64) -> Result<Vec<ObjectId>> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        let objects: Vec<ObjectId> = subtree_objects_in(&tx, uid)?
+            .into_iter()
+            .map(|object| object.object_id)
+            .collect();
+        for object in &objects {
+            tx.execute(
+                "DELETE FROM content_objects WHERE object_id = ?1",
+                [id_to_sql(object.get())?],
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM replica_deletes WHERE uid = ?1",
+            [id_to_sql(uid)?],
+        )?;
+        let mut pending = PendingRevision::open(&tx)?;
+        tombstone_subtree(&tx, uid, &HashSet::new(), &mut pending)?;
+        pending.commit(&tx)?;
+        tx.commit()?;
+        Ok(objects)
+    }
+
     /// Return the store identity and revision counters.
     pub fn replica_meta(&self) -> Result<ReplicaMeta> {
         let conn = self.lock_conn()?;
@@ -510,7 +862,11 @@ impl StateDb {
         let mut pending = PendingRevision::open(&tx)?;
         let mut uids = Vec::with_capacity(listing.len());
         for (entry, revision) in listing {
-            let uid = match item_by_stable_id(&tx, backend_id, &revision.stable_id)? {
+            let known = match item_by_stable_id(&tx, backend_id, &revision.stable_id)? {
+                None => relink_recorded_upload(&tx, backend_id, entry, &revision.stable_id)?,
+                found => found,
+            };
+            let uid = match known {
                 None => insert_item(&tx, backend_id, parent_uid, entry, revision, &mut pending)?,
                 Some(item) if has_dirty_object(&tx, item.uid)? => {
                     update_dirty_item(&tx, &item, parent_uid, entry, &mut pending)?;
@@ -554,45 +910,7 @@ impl StateDb {
         let mut pending = PendingRevision::open(&tx)?;
         let mut deleted = Vec::new();
         for uid in gone {
-            let doomed: Vec<(u64, Option<u64>)> = {
-                let mut statement = tx.prepare(
-                    "WITH RECURSIVE doomed(uid, parent_uid) AS (
-                         SELECT uid, parent_uid FROM replica_items WHERE uid = ?1
-                         UNION ALL
-                         SELECT i.uid, i.parent_uid FROM replica_items i
-                         JOIN doomed d ON i.parent_uid = d.uid)
-                     SELECT uid, parent_uid FROM doomed",
-                )?;
-                statement
-                    .query_map([id_to_sql(uid)?], |row| {
-                        Ok((u64_column(row, 0)?, optional_u64_column(row, 1)?))
-                    })?
-                    .collect::<rusqlite::Result<_>>()?
-            };
-            let doomed: Vec<_> = doomed
-                .into_iter()
-                .filter(|(doomed_uid, _)| !dirty_paths.contains(doomed_uid))
-                .collect();
-            if doomed.is_empty() {
-                continue;
-            }
-            let revision = pending.take()?;
-            for (doomed_uid, doomed_parent) in doomed {
-                tx.execute(
-                    "INSERT OR REPLACE INTO replica_tombstones (uid, parent_uid, revision)
-                     VALUES (?1, ?2, ?3)",
-                    params![
-                        id_to_sql(doomed_uid)?,
-                        doomed_parent.map(id_to_sql).transpose()?,
-                        revision
-                    ],
-                )?;
-                tx.execute(
-                    "DELETE FROM replica_items WHERE uid = ?1",
-                    [id_to_sql(doomed_uid)?],
-                )?;
-                deleted.push(doomed_uid);
-            }
+            deleted.extend(tombstone_subtree(&tx, uid, &dirty_paths, &mut pending)?);
         }
         pending.commit(&tx)?;
         tx.commit()?;

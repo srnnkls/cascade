@@ -1,19 +1,17 @@
 //! Names an SMB share cannot hold.
 
-/// Characters SMB rejects in a file or folder name.
-const FORBIDDEN: [char; 8] = ['?', '*', '<', '>', '"', '\\', '|', ':'];
+use cascade_engine::content::names::check_name;
 
-/// Reject the last component of `native_id` when SMB cannot hold it.
+/// Reject the last component of `native_id` when the backend cannot store it.
 ///
 /// # Errors
 ///
-/// Returns an error naming the first forbidden character.
+/// Returns the [`NameError`](cascade_engine::content::names::NameError) of
+/// the last component.
 pub fn check(native_id: &str) -> anyhow::Result<()> {
     let name = native_id
         .rsplit_once('/')
         .map_or(native_id, |(_, name)| name);
-    if let Some(c) = name.chars().find(|c| FORBIDDEN.contains(c)) {
-        anyhow::bail!("SMB cannot hold the name {name:?}: it contains {c:?}");
-    }
+    check_name(name)?;
     Ok(())
 }

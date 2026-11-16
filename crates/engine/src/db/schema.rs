@@ -404,8 +404,9 @@ fn v8_exec_sessions(conn: &Connection) -> Result<()> {
 /// temporary name and file id are recorded before the rename so a restart
 /// recognises a finished rename. `content_ranges` is the authority for the
 /// fetched byte ranges of an object, kept merged. `materialized_items` is the
-/// set of items the system reports as on disk. Times are nanoseconds since the
-/// Unix epoch.
+/// set of items the system reports as on disk. `replica_deletes` marks the
+/// items whose backend delete was issued and whose local state is not yet
+/// removed. Times are nanoseconds since the Unix epoch.
 fn v9_replica_and_content(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
@@ -480,6 +481,10 @@ fn v9_replica_and_content(conn: &Connection) -> Result<()> {
         );
 
         CREATE TABLE IF NOT EXISTS materialized_items (
+            uid           INTEGER PRIMARY KEY
+        );
+
+        CREATE TABLE IF NOT EXISTS replica_deletes (
             uid           INTEGER PRIMARY KEY
         );
         ",

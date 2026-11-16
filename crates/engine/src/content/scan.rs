@@ -9,6 +9,9 @@ use super::replica::Replica;
 /// Rescan every listed folder and every folder holding a materialised item or
 /// a cached object, parents first.
 ///
+/// Presenters and the daemon scan through `ContentCache::scan`, which waits
+/// for start-up recovery.
+///
 /// Each listing carries the revision of every child, so materialised and
 /// cached files are stat-ed with it. Removals are applied after all listings,
 /// so an item moved between scanned folders keeps its uid. A folder that is

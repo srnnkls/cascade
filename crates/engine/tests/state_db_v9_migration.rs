@@ -239,4 +239,5 @@ fn v8_database_migrates_to_v9_with_existing_rows_intact() {
     );
     assert_has_columns(&conn, "content_ranges", &["object_id", "start", "end"]);
     assert_has_columns(&conn, "materialized_items", &["uid"]);
+    assert_has_columns(&conn, "replica_deletes", &["uid"]);
 }

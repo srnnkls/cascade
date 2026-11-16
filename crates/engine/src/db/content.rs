@@ -30,7 +30,7 @@ pub enum ContentState {
 }
 
 impl ContentState {
-    const fn as_str(self) -> &'static str {
+    pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::Partial => "partial",
             Self::Complete => "complete",
@@ -166,6 +166,22 @@ fn object_from_row(row: &Row<'_>) -> rusqlite::Result<ContentObject> {
     })
 }
 
+/// The objects of the item `uid` and of its descendants.
+pub(super) fn subtree_objects_in(conn: &Connection, uid: u64) -> Result<Vec<ContentObject>> {
+    let mut statement = conn.prepare(&format!(
+        "WITH RECURSIVE subtree(uid) AS (
+             SELECT ?1
+             UNION ALL
+             SELECT i.uid FROM replica_items i JOIN subtree s ON i.parent_uid = s.uid)
+         SELECT {OBJECT_COLUMNS} FROM content_objects o JOIN subtree s ON o.uid = s.uid
+         ORDER BY o.object_id"
+    ))?;
+    let objects = statement
+        .query_map([id_to_sql(uid)?], object_from_row)?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(objects)
+}
+
 impl StateDb {
     pub(super) fn lock_conn(&self) -> Result<MutexGuard<'_, Connection>> {
         self.conn.lock().map_err(|e| anyhow!("lock poisoned: {e}"))
@@ -226,6 +242,12 @@ impl StateDb {
             .query_map([id_to_sql(uid)?], object_from_row)?
             .collect::<rusqlite::Result<_>>()?;
         Ok(objects)
+    }
+
+    /// Return the objects of an item and its descendants.
+    pub fn subtree_content_objects(&self, uid: u64) -> Result<Vec<ContentObject>> {
+        let conn = self.lock_conn()?;
+        subtree_objects_in(&conn, uid)
     }
 
     /// Return every dirty object, for rebuilding the upload timers at start.
@@ -309,25 +331,6 @@ impl StateDb {
         )
     }
 
-    /// Mark an object as holding an accepted save with the given content
-    /// version and size.
-    pub fn mark_content_dirty(
-        &self,
-        object_id: ObjectId,
-        content_version: &str,
-        size: u64,
-    ) -> Result<()> {
-        self.update_object(
-            "UPDATE content_objects SET dirty = TRUE, content_version = ?2, size = ?3
-             WHERE object_id = ?1",
-            params![
-                object_id_to_sql(object_id)?,
-                content_version,
-                id_to_sql(size)?
-            ],
-        )
-    }
-
     /// Record the temporary name and file id of an upload before its rename.
     pub fn record_content_upload(&self, object_id: ObjectId, upload: &UploadRecord) -> Result<()> {
         self.update_object(
@@ -341,11 +344,10 @@ impl StateDb {
         )
     }
 
-    /// Mark an object clean and clear its upload record.
-    pub fn mark_content_clean(&self, object_id: ObjectId) -> Result<()> {
+    /// Clear the upload record of an object whose temporary file is gone.
+    pub fn clear_content_upload(&self, object_id: ObjectId) -> Result<()> {
         self.update_object(
-            "UPDATE content_objects SET dirty = FALSE, upload_temp_name = NULL,
-                 upload_file_id = NULL
+            "UPDATE content_objects SET upload_temp_name = NULL, upload_file_id = NULL
              WHERE object_id = ?1",
             [object_id_to_sql(object_id)?],
         )

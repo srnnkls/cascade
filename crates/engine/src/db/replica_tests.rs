@@ -51,7 +51,8 @@ fn dirty(db: &StateDb, uid: u64) -> ObjectId {
             size: 1,
         })
         .unwrap();
-    db.mark_content_dirty(object, "local", 1).unwrap();
+    db.accept_content_save(uid, object, 1, DateTime::from_timestamp_nanos(1))
+        .unwrap();
     object
 }
 

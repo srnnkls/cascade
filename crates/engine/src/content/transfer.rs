@@ -44,6 +44,8 @@ pub struct TransferConfig {
     pub max_errors: u32,
     /// Pause before a failed read is tried again.
     pub retry_delay: Duration,
+    /// Uploads that run at once, as rclone's `--transfers`.
+    pub upload_transfers: usize,
 }
 
 impl Default for TransferConfig {
@@ -55,6 +57,7 @@ impl Default for TransferConfig {
             idle_stop: Duration::from_mins(1),
             max_errors: 10,
             retry_delay: Duration::from_secs(1),
+            upload_transfers: 4,
         }
     }
 }
@@ -625,14 +628,29 @@ impl Remote {
     }
 
     pub(crate) async fn call<T>(&self, op: impl Future<Output = Result<T>>) -> Result<T> {
-        let result = tokio::time::timeout(self.timeout, op)
+        self.call_within(self.timeout, op).await
+    }
+
+    /// A call of `pieces` requests of at most `request_size`, bounded by the
+    /// deadline of one call per piece.
+    pub(crate) async fn call_for_pieces<T>(
+        &self,
+        pieces: u64,
+        op: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let pieces = u32::try_from(pieces.max(1)).unwrap_or(u32::MAX);
+        self.call_within(self.timeout.saturating_mul(pieces), op)
             .await
-            .unwrap_or_else(|_| {
-                Err(
-                    TransientError::Unreachable(format!("no reply within {:?}", self.timeout))
-                        .into(),
-                )
-            });
+    }
+
+    async fn call_within<T>(
+        &self,
+        timeout: Duration,
+        op: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let result = tokio::time::timeout(timeout, op).await.unwrap_or_else(|_| {
+            Err(TransientError::Unreachable(format!("no reply within {timeout:?}")).into())
+        });
         match &result {
             Ok(_) => {
                 if self.unreachable.swap(false, StdOrdering::AcqRel)

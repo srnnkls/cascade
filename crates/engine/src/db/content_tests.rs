@@ -7,7 +7,7 @@ use chrono::DateTime;
 use super::{ContentState, EvictionCandidate, NewContentObject, UploadRecord};
 use crate::content::ObjectId;
 use crate::db::StateDb;
-use crate::types::Revision;
+use crate::types::{FileEntry, ItemId, Revision};
 
 fn revision(stable_id: &str) -> Revision {
     Revision {
@@ -29,15 +29,37 @@ fn insert(db: &StateDb, uid: u64, size: u64) -> ObjectId {
     .unwrap()
 }
 
-fn pin(db: &StateDb, uid: u64) {
+fn add_item(db: &StateDb, uid: u64, pinned: bool) {
     let conn = db.conn.lock().unwrap();
     conn.execute(
         "INSERT INTO replica_items (uid, backend_id, stable_id, native_id, name, kind,
              content_version, metadata_version, pinned, revision)
-         VALUES (?1, 'nas', ?1, ?1, 'f', 'file', 'v1', 'm1', TRUE, 1)",
-        [i64::try_from(uid).unwrap()],
+         VALUES (?1, 'nas', ?1, ?1, 'f', 'file', 'v1', 'm1', ?2, 1)",
+        rusqlite::params![i64::try_from(uid).unwrap(), pinned],
     )
     .unwrap();
+}
+
+/// Accepts a save of `size` bytes held by `object` into the item `uid`.
+fn save(db: &StateDb, uid: u64, object: ObjectId, size: u64) -> String {
+    add_item(db, uid, false);
+    let (saved, _) = db
+        .accept_content_save(uid, object, size, DateTime::from_timestamp_nanos(5))
+        .unwrap();
+    saved.content_version
+}
+
+fn uploaded(native_id: &str) -> (FileEntry, Revision) {
+    let entry = FileEntry::file(
+        ItemId::new("nas", native_id),
+        ItemId::new("nas", "root"),
+        "f".to_owned(),
+    );
+    (entry, revision(native_id))
+}
+
+fn pin(db: &StateDb, uid: u64) {
+    add_item(db, uid, true);
 }
 
 #[test]
@@ -108,7 +130,7 @@ fn write_back_state_records_upload_before_clean() {
     let id = insert(&db, 1, 100);
     let untouched = insert(&db, 2, 100);
 
-    db.mark_content_dirty(id, "v2", 120).unwrap();
+    let version = save(&db, 1, id, 120);
     let upload = UploadRecord {
         temp_name: ".cascade-tmp-1".to_owned(),
         file_id: "file-77".to_owned(),
@@ -120,21 +142,22 @@ fn write_back_state_records_upload_before_clean() {
     let object = dirty.first().unwrap();
     assert_eq!(object.object_id, id);
     assert!(object.dirty);
-    assert_eq!(object.content_version, "v2");
+    assert_eq!(object.content_version, version);
     assert_eq!(object.size, 120);
     assert_eq!(object.upload.as_ref(), Some(&upload));
 
-    db.mark_content_clean(id).unwrap();
+    let (entry, file) = uploaded("file-77");
+    assert!(db.finish_content_upload(1, id, &entry, &file).unwrap());
     let clean = db.content_object(id).unwrap().unwrap();
     assert!(!clean.dirty);
     assert_eq!(clean.upload, None);
-    assert_eq!(clean.content_version, "v2");
+    assert_eq!(clean.content_version, version);
     assert!(db.dirty_content_objects().unwrap().is_empty());
     assert!(!db.content_object(untouched).unwrap().unwrap().dirty);
 
     assert!(
-        db.mark_content_clean(ObjectId::new(untouched.get() + 1))
-            .is_err()
+        !db.finish_content_upload(1, ObjectId::new(untouched.get() + 1), &entry, &file)
+            .unwrap()
     );
 }
 
@@ -153,7 +176,7 @@ fn eviction_candidates_are_clean_unpinned_and_least_recent_first() {
         .unwrap();
     db.add_content_range(old, 0..10).unwrap();
     db.add_content_range(old, 5..30).unwrap();
-    db.mark_content_dirty(dirty, "v2", 100).unwrap();
+    save(&db, 4, dirty, 100);
     pin(&db, 5);
 
     let candidates = db.content_eviction_candidates().unwrap();
