@@ -6,7 +6,7 @@ use std::sync::MutexGuard;
 
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 
 use super::StateDb;
 use crate::content::ObjectId;
@@ -15,7 +15,7 @@ use crate::types::Revision;
 
 const OBJECT_COLUMNS: &str = "o.object_id, o.uid, o.content_version, o.source_stable_id, \
      o.source_size, o.source_mtime, o.source_ctime, o.size, o.state, o.dirty, \
-     o.upload_temp_name, o.upload_file_id, o.last_access";
+     o.upload_temp_name, o.upload_file_id, o.last_access, o.edited";
 
 const POPULATED_BYTES: &str = "COALESCE((SELECT SUM(r.\"end\" - r.start) FROM content_ranges r \
      WHERE r.object_id = o.object_id), 0)";
@@ -90,6 +90,9 @@ pub struct ContentObject {
     pub upload: Option<UploadRecord>,
     /// Recency persisted by the eviction sweep.
     pub last_access: Option<DateTime<Utc>>,
+    /// Whether NFS writes edit the object in place and the edit is not yet
+    /// accepted as a save.
+    pub edited: bool,
 }
 
 /// A clean, unpinned object and the bytes it populates.
@@ -105,7 +108,7 @@ pub(super) fn id_to_sql(id: u64) -> Result<i64> {
     i64::try_from(id).map_err(|_| anyhow!("id {id} exceeds the SQLite integer range"))
 }
 
-fn object_id_to_sql(id: ObjectId) -> Result<i64> {
+pub(super) fn object_id_to_sql(id: ObjectId) -> Result<i64> {
     id_to_sql(id.get())
 }
 
@@ -163,7 +166,93 @@ fn object_from_row(row: &Row<'_>) -> rusqlite::Result<ContentObject> {
             .zip(file_id)
             .map(|(temp_name, file_id)| UploadRecord { temp_name, file_id }),
         last_access: time_column(row, 12)?,
+        edited: row.get(13)?,
     })
+}
+
+/// A table of merged byte ranges per object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RangeTable {
+    /// `content_ranges`: bytes present in the object file.
+    Present,
+    /// `content_written`: bytes NFS writes put into an edited object.
+    Written,
+}
+
+impl RangeTable {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Present => "content_ranges",
+            Self::Written => "content_written",
+        }
+    }
+}
+
+/// Records `range` in `table`, merging it with overlapping and adjacent
+/// ranges.
+pub(super) fn merge_range_in(
+    tx: &Transaction<'_>,
+    table: RangeTable,
+    object_id: ObjectId,
+    range: Range<u64>,
+) -> Result<()> {
+    if range.is_empty() {
+        return Ok(());
+    }
+    let table = table.name();
+    let object = object_id_to_sql(object_id)?;
+    let start = id_to_sql(range.start)?;
+    let end = id_to_sql(range.end)?;
+    let mut merged = RangeMap::default();
+    {
+        let mut touching = tx.prepare(&format!(
+            "SELECT start, \"end\" FROM {table}
+             WHERE object_id = ?1 AND start <= ?3 AND \"end\" >= ?2"
+        ))?;
+        let rows = touching.query_map(params![object, start, end], |row| {
+            Ok(u64_column(row, 0)?..u64_column(row, 1)?)
+        })?;
+        for row in rows {
+            merged.insert(row?);
+        }
+    }
+    merged.insert(range);
+    tx.execute(
+        &format!("DELETE FROM {table} WHERE object_id = ?1 AND start <= ?3 AND \"end\" >= ?2"),
+        params![object, start, end],
+    )?;
+    let mut insert = tx.prepare(&format!(
+        "INSERT INTO {table} (object_id, start, \"end\") VALUES (?1, ?2, ?3)"
+    ))?;
+    for stored in merged.ranges() {
+        insert.execute(params![
+            object,
+            id_to_sql(stored.start)?,
+            id_to_sql(stored.end)?
+        ])?;
+    }
+    Ok(())
+}
+
+/// Cuts the ranges of `table` at `size`.
+pub(super) fn truncate_ranges_in(
+    tx: &Transaction<'_>,
+    table: RangeTable,
+    object_id: ObjectId,
+    size: u64,
+) -> Result<()> {
+    let table = table.name();
+    let object = object_id_to_sql(object_id)?;
+    let size = id_to_sql(size)?;
+    tx.execute(
+        &format!("DELETE FROM {table} WHERE object_id = ?1 AND start >= ?2"),
+        params![object, size],
+    )?;
+    tx.execute(
+        &format!("UPDATE {table} SET \"end\" = ?2 WHERE object_id = ?1 AND \"end\" > ?2"),
+        params![object, size],
+    )?;
+    Ok(())
 }
 
 /// The objects of the item `uid` and of its descendants.
@@ -250,11 +339,13 @@ impl StateDb {
         subtree_objects_in(&conn, uid)
     }
 
-    /// Return every dirty object, for rebuilding the upload timers at start.
+    /// Return every dirty or edited object, for rebuilding the upload timers
+    /// at start.
     pub fn dirty_content_objects(&self) -> Result<Vec<ContentObject>> {
         let conn = self.lock_conn()?;
         let mut statement = conn.prepare(&format!(
-            "SELECT {OBJECT_COLUMNS} FROM content_objects o WHERE o.dirty ORDER BY o.object_id"
+            "SELECT {OBJECT_COLUMNS} FROM content_objects o WHERE o.dirty OR o.edited
+             ORDER BY o.object_id"
         ))?;
         let objects = statement
             .query_map([], object_from_row)?
@@ -264,44 +355,9 @@ impl StateDb {
 
     /// Record a fetched range, merging it with overlapping and adjacent ranges.
     pub fn add_content_range(&self, object_id: ObjectId, range: Range<u64>) -> Result<()> {
-        if range.is_empty() {
-            return Ok(());
-        }
-        let object = object_id_to_sql(object_id)?;
-        let start = id_to_sql(range.start)?;
-        let end = id_to_sql(range.end)?;
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
-        let mut merged = RangeMap::default();
-        {
-            let mut touching = tx.prepare(
-                "SELECT start, \"end\" FROM content_ranges
-                 WHERE object_id = ?1 AND start <= ?3 AND \"end\" >= ?2",
-            )?;
-            let rows = touching.query_map(params![object, start, end], |row| {
-                Ok(u64_column(row, 0)?..u64_column(row, 1)?)
-            })?;
-            for row in rows {
-                merged.insert(row?);
-            }
-        }
-        merged.insert(range);
-        tx.execute(
-            "DELETE FROM content_ranges WHERE object_id = ?1 AND start <= ?3 AND \"end\" >= ?2",
-            params![object, start, end],
-        )?;
-        {
-            let mut insert = tx.prepare(
-                "INSERT INTO content_ranges (object_id, start, \"end\") VALUES (?1, ?2, ?3)",
-            )?;
-            for stored in merged.ranges() {
-                insert.execute(params![
-                    object,
-                    id_to_sql(stored.start)?,
-                    id_to_sql(stored.end)?
-                ])?;
-            }
-        }
+        merge_range_in(&tx, RangeTable::Present, object_id, range)?;
         tx.commit()?;
         Ok(())
     }
@@ -394,7 +450,7 @@ impl StateDb {
             .query_map([], |row| {
                 Ok(EvictionCandidate {
                     object: object_from_row(row)?,
-                    populated_bytes: u64_column(row, 13)?,
+                    populated_bytes: u64_column(row, 14)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;

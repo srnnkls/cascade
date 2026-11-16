@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Component, Path};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -82,6 +82,7 @@ pub struct MockBackend {
     tree: Mutex<Tree>,
     faults: Mutex<HashMap<MockOp, VecDeque<Fault>>>,
     stops: Mutex<HashMap<MockOp, StopPoint>>,
+    upload_replaces: AtomicBool,
 }
 
 impl MockBackend {
@@ -94,7 +95,14 @@ impl MockBackend {
             tree: Mutex::new(Tree::new()),
             faults: Mutex::new(HashMap::new()),
             stops: Mutex::new(HashMap::new()),
+            upload_replaces: AtomicBool::new(false),
         }
+    }
+
+    /// Makes an upload to the path of an existing file replace its content,
+    /// as SMB opens with `OverwriteIf`, instead of failing with a conflict.
+    pub fn replace_existing_on_upload(&self) {
+        self.upload_replaces.store(true, Ordering::Relaxed);
     }
 
     /// Writes a file at the root-relative `path`, creating missing parent
@@ -169,6 +177,15 @@ impl MockBackend {
     /// Fails when `path` is the root.
     pub fn remove(&self, path: &str) -> anyhow::Result<()> {
         lock(&self.tree).remove(&path_key(Path::new(path)))
+    }
+
+    /// Content of the file at the root-relative `path`, without faults,
+    /// reordering or stop points; `None` when no file is there.
+    #[must_use]
+    pub fn content(&self, path: &Path) -> Option<Vec<u8>> {
+        let tree = lock(&self.tree);
+        let node = tree.nodes.get(tree.paths.get(&path_key(path))?)?;
+        (!node.is_dir).then(|| node.data.clone())
     }
 
     /// Makes the next call of `op` take `fault`. Faults for one operation
@@ -272,7 +289,22 @@ impl Backend for MockBackend {
     ) -> anyhow::Result<FileEntry> {
         self.gate(MockOp::Upload).await?;
         let mut tree = lock(&self.tree);
-        let id = tree.insert(&path_key(path), false, data)?;
+        let key = path_key(path);
+        let existing = tree.paths.get(&key).cloned();
+        let id = match existing {
+            Some(id) if self.upload_replaces.load(Ordering::Relaxed) => {
+                let now = tree.tick();
+                let node = tree.node_mut(&id)?;
+                if node.is_dir {
+                    return Err(BackendError::Conflict(format!("{key} is a folder")).into());
+                }
+                node.data = data.to_vec();
+                node.modified = now;
+                node.changed = now;
+                id
+            }
+            _ => tree.insert(&key, false, data)?,
+        };
         tree.entry(&id)
     }
 

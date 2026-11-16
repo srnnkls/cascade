@@ -2,6 +2,7 @@
 //! `replica_meta`.
 
 use std::collections::HashSet;
+use std::ops::Range;
 
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -11,8 +12,8 @@ use sha2::{Digest, Sha256};
 
 use super::StateDb;
 use super::content::{
-    ContentState, id_to_sql, optional_u64_column, subtree_objects_in, time_column, time_to_sql,
-    u64_column,
+    ContentState, RangeTable, id_to_sql, merge_range_in, object_id_to_sql, optional_u64_column,
+    subtree_objects_in, time_column, time_to_sql, truncate_ranges_in, u64_column,
 };
 use crate::content::ObjectId;
 use crate::types::{FileEntry, Revision};
@@ -613,6 +614,57 @@ fn relink_in(
     Ok(())
 }
 
+/// Delete every object of `uid` other than `kept` and return their ids.
+fn supersede_in(tx: &Transaction<'_>, uid: u64, kept: ObjectId) -> Result<Vec<ObjectId>> {
+    let uid = id_to_sql(uid)?;
+    let kept = object_id_to_sql(kept)?;
+    let superseded: Vec<ObjectId> = {
+        let mut statement =
+            tx.prepare("SELECT object_id FROM content_objects WHERE uid = ?1 AND object_id != ?2")?;
+        statement
+            .query_map(params![uid, kept], |row| {
+                u64_column(row, 0).map(ObjectId::new)
+            })?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    tx.execute(
+        "DELETE FROM content_objects WHERE uid = ?1 AND object_id != ?2",
+        params![uid, kept],
+    )?;
+    Ok(superseded)
+}
+
+/// Size of the edited object `object_id` of `uid`.
+fn edited_size_in(tx: &Transaction<'_>, uid: u64, object_id: ObjectId) -> Result<u64> {
+    tx.query_row(
+        "SELECT size FROM content_objects WHERE object_id = ?1 AND uid = ?2 AND edited",
+        params![object_id_to_sql(object_id)?, id_to_sql(uid)?],
+        |row| u64_column(row, 0),
+    )
+    .optional()?
+    .ok_or_else(|| anyhow!("no edited content object {object_id} of item {uid}"))
+}
+
+/// Set the size of the edited object and the presented size and last-write
+/// time of its item, leaving content version and revision for the save.
+fn resize_edit_in(
+    tx: &Transaction<'_>,
+    uid: u64,
+    object_id: ObjectId,
+    size: u64,
+    mtime: DateTime<Utc>,
+) -> Result<ReplicaItem> {
+    tx.execute(
+        "UPDATE content_objects SET size = ?2 WHERE object_id = ?1",
+        params![object_id_to_sql(object_id)?, id_to_sql(size)?],
+    )?;
+    tx.execute(
+        "UPDATE replica_items SET size = ?2, mtime = ?3 WHERE uid = ?1",
+        params![id_to_sql(uid)?, id_to_sql(size)?, time_to_sql(Some(mtime))],
+    )?;
+    item_in(tx, uid)
+}
+
 impl StateDb {
     /// Accept a local save held by `object_id`: the object becomes the
     /// item's only, dirty and complete object, and the item takes a new
@@ -635,7 +687,8 @@ impl StateDb {
         let sql_uid = id_to_sql(uid)?;
         let object = id_to_sql(object_id.get())?;
         let changed = tx.execute(
-            "UPDATE content_objects SET dirty = TRUE, state = ?3, content_version = ?4, size = ?5
+            "UPDATE content_objects SET dirty = TRUE, edited = FALSE, state = ?3,
+                 content_version = ?4, size = ?5
              WHERE object_id = ?1 AND uid = ?2",
             params![
                 object,
@@ -648,20 +701,8 @@ impl StateDb {
         if changed == 0 {
             return Err(anyhow!("no content object {object_id} of item {uid}"));
         }
-        let superseded: Vec<ObjectId> = {
-            let mut statement = tx.prepare(
-                "SELECT object_id FROM content_objects WHERE uid = ?1 AND object_id != ?2",
-            )?;
-            statement
-                .query_map(params![sql_uid, object], |row| {
-                    u64_column(row, 0).map(ObjectId::new)
-                })?
-                .collect::<rusqlite::Result<_>>()?
-        };
-        tx.execute(
-            "DELETE FROM content_objects WHERE uid = ?1 AND object_id != ?2",
-            params![sql_uid, object],
-        )?;
+        tx.execute("DELETE FROM content_written WHERE object_id = ?1", [object])?;
+        let superseded = supersede_in(&tx, uid, object_id)?;
         tx.execute(
             "UPDATE replica_items SET content_version = ?2, size = ?3, mtime = ?4,
                  uploaded = FALSE, metadata_version = ?5, revision = ?6
@@ -687,10 +728,122 @@ impl StateDb {
         Ok((saved, superseded))
     }
 
+    /// Start an in-place edit in `object_id`, whose file already holds the
+    /// bytes of `present`: the object becomes the item's only object, dirty
+    /// and edited, and the item is marked not uploaded. Returns the objects
+    /// the edit superseded, whose files the caller removes.
+    pub fn begin_content_edit(
+        &self,
+        uid: u64,
+        object_id: ObjectId,
+        present: &[Range<u64>],
+    ) -> Result<Vec<ObjectId>> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE content_objects SET dirty = TRUE, edited = TRUE, state = ?3
+             WHERE object_id = ?1 AND uid = ?2",
+            params![
+                object_id_to_sql(object_id)?,
+                id_to_sql(uid)?,
+                ContentState::Partial.as_str()
+            ],
+        )?;
+        if changed == 0 {
+            return Err(anyhow!("no content object {object_id} of item {uid}"));
+        }
+        for range in present {
+            merge_range_in(&tx, RangeTable::Present, object_id, range.clone())?;
+        }
+        let superseded = supersede_in(&tx, uid, object_id)?;
+        tx.execute(
+            "UPDATE replica_items SET uploaded = FALSE WHERE uid = ?1",
+            [id_to_sql(uid)?],
+        )?;
+        tx.commit()?;
+        Ok(superseded)
+    }
+
+    /// Record bytes written into the edited object at `written`: the range
+    /// is written and present, and the object and the item grow to its end.
+    /// Returns the item.
+    pub fn record_content_write(
+        &self,
+        uid: u64,
+        object_id: ObjectId,
+        written: Range<u64>,
+        mtime: DateTime<Utc>,
+    ) -> Result<ReplicaItem> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        let size = edited_size_in(&tx, uid, object_id)?.max(written.end);
+        merge_range_in(&tx, RangeTable::Written, object_id, written.clone())?;
+        merge_range_in(&tx, RangeTable::Present, object_id, written)?;
+        let item = resize_edit_in(&tx, uid, object_id, size, mtime)?;
+        tx.commit()?;
+        Ok(item)
+    }
+
+    /// Record a size change of the edited object: ranges past `size` are
+    /// cut, and growth is written as zeros. Returns the item.
+    pub fn truncate_content_edit(
+        &self,
+        uid: u64,
+        object_id: ObjectId,
+        size: u64,
+        mtime: DateTime<Utc>,
+    ) -> Result<ReplicaItem> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        let old = edited_size_in(&tx, uid, object_id)?;
+        for table in [RangeTable::Written, RangeTable::Present] {
+            if size < old {
+                truncate_ranges_in(&tx, table, object_id, size)?;
+            } else {
+                merge_range_in(&tx, table, object_id, old..size)?;
+            }
+        }
+        let item = resize_edit_in(&tx, uid, object_id, size, mtime)?;
+        tx.commit()?;
+        Ok(item)
+    }
+
+    /// Move the edited object onto `revision`: only its written ranges stay
+    /// present, so every other byte is fetched from that revision.
+    pub fn rebase_content_edit(&self, object_id: ObjectId, revision: &Revision) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        let object = object_id_to_sql(object_id)?;
+        tx.execute("DELETE FROM content_ranges WHERE object_id = ?1", [object])?;
+        tx.execute(
+            "INSERT INTO content_ranges (object_id, start, \"end\")
+             SELECT object_id, start, \"end\" FROM content_written WHERE object_id = ?1",
+            [object],
+        )?;
+        let changed = tx.execute(
+            "UPDATE content_objects SET source_stable_id = ?2, source_size = ?3,
+                 source_mtime = ?4, source_ctime = ?5
+             WHERE object_id = ?1 AND edited",
+            params![
+                object,
+                revision.stable_id,
+                revision.size.map(id_to_sql).transpose()?,
+                time_to_sql(revision.last_write_time),
+                time_to_sql(revision.change_time),
+            ],
+        )?;
+        if changed == 0 {
+            return Err(anyhow!("no edited content object {object_id}"));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Record a finished rename-over: the item is re-linked to the renamed
-    /// file, and when `object_id` is still its dirty object, the object
-    /// becomes clean with the renamed file's revision as its source and the
-    /// item is marked uploaded. Returns whether the object became clean.
+    /// file, and when `object_id` is still its dirty object and not edited,
+    /// the object becomes clean with the renamed file's revision as its
+    /// source and the item is marked uploaded. Returns whether the object
+    /// became clean.
     pub fn finish_content_upload(
         &self,
         uid: u64,
@@ -707,7 +860,7 @@ impl StateDb {
             "UPDATE content_objects SET dirty = FALSE, state = ?3, upload_temp_name = NULL,
                  upload_file_id = NULL, source_stable_id = ?4, source_size = ?5,
                  source_mtime = ?6, source_ctime = ?7
-             WHERE object_id = ?1 AND uid = ?2 AND dirty",
+             WHERE object_id = ?1 AND uid = ?2 AND dirty AND NOT edited",
             params![
                 id_to_sql(object_id.get())?,
                 id_to_sql(uid)?,
@@ -825,6 +978,26 @@ impl StateDb {
         meta_in(&conn)
     }
 
+    /// Whether the last backend call failed as unreachable.
+    pub fn remote_unreachable(&self) -> Result<bool> {
+        let conn = self.lock_conn()?;
+        Ok(conn.query_row(
+            "SELECT remote_unreachable FROM replica_meta WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Record whether the last backend call failed as unreachable.
+    pub fn set_remote_unreachable(&self, unreachable: bool) -> Result<()> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE replica_meta SET remote_unreachable = ?1 WHERE id = 1",
+            [unreachable],
+        )?;
+        Ok(())
+    }
+
     /// Return the uid of the backend's root folder, registering it on first use.
     pub fn ensure_replica_root(&self, backend_id: &str, native_id: &str) -> Result<u64> {
         let mut conn = self.lock_conn()?;
@@ -881,6 +1054,21 @@ impl StateDb {
         ))?;
         let items = statement
             .query_map([backend_id], item_from_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(items)
+    }
+
+    /// Return the working set in uid order: every pinned and every
+    /// materialised item.
+    pub fn replica_working_set(&self) -> Result<Vec<ReplicaItem>> {
+        let conn = self.lock_conn()?;
+        let mut statement = conn.prepare(&format!(
+            "SELECT {ITEM_COLUMNS} FROM replica_items
+             WHERE pinned OR rule_pinned OR uid IN (SELECT uid FROM materialized_items)
+             ORDER BY uid"
+        ))?;
+        let items = statement
+            .query_map([], item_from_row)?
             .collect::<rusqlite::Result<_>>()?;
         Ok(items)
     }
@@ -1108,8 +1296,9 @@ impl StateDb {
         Ok(uids)
     }
 
-    /// Return the items and tombstones newer than `revision` together with
-    /// the counters they were read under.
+    /// Return the items newer than `revision` in revision order and the
+    /// tombstones newer than it, together with the counters they were read
+    /// under.
     pub fn replica_changes_since(&self, revision: u64) -> Result<ReplicaChanges> {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
@@ -1117,7 +1306,7 @@ impl StateDb {
         let since = id_to_sql(revision)?;
         let updated = {
             let mut statement = tx.prepare(&format!(
-                "SELECT {ITEM_COLUMNS} FROM replica_items WHERE revision > ?1 ORDER BY uid"
+                "SELECT {ITEM_COLUMNS} FROM replica_items WHERE revision > ?1 ORDER BY revision, uid"
             ))?;
             statement
                 .query_map([since], item_from_row)?

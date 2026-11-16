@@ -470,7 +470,7 @@ impl ContentCache {
         };
         self.restarting(uid, admit, |source| async move {
             match source {
-                Source::Complete(..) => Ok(Some(())),
+                Source::Complete(..) | Source::Edited => Ok(Some(())),
                 Source::Transfer(transfer, _guard) => {
                     let wait = transfer.waiters.wait(transfer.whole());
                     self.ensure_download(&transfer);

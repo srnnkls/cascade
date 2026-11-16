@@ -16,7 +16,7 @@ use tokio::sync::Notify;
 use tokio::time::Instant;
 
 use super::mock_backend::{MockBackend, MockOp};
-use crate::backend::Backend;
+use crate::backend::{Backend, TransientError};
 use crate::types::{Change, Cursor, FileEntry, FileId, Quota, Revision};
 
 /// A temporary upload the backend applied.
@@ -108,6 +108,7 @@ pub struct RecordingBackend {
     freeze_after: Option<MockOp>,
     frozen: Notify,
     pause_after: Mutex<Option<(MockOp, Arc<Hold>)>>,
+    fail_reply_after: Mutex<Option<MockOp>>,
 }
 
 impl RecordingBackend {
@@ -124,6 +125,7 @@ impl RecordingBackend {
             freeze_after: freeze,
             frozen: Notify::new(),
             pause_after: Mutex::new(None),
+            fail_reply_after: Mutex::new(None),
         })
     }
 
@@ -168,11 +170,20 @@ impl RecordingBackend {
         hold
     }
 
+    /// Reports the next applied call of `op` as unreachable, as a reply lost
+    /// after the backend applied it.
+    pub fn fail_reply_after(&self, op: MockOp) {
+        *self
+            .fail_reply_after
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(op);
+    }
+
     fn note(&self, op: MockOp) {
         *self.log.entries().calls.entry(op).or_default() += 1;
     }
 
-    async fn applied(&self, op: MockOp) {
+    async fn applied(&self, op: MockOp) -> anyhow::Result<()> {
         if self.freeze_after == Some(op) {
             self.frozen.notify_one();
             std::future::pending::<()>().await;
@@ -192,6 +203,16 @@ impl RecordingBackend {
             hold.reached.notify_one();
             hold.released.notified().await;
         }
+        let reply_lost = self
+            .fail_reply_after
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take_if(|failing| *failing == op)
+            .is_some();
+        if reply_lost {
+            return Err(TransientError::Unreachable(format!("reply of {op:?}")).into());
+        }
+        Ok(())
     }
 }
 
@@ -261,7 +282,7 @@ impl Backend for RecordingBackend {
             data: data.to_vec(),
             file_id: entry.id.native_id().to_owned(),
         });
-        self.applied(MockOp::Upload).await;
+        self.applied(MockOp::Upload).await?;
         Ok(entry)
     }
 
@@ -287,7 +308,7 @@ impl Backend for RecordingBackend {
     async fn delete(&self, file: &FileEntry) -> anyhow::Result<()> {
         self.note(MockOp::Delete);
         self.inner.delete(file).await?;
-        self.applied(MockOp::Delete).await;
+        self.applied(MockOp::Delete).await?;
         Ok(())
     }
 
@@ -320,13 +341,13 @@ impl Backend for RecordingBackend {
         self.note(MockOp::Replace);
         self.log.entries().replace_attempts.push(Instant::now());
         let replaced = self.inner.replace(source, target).await?;
-        let data = self.inner.download(&replaced.0).await?;
+        let data = self.inner.content(target).unwrap_or_default();
         self.log.entries().placed.push(Placed {
             source: source.to_path_buf(),
             target: target.to_path_buf(),
             data,
         });
-        self.applied(MockOp::Replace).await;
+        self.applied(MockOp::Replace).await?;
         Ok(replaced)
     }
 

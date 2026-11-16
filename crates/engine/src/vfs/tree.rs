@@ -19,6 +19,18 @@ use crate::types::{CacheState, DirEntry, FileEntry, FileId, ItemId, SyncCursor, 
 /// on a single neutral-root identity.
 pub const NEUTRAL_ROOT_ID: &str = "__cascade_root__";
 
+/// How [`VfsTree`] spells a path and a mount prefix before matching them.
+type Spelling = fn(&Path) -> &Path;
+
+const fn as_spelled(path: &Path) -> &Path {
+    path
+}
+
+/// `path` without its leading root.
+fn rootless(path: &Path) -> &Path {
+    path.strip_prefix("/").unwrap_or(path)
+}
+
 /// The [`ItemId`] of the neutral root's synthetic container.
 ///
 /// Top-level mount-point directories (a backend mounted directly under the
@@ -123,8 +135,22 @@ impl VfsTree {
     /// of the loop, so the invariant survives any future change to the ordering.
     #[must_use]
     pub fn resolve(&self, path: &Path) -> (&Arc<dyn Backend>, PathBuf) {
+        self.route(path, as_spelled)
+    }
+
+    /// [`Self::resolve`] for a presenter path that may carry a leading root,
+    /// such as an NFS path: a mount prefix matches whether or not it carries
+    /// one, and the returned path is backend-relative without a leading root.
+    #[must_use]
+    pub fn resolve_rooted(&self, path: &Path) -> (&Arc<dyn Backend>, PathBuf) {
+        self.route(path, rootless)
+    }
+
+    fn route(&self, path: &Path, spelling: Spelling) -> (&Arc<dyn Backend>, PathBuf) {
+        let path = spelling(path);
         let mut at_root: Option<&Arc<dyn Backend>> = None;
         for (prefix, backend) in &self.children {
+            let prefix = spelling(prefix);
             if prefix.as_os_str().is_empty() {
                 // At-root child: the final fallback, tried after explicit prefixes.
                 at_root = Some(backend);
@@ -164,7 +190,26 @@ impl VfsTree {
         &self,
         path: &Path,
     ) -> anyhow::Result<(Arc<dyn Backend>, String, Vec<String>)> {
-        let (backend, backend_path) = self.resolve(path);
+        self.route_listing(path, as_spelled)
+    }
+
+    /// [`Self::resolve_listing`] for a presenter path that may carry a
+    /// leading root, routed as [`Self::resolve_rooted`] routes it; the root
+    /// path (`/` or empty) lists the mount points of the neutral root.
+    pub fn resolve_listing_rooted(
+        &self,
+        path: &Path,
+    ) -> anyhow::Result<(Arc<dyn Backend>, String, Vec<String>)> {
+        self.route_listing(path, rootless)
+    }
+
+    fn route_listing(
+        &self,
+        path: &Path,
+        spelling: Spelling,
+    ) -> anyhow::Result<(Arc<dyn Backend>, String, Vec<String>)> {
+        let (backend, backend_path) = self.route(path, spelling);
+        let path = spelling(path);
         let backend_path_str = backend_path
             .to_str()
             .ok_or_else(|| {
@@ -174,7 +219,7 @@ impl VfsTree {
 
         let mut mount_names = Vec::new();
         for (child_prefix, _) in &self.children {
-            if child_prefix.parent() == Some(path)
+            if spelling(child_prefix).parent() == Some(path)
                 && let Some(mount_dir_name) = child_prefix.file_name()
             {
                 mount_names.push(mount_dir_name.to_string_lossy().into_owned());
@@ -211,20 +256,13 @@ impl VfsTree {
     /// Move a file, handling cross-backend transfers.
     /// Phase 1 is read-only, so this always fails for cloud backends.
     pub async fn rename(&self, src: &Path, dst: &Path) -> anyhow::Result<()> {
-        let (src_backend, src_path) = self.resolve(src);
-        let (dst_backend, dst_path) = self.resolve(dst);
+        move_routed(self.resolve(src), self.resolve(dst)).await
+    }
 
-        if Arc::ptr_eq(src_backend, dst_backend) {
-            src_backend.move_entry(&src_path, &dst_path).await?;
-        } else {
-            // Cross-backend — download, upload, delete original
-            let entry = src_backend.metadata(&src_path).await?;
-            let data = src_backend.download(&entry).await?;
-            let parent_id = FileId(entry.parent_id.0.clone());
-            dst_backend.upload(&dst_path, &data, &parent_id).await?;
-            src_backend.delete(&entry).await?;
-        }
-        Ok(())
+    /// [`Self::rename`] for presenter paths that may carry a leading root,
+    /// routed as [`Self::resolve_rooted`] routes them.
+    pub async fn rename_rooted(&self, src: &Path, dst: &Path) -> anyhow::Result<()> {
+        move_routed(self.resolve_rooted(src), self.resolve_rooted(dst)).await
     }
 
     /// Get the root backend.
@@ -394,6 +432,25 @@ pub async fn resolve_listing_native_id(
     Ok(entry.id.native_id().to_owned())
 }
 
+/// Move the entry at a routed source to a routed destination, downloading,
+/// uploading and deleting across backends.
+async fn move_routed(
+    (src_backend, src_path): (&Arc<dyn Backend>, PathBuf),
+    (dst_backend, dst_path): (&Arc<dyn Backend>, PathBuf),
+) -> anyhow::Result<()> {
+    if Arc::ptr_eq(src_backend, dst_backend) {
+        src_backend.move_entry(&src_path, &dst_path).await?;
+    } else {
+        // Cross-backend — download, upload, delete original
+        let entry = src_backend.metadata(&src_path).await?;
+        let data = src_backend.download(&entry).await?;
+        let parent_id = FileId(entry.parent_id.0.clone());
+        dst_backend.upload(&dst_path, &data, &parent_id).await?;
+        src_backend.delete(&entry).await?;
+    }
+    Ok(())
+}
+
 /// Merge a backend's immediate children with injected child-mount directory
 /// names, applying the shadow rule.
 ///
@@ -408,14 +465,21 @@ pub async fn resolve_listing_native_id(
 /// identical to [`VfsTree::read_dir`] without re-implementing the merge.
 #[must_use]
 pub fn merge_listing(backend_children: Vec<FileEntry>, mount_names: &[String]) -> Vec<DirEntry> {
-    let mut entries: Vec<DirEntry> = backend_children
+    let entries = backend_children
         .into_iter()
         .map(|entry| DirEntry {
             name: entry.name,
             is_dir: entry.is_dir,
         })
         .collect();
+    merge_mount_names(entries, mount_names)
+}
 
+/// The shadow rule of [`merge_listing`] over entries already converted to
+/// [`DirEntry`]: each mount name is appended as a directory only if no entry
+/// carries that name.
+#[must_use]
+pub fn merge_mount_names(mut entries: Vec<DirEntry>, mount_names: &[String]) -> Vec<DirEntry> {
     for mount_dir_name in mount_names {
         if !entries.iter().any(|e| &e.name == mount_dir_name) {
             entries.push(DirEntry::dir(mount_dir_name.clone()));

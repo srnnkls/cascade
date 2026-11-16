@@ -32,6 +32,12 @@ const OTHER: &str = "docs/other.txt";
 const ORIGINAL: &[u8] = b"original";
 const EDIT: &[u8] = b"local edit";
 const SECOND: &[u8] = b"second local edit, longer";
+/// [`ORIGINAL`] with `XY` written at 2.
+const WRITTEN: &[u8] = b"orXYinal";
+/// [`WRITTEN`] with `QQ` written at 4.
+const WRITTEN_TWICE: &[u8] = b"orXYQQal";
+/// [`EDIT`] with `L` written at 0.
+const EDIT_WRITTEN: &[u8] = b"Local edit";
 const RENAMED_NAME: &str = "renamed.txt";
 const RENAMED: &str = "docs/renamed.txt";
 const ARCHIVE: &str = "archive";
@@ -105,6 +111,17 @@ impl Daemon {
         std::fs::remove_file(&incoming).unwrap();
         assert!(!item.uploaded, "a save replies before its upload");
         item.content_version
+    }
+
+    /// Writes `data` at `offset` as an NFS WRITE does; the reply comes
+    /// before any upload.
+    async fn write(&self, uid: u64, offset: u64, data: &[u8]) {
+        let item = self.cache.write_at(uid, offset, data).await.unwrap();
+        assert!(!item.uploaded, "a write replies before its upload");
+    }
+
+    fn edited_object(&self, uid: u64) -> Option<ContentObject> {
+        self.dirty_object(uid).filter(|object| object.edited)
     }
 
     fn spawn_save(&self, uid: u64, data: &[u8]) -> JoinHandle<anyhow::Result<ReplicaItem>> {
@@ -393,6 +410,20 @@ kill_tests! {
     kill_dirty_reparent: Dirty Reparent Dirty => dirty_reparent;
     kill_dirty_scan: Dirty Scan Dirty => dirty_scan;
     kill_dirty_restart: Dirty Restart Dirty => dirty_restart;
+    kill_clean_write: Clean Write Editing => clean_write;
+    kill_dirty_write: Dirty Write Editing => dirty_write;
+    kill_uploading_write: Uploading Write Editing => uploading_write;
+    kill_recorded_write: Recorded Write Editing => recorded_write;
+    kill_editing_write: Editing Write Editing => editing_write;
+    kill_editing_save: Editing Save Dirty => editing_save;
+    kill_editing_timer_due_uploading: Editing TimerDue Uploading => editing_timer_due_uploading;
+    kill_editing_timer_due_editing: Editing TimerDue Editing => editing_timer_due_editing;
+    kill_editing_rename: Editing Rename Editing => editing_rename;
+    kill_editing_reparent: Editing Reparent Editing => editing_reparent;
+    kill_editing_delete: Editing Delete Deleting => editing_delete;
+    kill_editing_scan: Editing Scan Editing => editing_scan;
+    kill_editing_restart: Editing Restart Editing => editing_restart;
+    kill_deleting_delete_failed_editing: Deleting DeleteFailed Editing => deleting_delete_failed_editing;
     kill_uploading_save: Uploading Save Dirty => uploading_save;
     kill_uploading_upload_failed: Uploading UploadFailed Dirty => uploading_upload_failed;
     kill_uploading_temp_uploaded: Uploading TempUploaded Recorded => uploading_temp_uploaded;
@@ -409,6 +440,8 @@ kill_tests! {
     kill_recorded_reparent: Recorded Reparent Dirty => recorded_reparent;
     kill_recorded_scan: Recorded Scan Recorded => recorded_scan;
     kill_recorded_restart: Recorded Restart Recorded => recorded_restart;
+    kill_recorded_timer_due_renamed: Recorded TimerDue Renamed => recorded_timer_due_renamed;
+    kill_recorded_timer_due_recorded: Recorded TimerDue Recorded => recorded_timer_due_recorded;
     kill_renamed_bookkeeping: Renamed Bookkeeping Clean => renamed_bookkeeping;
     kill_renamed_scan: Renamed Scan Renamed => renamed_scan;
     kill_renamed_restart: Renamed Restart Clean => renamed_restart;
@@ -859,6 +892,61 @@ fn recorded_restart(seed: u64) {
         1,
         "{seed}: a recorded upload was repeated"
     );
+}
+
+/// A rename-over the backend applied whose reply was lost: the retry finds
+/// the recorded file id under the target and settles without a second
+/// upload or rename-over.
+fn recorded_timer_due_renamed(seed: u64) {
+    let case = Case::new(seed);
+    let uid = runtime().block_on(async {
+        let backend = case.recording();
+        backend.fail_reply_after(MockOp::Replace);
+        let (daemon, uid) = case.start(backend).await;
+        daemon.save(uid, EDIT).await;
+        until("the retry settles the object", || {
+            daemon.dirty_object(uid).is_none()
+        })
+        .await;
+        assert_eq!(
+            calls(&case.log, MockOp::Replace),
+            1,
+            "{seed}: second rename-over"
+        );
+        assert!(daemon.item(uid).unwrap().uploaded, "{seed}");
+        uid
+    });
+    case.restart_and_settle(uid, &at(TARGET, EDIT));
+    assert_eq!(uploads(&case.log).len(), 1, "{seed}: second upload");
+    assert_eq!(placed(&case.log), [EDIT], "{seed}");
+    assert_eq!(
+        calls(&case.log, MockOp::Replace),
+        1,
+        "{seed}: second rename-over"
+    );
+}
+
+/// A rename-over that failed leaves the temporary file: the retry renames it
+/// over the target again without a second upload.
+fn recorded_timer_due_recorded(seed: u64) {
+    let case = Case::new(seed);
+    let uid = runtime().block_on(async {
+        let (daemon, uid) = case.start(case.recording()).await;
+        into_recorded(&case, &daemon, uid).await;
+        until("the retry settles the object", || {
+            daemon.dirty_object(uid).is_none()
+        })
+        .await;
+        assert_eq!(
+            calls(&case.log, MockOp::Replace),
+            2,
+            "{seed}: the rename-over is retried once"
+        );
+        uid
+    });
+    case.restart_and_settle(uid, &at(TARGET, EDIT));
+    assert_eq!(uploads(&case.log).len(), 1, "{seed}: second upload");
+    assert_eq!(placed(&case.log), [EDIT], "{seed}");
 }
 
 fn renamed_bookkeeping(seed: u64) {
@@ -2169,4 +2257,279 @@ fn case_operation_locks_of_settled_items_are_released() {
             assert_eq!(locks, 0, "{seed}: operation locks kept");
         });
     }
+}
+
+/// A write into an object never fetched calls no backend before its reply.
+fn clean_write(seed: u64) {
+    let case = Case::new(seed);
+    let uid = runtime().block_on(async {
+        let (daemon, uid) = case.start(case.recording()).await;
+        let version = daemon.item(uid).unwrap().content_version;
+        let fetched = case.log.fetched();
+        daemon.write(uid, 2, b"XY").await;
+        assert_eq!(case.log.fetched(), fetched, "{seed}: the write fetched");
+        assert!(daemon.edited_object(uid).is_some(), "{seed}");
+        assert_eq!(
+            daemon.item(uid).unwrap().content_version,
+            version,
+            "{seed}: a write minted a version before the writes paused"
+        );
+        uid
+    });
+    case.restart_and_settle(uid, &at(TARGET, WRITTEN));
+    assert_eq!(placed(&case.log), [WRITTEN], "{seed}: FR-7 exactly once");
+}
+
+fn dirty_write(seed: u64) {
+    let case = Case::new(seed);
+    let uid = runtime().block_on(async {
+        let (daemon, uid) = case.start(case.recording()).await;
+        daemon.save(uid, EDIT).await;
+        daemon.write(uid, 0, b"L").await;
+        uid
+    });
+    case.restart_and_settle(uid, &at(TARGET, EDIT_WRITTEN));
+    assert_eq!(placed(&case.log), [EDIT_WRITTEN], "{seed}");
+}
+
+fn uploading_write(seed: u64) {
+    let case = Case::new(seed);
+    let uid = runtime().block_on(async {
+        let (daemon, uid) = case.start(case.recording()).await;
+        into_uploading(&case, &daemon, uid).await;
+        daemon.write(uid, 0, b"L").await;
+        uid
+    });
+    case.restart_and_settle(uid, &at(TARGET, EDIT_WRITTEN));
+    assert_eq!(placed(&case.log), [EDIT_WRITTEN], "{seed}");
+}
+
+fn recorded_write(seed: u64) {
+    let case = Case::new(seed);
+    let uid = runtime().block_on(async {
+        let (daemon, uid) = case.start(case.recording()).await;
+        into_recorded(&case, &daemon, uid).await;
+        daemon.write(uid, 0, b"L").await;
+        uid
+    });
+    case.restart_and_settle(uid, &at(TARGET, EDIT_WRITTEN));
+    assert_eq!(placed(&case.log), [EDIT_WRITTEN], "{seed}");
+}
+
+/// Writes in a burst land in one edited object and one content version.
+fn editing_write(seed: u64) {
+    let case = Case::new(seed);
+    let uid = runtime().block_on(async {
+        let (daemon, uid) = case.start(case.recording()).await;
+        daemon.write(uid, 2, b"XY").await;
+        let object = daemon.edited_object(uid).unwrap();
+        daemon.write(uid, 4, b"QQ").await;
+        assert_eq!(
+            daemon.edited_object(uid).unwrap().object_id,
+            object.object_id,
+            "{seed}: a further write left the edited object"
+        );
+        uid
+    });
+    case.restart_and_settle(uid, &at(TARGET, WRITTEN_TWICE));
+    assert_eq!(placed(&case.log), [WRITTEN_TWICE], "{seed}");
+}
+
+fn editing_save(seed: u64) {
+    let case = Case::new(seed);
+    let uid = runtime().block_on(async {
+        let (daemon, uid) = case.start(case.recording()).await;
+        daemon.write(uid, 2, b"XY").await;
+        daemon.save(uid, SECOND).await;
+        assert!(daemon.edited_object(uid).is_none(), "{seed}");
+        uid
+    });
+    case.restart_and_settle(uid, &at(TARGET, SECOND));
+    assert_eq!(placed(&case.log), [SECOND], "{seed}");
+}
+
+/// Kill while the upload of a sealed edit is held: the edit was accepted
+/// as a save with a new content version first.
+fn editing_timer_due_uploading(seed: u64) {
+    let case = Case::new(seed);
+    let uid = runtime().block_on(async {
+        let (daemon, uid) = case.start(case.recording()).await;
+        let version = daemon.item(uid).unwrap().content_version;
+        let held = case.share.stop_at(MockOp::Upload);
+        daemon.write(uid, 2, b"XY").await;
+        held.reached().await;
+        assert!(
+            daemon.edited_object(uid).is_none(),
+            "{seed}: edit not sealed"
+        );
+        assert!(daemon.dirty_object(uid).is_some(), "{seed}");
+        assert_ne!(
+            daemon.item(uid).unwrap().content_version,
+            version,
+            "{seed}: the sealed edit minted no version"
+        );
+        uid
+    });
+    case.restart_and_settle(uid, &at(TARGET, WRITTEN));
+    assert_eq!(placed(&case.log), [WRITTEN], "{seed}");
+}
+
+/// The fetch of the missing ranges fails unreachable; the edit stays.
+fn editing_timer_due_editing(seed: u64) {
+    let case = Case::new(seed);
+    let uid = runtime().block_on(async {
+        let (daemon, uid) = case.start(case.recording()).await;
+        let before = calls(&case.log, MockOp::Metadata);
+        case.share.inject(MockOp::Metadata, Fault::Unreachable);
+        daemon.write(uid, 2, b"XY").await;
+        until("a failed fill", || {
+            calls(&case.log, MockOp::Metadata) > before
+        })
+        .await;
+        let_run().await;
+        assert!(daemon.edited_object(uid).is_some(), "{seed}: edit lost");
+        assert!(uploads(&case.log).is_empty(), "{seed}");
+        uid
+    });
+    case.restart_and_settle(uid, &at(TARGET, WRITTEN));
+    assert_eq!(placed(&case.log), [WRITTEN], "{seed}");
+}
+
+fn editing_rename(seed: u64) {
+    let case = Case::new(seed);
+    let uid = runtime().block_on(async {
+        let (daemon, uid) = case.start(case.recording()).await;
+        daemon.write(uid, 2, b"XY").await;
+        let folder = daemon.folder_uid(uid);
+        daemon
+            .cache
+            .rename(uid, folder, RENAMED_NAME)
+            .await
+            .unwrap();
+        assert!(daemon.edited_object(uid).is_some(), "{seed}");
+        uid
+    });
+    case.restart_and_settle(uid, &at(RENAMED, WRITTEN));
+    assert_eq!(placed(&case.log), [WRITTEN], "{seed}");
+}
+
+fn editing_reparent(seed: u64) {
+    let case = with_archive(seed);
+    let uid = runtime().block_on(async {
+        let (daemon, uid) = case.start(case.recording()).await;
+        daemon.write(uid, 2, b"XY").await;
+        reparent_to_archive(&daemon, uid).await;
+        assert!(daemon.edited_object(uid).is_some(), "{seed}");
+        uid
+    });
+    case.restart_and_settle(uid, &at(ARCHIVED, WRITTEN));
+    assert_left_folder_empty(&case);
+    assert_eq!(placed(&case.log), [WRITTEN], "{seed}");
+}
+
+fn editing_delete(seed: u64) {
+    let case = Case::new(seed);
+    let uid = runtime().block_on(async {
+        let (daemon, uid) = case.start(case.recording()).await;
+        daemon.write(uid, 2, b"XY").await;
+        daemon.cache.delete(uid).await.unwrap();
+        uid
+    });
+    case.restart_and_settle(uid, &Outcome::Gone);
+    assert!(
+        placed(&case.log).is_empty(),
+        "{seed}: a deleted edited item was uploaded"
+    );
+}
+
+fn editing_scan(seed: u64) {
+    let case = Case::new(seed);
+    let uid = runtime().block_on(async {
+        let (daemon, uid) = case.start(case.recording()).await;
+        daemon.write(uid, 2, b"XY").await;
+        let before = daemon.item(uid).unwrap();
+        case.share.rename(TARGET, RENAMED).unwrap();
+        daemon.scan().await;
+        let after = daemon.item(uid).expect("the edited item keeps its uid");
+        assert_eq!(
+            after.name, RENAMED_NAME,
+            "{seed}: name followed by stable id"
+        );
+        assert_eq!(
+            after.content_version, before.content_version,
+            "{seed}: scan minted a version"
+        );
+        assert!(daemon.edited_object(uid).is_some(), "{seed}");
+        uid
+    });
+    case.restart_and_settle(uid, &at(RENAMED, WRITTEN));
+    assert_eq!(placed(&case.log), [WRITTEN], "{seed}");
+}
+
+/// A kill between writes and the upload loses no written range of an
+/// object whose other ranges were never fetched.
+fn editing_restart(seed: u64) {
+    let case = Case::new(seed);
+    let uid = runtime().block_on(async {
+        let (daemon, uid) = case.start(case.recording()).await;
+        daemon.write(uid, 0, b"O").await;
+        daemon.write(uid, 6, b"AL").await;
+        assert!(case.log.fetched().is_empty(), "{seed}: a write fetched");
+        uid
+    });
+    case.restart_and_settle(uid, &at(TARGET, b"OriginAL"));
+    assert_eq!(placed(&case.log), [b"OriginAL"], "{seed}");
+}
+
+/// A write queued behind the operation lock while the timer's seal fetches
+/// the edit's missing ranges: every written byte reaches the remote and no
+/// object ends clean while edited.
+#[test]
+fn case_write_queued_behind_the_seal_of_an_edit() {
+    overlap(async |case, daemon, uid| {
+        let held = case.share.stop_at(MockOp::Download);
+        daemon.write(uid, 2, b"XY").await;
+        held.reached().await;
+        let cache = daemon.cache.clone();
+        let writing = tokio::spawn(async move { cache.write_at(uid, 4, b"QQ").await });
+        let_run().await;
+        held.release();
+        writing.await.unwrap().unwrap();
+        tokio::time::sleep(SETTLE).await;
+        let objects = daemon.db.content_objects_of(uid).unwrap();
+        assert!(
+            objects.iter().all(|object| object.dirty || !object.edited),
+            "{}: an object ended clean with edited set: {objects:?}",
+            case.seed
+        );
+        assert_eq!(
+            placed(&case.log).last().map(Vec::as_slice),
+            Some(WRITTEN_TWICE),
+            "{}",
+            case.seed
+        );
+        at(TARGET, WRITTEN_TWICE)
+    });
+}
+
+/// FR-7: a delete of an edited item failing unreachable keeps the edit,
+/// which a restart uploads.
+fn deleting_delete_failed_editing(seed: u64) {
+    let case = Case::new(seed);
+    let uid = runtime().block_on(async {
+        let (daemon, uid) = case.start(case.recording()).await;
+        daemon.write(uid, 2, b"XY").await;
+        case.share.inject(MockOp::Delete, Fault::Unreachable);
+        assert!(daemon.cache.delete(uid).await.is_err(), "{seed}");
+        let len = u32::try_from(WRITTEN.len()).unwrap();
+        assert_eq!(
+            daemon.cache.read(uid, 0, len).await.unwrap(),
+            WRITTEN,
+            "{seed}"
+        );
+        assert!(daemon.edited_object(uid).is_some(), "{seed}");
+        uid
+    });
+    case.restart_and_settle(uid, &at(TARGET, WRITTEN));
+    assert_eq!(placed(&case.log), [WRITTEN], "{seed}");
 }

@@ -603,25 +603,39 @@ pub enum CacheSignal {
     /// app evicts the item, and the object is deleted once the item leaves
     /// the materialised set.
     Evict(u64),
+    /// A file was pinned; the host app asks the system to download it.
+    RequestDownload(u64),
 }
 
 /// Bounds backend calls by a deadline and raises
 /// [`CacheSignal::ErrorResolved`] on the first success after an unreachable
-/// failure.
+/// failure, also when that failure happened before a restart. The failure
+/// stays pending until a success finds a subscriber to receive the signal.
 #[derive(Debug)]
 pub(crate) struct Remote {
     timeout: Duration,
     unreachable: AtomicBool,
+    db: Arc<StateDb>,
     signals: broadcast::Sender<CacheSignal>,
 }
 
 impl Remote {
-    pub(crate) fn new(timeout: Duration) -> Self {
+    /// # Errors
+    ///
+    /// Fails when the state database cannot be read.
+    pub(crate) fn new(timeout: Duration, db: Arc<StateDb>) -> Result<Self> {
         let (signals, _) = broadcast::channel(16);
-        Self {
+        Ok(Self {
             timeout,
-            unreachable: AtomicBool::new(false),
+            unreachable: AtomicBool::new(db.remote_unreachable()?),
+            db,
             signals,
+        })
+    }
+
+    fn persist_unreachable(&self, unreachable: bool) {
+        if let Err(error) = self.db.set_remote_unreachable(unreachable) {
+            tracing::warn!(error = %format!("{error:#}"), "unreachable state not recorded");
         }
     }
 
@@ -662,12 +676,17 @@ impl Remote {
         });
         match &result {
             Ok(_) => {
-                if self.unreachable.swap(false, StdOrdering::AcqRel) {
+                if self.signals.receiver_count() > 0
+                    && self.unreachable.swap(false, StdOrdering::AcqRel)
+                {
+                    self.persist_unreachable(false);
                     self.signal(CacheSignal::ErrorResolved);
                 }
             }
             Err(error) if is_unreachable(error) => {
-                self.unreachable.store(true, StdOrdering::Release);
+                if !self.unreachable.swap(true, StdOrdering::AcqRel) {
+                    self.persist_unreachable(true);
+                }
             }
             Err(_) => {}
         }

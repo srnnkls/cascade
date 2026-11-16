@@ -221,7 +221,11 @@ fn v8_database_migrates_to_v9_with_existing_rows_intact() {
         "replica_tombstones",
         &["uid", "parent_uid", "revision"],
     );
-    assert_has_columns(&conn, "replica_meta", &["store_id", "revision", "floor"]);
+    assert_has_columns(
+        &conn,
+        "replica_meta",
+        &["store_id", "revision", "floor", "remote_unreachable"],
+    );
     assert_has_columns(
         &conn,
         "content_objects",

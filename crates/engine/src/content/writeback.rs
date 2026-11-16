@@ -50,6 +50,8 @@ pub enum WriteBackState {
     Clean,
     /// A dirty object waits for its timer.
     Dirty,
+    /// NFS writes edit an object in place; the edit is not yet a save.
+    Editing,
     /// The dirty object is being uploaded to its temporary name.
     Uploading,
     /// The temporary name and file id are recorded; the rename-over is due.
@@ -68,6 +70,8 @@ pub enum WriteBackState {
 pub enum WriteBackEvent {
     /// A save is accepted into a new dirty object.
     Save,
+    /// An NFS write or size change goes into the item's edited object.
+    Write,
     /// The item's timer expires and an upload starts.
     TimerDue,
     /// The upload to the temporary name fails.
@@ -113,6 +117,11 @@ const fn row(from: WriteBackState, event: WriteBackEvent, to: WriteBackState) ->
 ///
 /// - A save always lands in a new dirty object; an upload that finds its
 ///   object superseded removes its temporary file.
+/// - A write into an item without an edited object starts one from a clone
+///   of its current object, which supersedes that object; further writes go
+///   into the same object. The timer of an edited object fetches its missing
+///   ranges and accepts it as a save before the upload; a fetch that fails
+///   leaves the edit in place for the next timer.
 /// - A save after a failed rename-over leaves the record with the superseded
 ///   object; the next upload removes the stale temporary file.
 /// - Rename and scan follow name and parent by stable id and mint no content
@@ -125,24 +134,39 @@ const fn row(from: WriteBackState, event: WriteBackEvent, to: WriteBackState) ->
 /// - Recovery finishes a rename it finds under the target name by file id,
 ///   resumes a recorded temporary file that still exists and removes every
 ///   other temporary file in the scan set and the folders of dirty objects.
+/// - A timer after a failed rename-over settles the record the same way: a
+///   rename that applied but whose reply failed is found under the target by
+///   file id, and a temporary file that still exists is renamed over again.
 pub const TRANSITIONS: &[Transition] = {
     use WriteBackEvent as E;
     use WriteBackState as S;
     &[
         row(S::Clean, E::Save, S::Dirty),
+        row(S::Clean, E::Write, S::Editing),
         row(S::Clean, E::Rename, S::Clean),
         row(S::Clean, E::Reparent, S::Clean),
         row(S::Clean, E::Delete, S::Deleting),
         row(S::Clean, E::Scan, S::Clean),
         row(S::Clean, E::Restart, S::Clean),
         row(S::Dirty, E::Save, S::Dirty),
+        row(S::Dirty, E::Write, S::Editing),
         row(S::Dirty, E::TimerDue, S::Uploading),
         row(S::Dirty, E::Rename, S::Dirty),
         row(S::Dirty, E::Reparent, S::Dirty),
         row(S::Dirty, E::Delete, S::Deleting),
         row(S::Dirty, E::Scan, S::Dirty),
         row(S::Dirty, E::Restart, S::Dirty),
+        row(S::Editing, E::Write, S::Editing),
+        row(S::Editing, E::Save, S::Dirty),
+        row(S::Editing, E::TimerDue, S::Uploading),
+        row(S::Editing, E::TimerDue, S::Editing),
+        row(S::Editing, E::Rename, S::Editing),
+        row(S::Editing, E::Reparent, S::Editing),
+        row(S::Editing, E::Delete, S::Deleting),
+        row(S::Editing, E::Scan, S::Editing),
+        row(S::Editing, E::Restart, S::Editing),
         row(S::Uploading, E::Save, S::Dirty),
+        row(S::Uploading, E::Write, S::Editing),
         row(S::Uploading, E::UploadFailed, S::Dirty),
         row(S::Uploading, E::TempUploaded, S::Recorded),
         row(S::Uploading, E::Rename, S::Uploading),
@@ -151,6 +175,7 @@ pub const TRANSITIONS: &[Transition] = {
         row(S::Uploading, E::Scan, S::Uploading),
         row(S::Uploading, E::Restart, S::Dirty),
         row(S::Recorded, E::Save, S::Dirty),
+        row(S::Recorded, E::Write, S::Editing),
         row(S::Recorded, E::RenameOver, S::Renamed),
         row(S::Recorded, E::RenameFailed, S::Recorded),
         row(S::Recorded, E::Rename, S::Recorded),
@@ -158,12 +183,15 @@ pub const TRANSITIONS: &[Transition] = {
         row(S::Recorded, E::Delete, S::Deleting),
         row(S::Recorded, E::Scan, S::Recorded),
         row(S::Recorded, E::Restart, S::Recorded),
+        row(S::Recorded, E::TimerDue, S::Renamed),
+        row(S::Recorded, E::TimerDue, S::Recorded),
         row(S::Renamed, E::Bookkeeping, S::Clean),
         row(S::Renamed, E::Scan, S::Renamed),
         row(S::Renamed, E::Restart, S::Clean),
         row(S::Deleting, E::RemoteDeleted, S::Deleted),
         row(S::Deleting, E::DeleteFailed, S::Clean),
         row(S::Deleting, E::DeleteFailed, S::Dirty),
+        row(S::Deleting, E::DeleteFailed, S::Editing),
         row(S::Deleting, E::Restart, S::Deleted),
         row(S::Deleted, E::Restart, S::Deleted),
     ]
@@ -180,7 +208,7 @@ fn sibling(target: &Path, name: &str) -> PathBuf {
         .map_or_else(|| PathBuf::from(name), |parent| parent.join(name))
 }
 
-fn file_id(backend_id: &str, native_id: &str) -> FileId {
+pub(super) fn file_id(backend_id: &str, native_id: &str) -> FileId {
     FileId(ItemId::new(backend_id, native_id).0)
 }
 
@@ -374,6 +402,18 @@ impl ContentCache {
     /// Fails when the item is unknown or no file, its name is rejected by
     /// TR-10, or the file cannot be copied into the cache.
     pub async fn save(&self, uid: u64, contents: &Path) -> Result<ReplicaItem> {
+        let operation = self.shared().writeback.lock(uid).await;
+        self.save_locked(uid, contents, &operation).await
+    }
+
+    /// [`save`](Self::save) under the item's operation lock, held by the
+    /// caller as `_operation`.
+    pub(super) async fn save_locked(
+        &self,
+        uid: u64,
+        contents: &Path,
+        _operation: &Operation<'_>,
+    ) -> Result<ReplicaItem> {
         let item = self
             .item(uid)?
             .ok_or_else(|| BackendError::NotFound(format!("item {uid}")))?;
@@ -382,7 +422,6 @@ impl ContentCache {
         }
         check_name(&item.name)?;
         let writeback = &self.shared().writeback;
-        let _operation = writeback.lock(uid).await;
         let slot = self.slot(uid);
         let mut current = slot.lock().await;
         if let Some(transfer) = current.take() {
@@ -500,12 +539,13 @@ impl ContentCache {
         self.finish_delete(&replica, uid, &path).await
     }
 
+    /// The item's object awaiting upload: dirty or edited.
     fn dirty_object(&self, uid: u64) -> Result<Option<ContentObject>> {
         Ok(self
             .db()
             .content_objects_of(uid)?
             .into_iter()
-            .find(|object| object.dirty))
+            .find(|object| object.dirty || object.edited))
     }
 
     async fn run_write_back(self) {
@@ -532,6 +572,9 @@ impl ContentCache {
         if let Err(error) = &outcome {
             tracing::warn!(uid, error = %format!("{error:#}"), "upload failed; retrying later");
         }
+        if matches!(outcome, Ok(Uploaded::Clean)) {
+            self.shared().working_set.raise();
+        }
         self.shared().writeback.finish(uid, &outcome);
     }
 
@@ -545,8 +588,15 @@ impl ContentCache {
             return Ok(Uploaded::Gone);
         }
         let replica = self.replica(uid)?;
+        let operation = if object.edited || object.upload.is_some() {
+            Some(writeback.lock(uid).await)
+        } else {
+            None
+        };
+        if object.edited {
+            self.seal_edit(uid).await?;
+        }
         if object.upload.is_some() {
-            let _operation = writeback.lock(uid).await;
             match self.settle(&replica, uid).await? {
                 Settled::Clean => return Ok(Uploaded::Clean),
                 Settled::Resume { object_id, temp } => {
@@ -558,6 +608,10 @@ impl ContentCache {
         let Some(object) = self.dirty_object(uid)? else {
             return Ok(Uploaded::Gone);
         };
+        if object.edited {
+            return Ok(Uploaded::Superseded);
+        }
+        drop(operation);
         let target = self.upload_target(&replica, uid).await?;
         let folder = self.parent_uid(uid)?;
         let temp = sibling(&target, &temp_name(uid));

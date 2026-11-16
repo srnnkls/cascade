@@ -1,24 +1,39 @@
-//! Unix domain socket server that dispatches inbound File Provider RPC
-//! calls to a [`crate::handlers::FileProviderHandlers`] implementation.
+//! Unix domain socket servers of the File Provider extension.
 //!
-//! The Swift `ActionHandler` opens a fresh socket per call, writes one
-//! length-prefixed JSON [`cascade_engine::protocol::Request`], reads back
-//! one length-prefixed [`crate::wire::RpcResponse`], and closes. The
-//! server mirrors that shape: accept a connection, read one request,
-//! dispatch, write one response, drop the connection.
+//! [`FileProviderServer`] serves protocol v1 to the Swift `ActionHandler`,
+//! which opens a fresh socket per call, writes one length-prefixed JSON
+//! [`cascade_engine::protocol::Request`], reads back one length-prefixed
+//! [`crate::wire::RpcResponse`], and closes; it dispatches to a
+//! [`crate::handlers::FileProviderHandlers`] implementation.
 //!
-//! The server task is spawned with [`FileProviderServer::serve`]. It runs
-//! until the cancel signal fires or the listener is dropped.
+//! [`ContentServer`] serves protocol v2 from the content cache over
+//! persistent connections with the same framing.
+//!
+//! Each server task runs until the cancel signal fires or the listener is
+//! dropped.
 
+use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, PoisonError};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use cascade_engine::backend::{BackendError, TransientError};
+use cascade_engine::content::anchor::SyncAnchor;
+use cascade_engine::content::cache::{ContentCache, Handoff, RangeRequest};
+use cascade_engine::content::domain::{CachedBytes, DomainError, Mount};
+use cascade_engine::content::evict::EvictError;
+use cascade_engine::content::names::NameError;
+use cascade_engine::content::replica::{Changes, ItemKind, ReplicaItem};
+use cascade_engine::content::transfer::{CacheSignal, TransferError};
 use cascade_engine::protocol::{Request, encode_message};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::unix::OwnedReadHalf;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::watch;
+use tokio::sync::{broadcast, mpsc, watch};
 
 /// File mode applied to the RPC socket after binding.
 ///
@@ -30,13 +45,18 @@ use tokio::sync::watch;
 const SOCKET_MODE: u32 = 0o600;
 
 use crate::handlers::{FileProviderHandlers, HandlerError, HandlerResult};
-use crate::items::FileProviderItem;
+use crate::items::{DomainItem, DomainItemKind, EXTENSION_ROOT_ID, FileProviderItem};
 use crate::wire::{
-    CreateDirectoryParams, CreateDirectoryResult, CurrentSyncCursorParams, CurrentSyncCursorResult,
-    DeleteItemParams, DeleteItemResult, EnumerateChangesParams, EnumerateChangesResult,
-    EnumerateItemsParams, EnumerateItemsResult, FetchContentsParams, FetchContentsResult,
-    GetItemParams, GetItemResult, ImportDocumentParams, ImportDocumentResult, MoveItemParams,
-    MoveItemResult, RpcError, RpcResponse, methods,
+    AnchorResult, CancelParams, ChangedField, ChangesParams, ChangesResult, CreateDirectoryParams,
+    CreateDirectoryResult, CreateParams, CurrentSyncCursorParams, CurrentSyncCursorResult,
+    DeleteItemParams, DeleteItemResult, DeleteParams, EnumerateChangesParams,
+    EnumerateChangesResult, EnumerateItemsParams, EnumerateItemsResult, EvictParams,
+    FetchContentsParams, FetchContentsResult, FetchParams, FetchRangeParams, FetchRangeResult,
+    FetchResult, FileProviderErrorCode, GetItemParams, GetItemResult, HelloParams, HelloResult,
+    ImportDocumentParams, ImportDocumentResult, ItemParams, ItemResult, ListParams,
+    MaterializedSetParams, ModifyParams, MoveItemParams, MoveItemResult, MutationResult,
+    PROTOCOL_VERSION, PageResult, ProgressFrame, ProgressParams, RpcError, RpcResponse,
+    SetPinnedParams, Signal, WorkingSetParams, methods, methods_v2,
 };
 
 /// Server that listens on a Unix domain socket and dispatches each
@@ -75,55 +95,63 @@ impl FileProviderServer {
     /// permissions must restrict access to the owning user. Any future
     /// change to the bind sequence must preserve this invariant; rely on
     /// explicit `set_permissions`, not the process umask.
-    pub async fn serve(&self, mut cancel: watch::Receiver<bool>) -> Result<()> {
-        if let Some(parent) = self.socket_path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("create socket parent directory {}", parent.display()))?;
-        }
-        if self.socket_path.exists() {
-            tokio::fs::remove_file(&self.socket_path)
-                .await
-                .with_context(|| format!("remove stale socket {}", self.socket_path.display()))?;
-        }
-
-        let listener = UnixListener::bind(&self.socket_path)
-            .with_context(|| format!("bind socket {}", self.socket_path.display()))?;
-        tokio::fs::set_permissions(
-            &self.socket_path,
-            std::fs::Permissions::from_mode(SOCKET_MODE),
-        )
+    pub async fn serve(&self, cancel: watch::Receiver<bool>) -> Result<()> {
+        let listener = bind(&self.socket_path).await?;
+        accept_until(listener, cancel, |stream| {
+            let handlers = Arc::clone(&self.handlers);
+            tokio::spawn(async move {
+                if let Err(error) = serve_connection(stream, handlers).await {
+                    tracing::warn!(%error, "file provider connection failed");
+                }
+            });
+        })
         .await
-        .with_context(|| {
-            format!(
-                "chmod socket {} to {SOCKET_MODE:#o}",
-                self.socket_path.display()
-            )
-        })?;
-        tracing::info!(socket = %self.socket_path.display(), "file provider server listening");
+    }
+}
 
-        loop {
-            tokio::select! {
-                accept = listener.accept() => {
-                    match accept {
-                        Ok((stream, _)) => {
-                            let handlers = Arc::clone(&self.handlers);
-                            tokio::spawn(async move {
-                                if let Err(error) = serve_connection(stream, handlers).await {
-                                    tracing::warn!(%error, "file provider connection failed");
-                                }
-                            });
-                        }
-                        Err(error) => {
-                            tracing::warn!(%error, "file provider accept failed");
-                        }
+/// Binds the socket at `socket_path` with mode [`SOCKET_MODE`], creating its
+/// parent and removing a stale socket first.
+async fn bind(socket_path: &Path) -> Result<UnixListener> {
+    if let Some(parent) = socket_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("create socket parent directory {}", parent.display()))?;
+    }
+    if socket_path.exists() {
+        tokio::fs::remove_file(socket_path)
+            .await
+            .with_context(|| format!("remove stale socket {}", socket_path.display()))?;
+    }
+
+    let listener = UnixListener::bind(socket_path)
+        .with_context(|| format!("bind socket {}", socket_path.display()))?;
+    tokio::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(SOCKET_MODE))
+        .await
+        .with_context(|| format!("chmod socket {} to {SOCKET_MODE:#o}", socket_path.display()))?;
+    tracing::info!(socket = %socket_path.display(), "file provider server listening");
+    Ok(listener)
+}
+
+/// Hands every accepted connection to `on_stream` until `cancel` fires.
+async fn accept_until(
+    listener: UnixListener,
+    mut cancel: watch::Receiver<bool>,
+    on_stream: impl Fn(UnixStream),
+) -> Result<()> {
+    loop {
+        tokio::select! {
+            accept = listener.accept() => {
+                match accept {
+                    Ok((stream, _)) => on_stream(stream),
+                    Err(error) => {
+                        tracing::warn!(%error, "file provider accept failed");
                     }
                 }
-                _ = cancel.changed() => {
-                    if *cancel.borrow() {
-                        tracing::info!("file provider server shutting down");
-                        return Ok(());
-                    }
+            }
+            _ = cancel.changed() => {
+                if *cancel.borrow() {
+                    tracing::info!("file provider server shutting down");
+                    return Ok(());
                 }
             }
         }
@@ -321,6 +349,798 @@ async fn handle_enumerate_changes(
             new_cursor: output.new_cursor,
         },
     )
+}
+
+/// Methods that start work and carry an `op_id`.
+const OPERATIONS: [&str; 5] = [
+    methods_v2::FETCH,
+    methods_v2::FETCH_RANGE,
+    methods_v2::CREATE,
+    methods_v2::MODIFY,
+    methods_v2::DELETE,
+];
+
+/// Operations `cancel` interrupts; mutations run to their end.
+const CANCELLABLE: [&str; 2] = [methods_v2::FETCH, methods_v2::FETCH_RANGE];
+
+/// Capabilities announced by `hello`.
+const CAPABILITIES: [&str; 6] = [
+    "fetchRange",
+    "pin",
+    "evict",
+    "cancel",
+    "progress",
+    "subscribe",
+];
+
+/// Items per page of `list` and `workingSet`.
+const PAGE_SIZE: usize = 256;
+
+/// Interval between samples of the `progress` stream.
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+
+type Frames = mpsc::UnboundedSender<RpcResponse>;
+type CallResult<T> = std::result::Result<T, CallError>;
+
+/// Server of protocol v2: serves the File Provider domain from a
+/// [`ContentCache`].
+///
+/// A connection carries any number of requests, each
+/// answered under its `id` once it finishes; `subscribe` and `progress`
+/// answer with a stream of frames under their request's `id`.
+#[derive(Debug)]
+pub struct ContentServer {
+    socket_path: PathBuf,
+    domain: Arc<Domain>,
+}
+
+impl ContentServer {
+    pub fn new(socket_path: impl Into<PathBuf>, cache: ContentCache) -> Self {
+        Self {
+            socket_path: socket_path.into(),
+            domain: Arc::new(Domain {
+                cache,
+                ops: Arc::default(),
+            }),
+        }
+    }
+
+    /// Socket path the server listens on.
+    #[must_use]
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+
+    /// Bind the listener as [`FileProviderServer::serve`] does and serve
+    /// until `cancel` fires.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the socket cannot be bound.
+    pub async fn serve(&self, cancel: watch::Receiver<bool>) -> Result<()> {
+        let listener = bind(&self.socket_path).await?;
+        accept_until(listener, cancel, |stream| {
+            let domain = Arc::clone(&self.domain);
+            tokio::spawn(async move {
+                if let Err(error) = serve_domain_connection(stream, domain).await {
+                    tracing::warn!(error = %format!("{error:#}"), "file provider connection failed");
+                }
+            });
+        })
+        .await
+    }
+}
+
+/// Reads requests until the peer closes and runs each in its own task;
+/// one writer task sends the frames they produce.
+async fn serve_domain_connection(stream: UnixStream, domain: Arc<Domain>) -> Result<()> {
+    let (mut reader, mut writer) = stream.into_split();
+    let (frames, mut outgoing) = mpsc::unbounded_channel::<RpcResponse>();
+    let (hangup, hung_up) = watch::channel(false);
+    let writing = tokio::spawn(async move {
+        while let Some(frame) = outgoing.recv().await {
+            writer
+                .write_all(&encode_message(&frame).context("encode response")?)
+                .await
+                .context("write response")?;
+        }
+        anyhow::Ok(())
+    });
+    let read = loop {
+        match read_request(&mut reader).await {
+            Ok(Some(request)) => {
+                let op = domain.ops.begin(&request);
+                let domain = Arc::clone(&domain);
+                let frames = frames.clone();
+                let hung_up = hung_up.clone();
+                tokio::spawn(async move { domain.handle(request, op, &frames, hung_up).await });
+            }
+            Ok(None) => break Ok(()),
+            Err(error) => break Err(error),
+        }
+    };
+    hangup.send_replace(true);
+    drop(frames);
+    writing.await.context("join response writer")??;
+    read
+}
+
+/// One length-prefixed request, or `None` when the peer closed.
+async fn read_request(reader: &mut OwnedReadHalf) -> Result<Option<Request>> {
+    let mut len = [0u8; 4];
+    match reader.read_exact(&mut len).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error).context("read request length"),
+    }
+    let mut body = vec![0u8; usize::try_from(u32::from_be_bytes(len))?];
+    reader
+        .read_exact(&mut body)
+        .await
+        .context("read request body")?;
+    Ok(Some(
+        serde_json::from_slice(&body).context("decode request body")?,
+    ))
+}
+
+/// A failed call with its File Provider error code.
+#[derive(Debug)]
+struct CallError {
+    code: FileProviderErrorCode,
+    message: String,
+}
+
+impl CallError {
+    fn new(code: FileProviderErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl From<anyhow::Error> for CallError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::new(code_of(&error), format!("{error:#}"))
+    }
+}
+
+/// The File Provider error code of an engine failure.
+fn code_of(error: &anyhow::Error) -> FileProviderErrorCode {
+    use FileProviderErrorCode as Code;
+    for cause in error.chain() {
+        if cause.is::<TransferError>() {
+            return Code::VersionNoLongerAvailable;
+        }
+        if cause.is::<NameError>() {
+            return Code::ExcludedFromSync;
+        }
+        if let Some(transient) = cause.downcast_ref::<TransientError>() {
+            return match transient {
+                TransientError::Unreachable(_) => Code::ServerUnreachable,
+                TransientError::Busy(_) => Code::CannotSynchronize,
+            };
+        }
+        if let Some(evict) = cause.downcast_ref::<EvictError>() {
+            return match evict {
+                EvictError::OutOfSpace => Code::FileWriteOutOfSpace,
+                EvictError::Busy => Code::NonEvictable,
+            };
+        }
+        if matches!(
+            cause.downcast_ref::<DomainError>(),
+            Some(DomainError::DirectoryNotEmpty)
+        ) {
+            return Code::DirectoryNotEmpty;
+        }
+        if let Some(backend) = cause.downcast_ref::<BackendError>() {
+            return match backend {
+                BackendError::NotFound(_) => Code::NoSuchItem,
+                BackendError::Forbidden(_) | BackendError::ReadOnly(_) => Code::NotAuthenticated,
+                BackendError::Conflict(_) => Code::FilenameCollision,
+            };
+        }
+    }
+    Code::CannotSynchronize
+}
+
+fn reply<T: serde::Serialize>(value: &T) -> CallResult<serde_json::Value> {
+    serde_json::to_value(value).map_err(|error| {
+        CallError::new(FileProviderErrorCode::CannotSynchronize, error.to_string())
+    })
+}
+
+fn parse<T: serde::de::DeserializeOwned>(params: serde_json::Value) -> CallResult<T> {
+    serde_json::from_value(params).map_err(|error| {
+        CallError::new(
+            FileProviderErrorCode::FeatureUnsupported,
+            format!("invalid params: {error}"),
+        )
+    })
+}
+
+fn response(id: u32, outcome: CallResult<serde_json::Value>) -> RpcResponse {
+    match outcome {
+        Ok(value) => RpcResponse::ok(id, value),
+        Err(error) => RpcResponse::err(
+            id,
+            RpcError {
+                code: error.code.as_str().to_owned(),
+                message: error.message,
+            },
+        ),
+    }
+}
+
+/// Queues `frame`; `false` once the connection's writer is gone.
+fn send(frames: &Frames, frame: RpcResponse) -> bool {
+    frames.send(frame).is_ok()
+}
+
+/// An item named on the wire.
+enum Target {
+    Root,
+    Item(u64),
+}
+
+fn target(uid: &str) -> CallResult<Target> {
+    if uid == EXTENSION_ROOT_ID {
+        return Ok(Target::Root);
+    }
+    uid.parse()
+        .map(Target::Item)
+        .map_err(|_| CallError::new(FileProviderErrorCode::NoSuchItem, format!("no item {uid}")))
+}
+
+/// The uid of an item below the neutral root.
+fn item_uid(uid: &str) -> CallResult<u64> {
+    match target(uid)? {
+        Target::Item(uid) => Ok(uid),
+        Target::Root => Err(CallError::new(
+            FileProviderErrorCode::FeatureUnsupported,
+            "the neutral root holds only the mounted backends",
+        )),
+    }
+}
+
+fn anchor_string(anchor: &SyncAnchor) -> CallResult<String> {
+    String::from_utf8(anchor.to_bytes()).map_err(|error| {
+        CallError::new(FileProviderErrorCode::CannotSynchronize, error.to_string())
+    })
+}
+
+/// Operations in flight by `op_id`, for `cancel` and `progress`.
+#[derive(Debug, Default)]
+struct Ops {
+    running: std::sync::Mutex<HashMap<String, Running>>,
+    serial: AtomicU64,
+}
+
+#[derive(Debug)]
+struct Running {
+    serial: u64,
+    uid: Option<u64>,
+    cancel: watch::Sender<bool>,
+}
+
+/// Registration of a running operation, removed on drop.
+struct OpGuard {
+    ops: Arc<Ops>,
+    op_id: String,
+    serial: u64,
+    cancelled: watch::Receiver<bool>,
+}
+
+impl Ops {
+    fn running(&self) -> std::sync::MutexGuard<'_, HashMap<String, Running>> {
+        self.running.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Registers the operation `request` starts, before it is spawned, so a
+    /// later `cancel` or `progress` on the connection finds it.
+    fn begin(self: &Arc<Self>, request: &Request) -> Option<OpGuard> {
+        if !OPERATIONS.contains(&request.method.as_str()) {
+            return None;
+        }
+        let op_id = request.params.get("op_id")?.as_str()?.to_owned();
+        let uid = request
+            .params
+            .get("uid")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|uid| uid.parse().ok());
+        let serial = self.serial.fetch_add(1, Ordering::Relaxed);
+        let (cancel, cancelled) = watch::channel(false);
+        self.running().insert(
+            op_id.clone(),
+            Running {
+                serial,
+                uid,
+                cancel,
+            },
+        );
+        Some(OpGuard {
+            ops: Arc::clone(self),
+            op_id,
+            serial,
+            cancelled,
+        })
+    }
+
+    fn cancel(&self, op_id: &str) {
+        if let Some(running) = self.running().get(op_id) {
+            running.cancel.send_replace(true);
+        }
+    }
+
+    fn is_running(&self, op_id: &str) -> bool {
+        self.running().contains_key(op_id)
+    }
+
+    /// The item of a running operation that names one.
+    fn uid_of(&self, op_id: &str) -> Option<u64> {
+        self.running().get(op_id).and_then(|running| running.uid)
+    }
+}
+
+impl Drop for OpGuard {
+    fn drop(&mut self) {
+        let mut running = self.ops.running();
+        if running
+            .get(&self.op_id)
+            .is_some_and(|op| op.serial == self.serial)
+        {
+            running.remove(&self.op_id);
+        }
+    }
+}
+
+impl OpGuard {
+    async fn cancellable(
+        &self,
+        call: impl Future<Output = CallResult<serde_json::Value>>,
+    ) -> CallResult<serde_json::Value> {
+        let mut cancelled = self.cancelled.clone();
+        tokio::select! {
+            outcome = call => outcome,
+            Ok(_) = cancelled.wait_for(|cancelled| *cancelled) => Err(CallError::new(
+                FileProviderErrorCode::UserCancelled,
+                format!("operation {} cancelled", self.op_id),
+            )),
+        }
+    }
+}
+
+/// The domain a [`ContentServer`] serves.
+#[derive(Debug)]
+struct Domain {
+    cache: ContentCache,
+    ops: Arc<Ops>,
+}
+
+impl Domain {
+    async fn handle(
+        &self,
+        request: Request,
+        op: Option<OpGuard>,
+        frames: &Frames,
+        hung_up: watch::Receiver<bool>,
+    ) {
+        let id = request.id;
+        match request.method.as_str() {
+            methods_v2::SUBSCRIBE => self.subscribe(id, frames, hung_up).await,
+            methods_v2::PROGRESS => self.progress(id, request.params, frames, hung_up).await,
+            method => {
+                let call = self.call(method, request.params);
+                let outcome = match &op {
+                    Some(op) if CANCELLABLE.contains(&method) => op.cancellable(call).await,
+                    _ => call.await,
+                };
+                drop(op);
+                send(frames, response(id, outcome));
+            }
+        }
+    }
+
+    async fn call(&self, method: &str, params: serde_json::Value) -> CallResult<serde_json::Value> {
+        match method {
+            methods_v2::HELLO => Self::hello(parse(params)?),
+            methods_v2::ITEM => self.item(&parse(params)?),
+            methods_v2::LIST => self.list(parse(params)?).await,
+            methods_v2::WORKING_SET => self.working_set(&parse(params)?),
+            methods_v2::CURRENT_ANCHOR => reply(&AnchorResult {
+                anchor: anchor_string(&self.cache.current_anchor()?)?,
+            }),
+            methods_v2::CHANGES => self.changes(&parse(params)?),
+            methods_v2::FETCH => self.fetch(parse(params)?).await,
+            methods_v2::FETCH_RANGE => self.fetch_range(parse(params)?).await,
+            methods_v2::CREATE => self.create(parse(params)?).await,
+            methods_v2::MODIFY => self.modify(parse(params)?).await,
+            methods_v2::DELETE => self.delete(parse(params)?).await,
+            methods_v2::SET_PINNED => self.set_pinned(parse(params)?).await,
+            methods_v2::EVICT => {
+                let params: EvictParams = parse(params)?;
+                self.cache.evict(item_uid(&params.uid)?).await?;
+                reply(&serde_json::json!({}))
+            }
+            methods_v2::MATERIALIZED_SET => {
+                let params: MaterializedSetParams = parse(params)?;
+                let uids: Vec<u64> = params
+                    .uids
+                    .iter()
+                    .filter_map(|uid| uid.parse().ok())
+                    .collect();
+                self.cache.set_materialized(&uids).await?;
+                reply(&serde_json::json!({}))
+            }
+            methods_v2::CANCEL => {
+                let params: CancelParams = parse(params)?;
+                self.ops.cancel(&params.op_id);
+                reply(&serde_json::json!({}))
+            }
+            other => Err(CallError::new(
+                FileProviderErrorCode::FeatureUnsupported,
+                format!("unknown File Provider RPC method: {other}"),
+            )),
+        }
+    }
+
+    fn known(&self, uid: u64) -> CallResult<ReplicaItem> {
+        self.cache.item(uid)?.ok_or_else(|| {
+            CallError::new(FileProviderErrorCode::NoSuchItem, format!("no item {uid}"))
+        })
+    }
+
+    fn present(item: &ReplicaItem, mounts: &[Mount]) -> DomainItem {
+        let mount = mounts
+            .iter()
+            .find(|mount| mount.root_uid == item.uid)
+            .map(|mount| mount.backend_id.as_str());
+        DomainItem::from_replica(item, mount)
+    }
+
+    fn present_one(&self, item: &ReplicaItem) -> DomainItem {
+        Self::present(item, &self.cache.mounts())
+    }
+
+    fn is_mount_root(&self, uid: u64) -> CallResult<bool> {
+        Ok(self
+            .cache
+            .item(uid)?
+            .is_some_and(|item| item.parent_uid.is_none()))
+    }
+
+    fn hello(params: HelloParams) -> CallResult<serde_json::Value> {
+        let version = params.version;
+        match version.cmp(&PROTOCOL_VERSION) {
+            std::cmp::Ordering::Less => Err(CallError::new(
+                FileProviderErrorCode::OlderExtensionVersionRunning,
+                format!("protocol {version} is older than {PROTOCOL_VERSION}"),
+            )),
+            std::cmp::Ordering::Greater => Err(CallError::new(
+                FileProviderErrorCode::NewerExtensionVersionFound,
+                format!("protocol {version} is newer than {PROTOCOL_VERSION}"),
+            )),
+            std::cmp::Ordering::Equal => reply(&HelloResult {
+                version,
+                root_uid: EXTENSION_ROOT_ID.to_owned(),
+                capabilities: CAPABILITIES.map(str::to_owned).to_vec(),
+            }),
+        }
+    }
+
+    fn item(&self, params: &ItemParams) -> CallResult<serde_json::Value> {
+        let item = match target(&params.uid)? {
+            Target::Root => DomainItem::root(),
+            Target::Item(uid) => self.present_one(&self.known(uid)?),
+        };
+        reply(&ItemResult { item })
+    }
+
+    /// The first page lists the folder from the backend; later pages read
+    /// the replica.
+    async fn list(&self, params: ListParams) -> CallResult<serde_json::Value> {
+        let mounts = self.cache.mounts();
+        let items = match target(&params.uid)? {
+            Target::Root => mounts
+                .iter()
+                .map(|mount| self.known(mount.root_uid))
+                .collect::<CallResult<Vec<_>>>()?,
+            Target::Item(uid) if params.page.is_none() => self.cache.list(uid).await?,
+            Target::Item(uid) => self.cache.children(uid)?,
+        };
+        reply(&page(items, params.page.as_deref(), &mounts)?)
+    }
+
+    fn working_set(&self, params: &WorkingSetParams) -> CallResult<serde_json::Value> {
+        let items = self.cache.working_set()?;
+        reply(&page(items, params.page.as_deref(), &self.cache.mounts())?)
+    }
+
+    fn changes(&self, params: &ChangesParams) -> CallResult<serde_json::Value> {
+        let expired =
+            |message: String| CallError::new(FileProviderErrorCode::SyncAnchorExpired, message);
+        let anchor = SyncAnchor::from_bytes(params.anchor.as_bytes())
+            .map_err(|error| expired(format!("{error:#}")))?;
+        let Changes::Since(changes) = self.cache.changes(&anchor)? else {
+            return Err(expired(format!("anchor {} expired", params.anchor)));
+        };
+        let mounts = self.cache.mounts();
+        reply(&ChangesResult {
+            updated: changes
+                .updated
+                .iter()
+                .map(|item| Self::present(item, &mounts))
+                .collect(),
+            deleted: changes.deleted.iter().map(u64::to_string).collect(),
+            anchor: anchor_string(&changes.anchor)?,
+        })
+    }
+
+    /// The item as handed out: its current metadata at the handed-out
+    /// content version.
+    fn handed_out(&self, uid: u64, handoff: &Handoff) -> CallResult<DomainItem> {
+        let mut item = self.present_one(&self.known(uid)?);
+        item.content_version.clone_from(&handoff.content_version);
+        Ok(item)
+    }
+
+    async fn fetch(&self, params: FetchParams) -> CallResult<serde_json::Value> {
+        let uid = item_uid(&params.uid)?;
+        let handoff = self
+            .cache
+            .fetch(uid, params.requested_version.as_deref())
+            .await?;
+        reply(&FetchResult {
+            item: self.handed_out(uid, &handoff)?,
+            path: handoff.path.to_string_lossy().into_owned(),
+        })
+    }
+
+    async fn fetch_range(&self, params: FetchRangeParams) -> CallResult<serde_json::Value> {
+        let uid = item_uid(&params.uid)?;
+        let handoff = self
+            .cache
+            .fetch_range(&RangeRequest {
+                uid,
+                requested_version: params.requested_version,
+                strict: params.strict,
+                offset: params.offset,
+                length: params.length,
+                alignment: params.alignment,
+            })
+            .await?;
+        reply(&FetchRangeResult {
+            item: self.handed_out(uid, &handoff)?,
+            path: handoff.path.to_string_lossy().into_owned(),
+            retrieved_offset: handoff.range.start,
+            retrieved_length: handoff.range.end - handoff.range.start,
+        })
+    }
+
+    /// Creates the item; with `may_already_exist` an item of the same name
+    /// and kind is taken over, receiving the contents of a file.
+    async fn create(&self, params: CreateParams) -> CallResult<serde_json::Value> {
+        let parent = item_uid(&params.parent_uid)?;
+        let contents = params.contents_path.as_deref().map(Path::new);
+        if let Some(existing) = self.cache.existing_child(parent, &params.name).await? {
+            let same_kind = matches!(
+                (existing.kind, params.kind),
+                (ItemKind::File, DomainItemKind::File) | (ItemKind::Folder, DomainItemKind::Folder)
+            );
+            if !params.may_already_exist || !same_kind {
+                return Err(CallError::new(
+                    FileProviderErrorCode::FilenameCollision,
+                    format!("{:?} exists in item {parent}", params.name),
+                ));
+            }
+            let item = match (contents, existing.kind) {
+                (Some(contents), ItemKind::File) => self.cache.save(existing.uid, contents).await?,
+                _ => existing,
+            };
+            return self.mutated(&item);
+        }
+        let item = match params.kind {
+            DomainItemKind::Folder => self.cache.create_folder(parent, &params.name).await?,
+            DomainItemKind::File => {
+                self.cache
+                    .create_file(parent, &params.name, contents)
+                    .await?
+            }
+        };
+        self.mutated(&item)
+    }
+
+    /// Applies a rename or reparent, then new contents. A name the backend
+    /// cannot store leaves the item under its current name (AD-18).
+    async fn modify(&self, params: ModifyParams) -> CallResult<serde_json::Value> {
+        let uid = item_uid(&params.uid)?;
+        let mut item = self.known(uid)?;
+        let moves = params
+            .changed_fields
+            .iter()
+            .any(|field| matches!(field, ChangedField::Name | ChangedField::ParentUid));
+        if moves {
+            let Some(current_parent) = item.parent_uid else {
+                return Err(CallError::new(
+                    FileProviderErrorCode::FeatureUnsupported,
+                    "a mounted backend cannot be renamed or moved",
+                ));
+            };
+            let parent = params
+                .parent_uid
+                .as_deref()
+                .map_or(Ok(current_parent), item_uid)?;
+            let name = params.name.clone().unwrap_or_else(|| item.name.clone());
+            if parent != current_parent || name != item.name {
+                match self.cache.rename(uid, parent, &name).await {
+                    Ok(renamed) => item = renamed,
+                    Err(error) if error.is::<NameError>() => {
+                        tracing::info!(
+                            uid,
+                            name,
+                            "rename to a name the backend cannot store left unapplied"
+                        );
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        if let Some(contents) = &params.contents_path {
+            item = self.cache.save(uid, Path::new(contents)).await?;
+        }
+        self.mutated(&item)
+    }
+
+    fn mutated(&self, item: &ReplicaItem) -> CallResult<serde_json::Value> {
+        reply(&MutationResult {
+            item: self.present_one(item),
+            fetch_content: false,
+        })
+    }
+
+    async fn delete(&self, params: DeleteParams) -> CallResult<serde_json::Value> {
+        let rejected = || {
+            CallError::new(
+                FileProviderErrorCode::DeletionRejected,
+                "the neutral root and mounted backends cannot be deleted",
+            )
+        };
+        match target(&params.uid) {
+            Ok(Target::Root) => return Err(rejected()),
+            Ok(Target::Item(uid)) => {
+                if self.is_mount_root(uid)? {
+                    return Err(rejected());
+                }
+                self.cache.delete_item(uid, params.recursive).await?;
+            }
+            Err(_) => {}
+        }
+        reply(&serde_json::json!({}))
+    }
+
+    async fn set_pinned(&self, params: SetPinnedParams) -> CallResult<serde_json::Value> {
+        for uid in &params.uids {
+            if let Target::Item(uid) = target(uid)? {
+                self.cache.keep_downloaded(uid, params.pinned).await?;
+            }
+        }
+        reply(&serde_json::json!({}))
+    }
+
+    /// Acknowledges, then sends a frame per daemon signal until the peer
+    /// closes.
+    async fn subscribe(&self, id: u32, frames: &Frames, mut hung_up: watch::Receiver<bool>) {
+        let mut signals = self.cache.subscribe();
+        let mut working_set = self.cache.working_set_changes();
+        if !send(frames, RpcResponse::ok(id, serde_json::json!({}))) {
+            return;
+        }
+        loop {
+            let signal = tokio::select! {
+                received = signals.recv() => match received {
+                    Ok(CacheSignal::ErrorResolved) => Signal::ErrorResolved,
+                    Ok(CacheSignal::Evict(uid)) => Signal::Evict { uid: uid.to_string() },
+                    Ok(CacheSignal::RequestDownload(uid)) => {
+                        Signal::RequestDownload { uid: uid.to_string() }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(missed)) => {
+                        tracing::warn!(missed, "signals dropped for a slow subscriber");
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
+                },
+                changed = working_set.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    Signal::WorkingSet
+                }
+                _ = hung_up.wait_for(|hung_up| *hung_up) => return,
+            };
+            let frame = response(id, reply(&signal));
+            if !send(frames, frame) {
+                return;
+            }
+        }
+    }
+
+    /// Acknowledges, then samples the cached bytes of the operation's item
+    /// and sends each change until the operation finished.
+    async fn progress(
+        &self,
+        id: u32,
+        params: serde_json::Value,
+        frames: &Frames,
+        mut hung_up: watch::Receiver<bool>,
+    ) {
+        let params: ProgressParams = match parse(params) {
+            Ok(params) => params,
+            Err(error) => {
+                send(frames, response(id, Err(error)));
+                return;
+            }
+        };
+        if !send(frames, RpcResponse::ok(id, serde_json::json!({}))) {
+            return;
+        }
+        let uid = self.ops.uid_of(&params.op_id);
+        let mut ticks = tokio::time::interval(PROGRESS_INTERVAL);
+        let mut last = None;
+        loop {
+            tokio::select! {
+                _ = ticks.tick() => {}
+                _ = hung_up.wait_for(|hung_up| *hung_up) => return,
+            }
+            let running = self.ops.is_running(&params.op_id);
+            let bytes = uid
+                .and_then(|uid| self.cache.cached_bytes(uid).ok())
+                .unwrap_or(CachedBytes { done: 0, total: 0 });
+            let frame = ProgressFrame {
+                op_id: params.op_id.clone(),
+                done: bytes.done,
+                total: bytes.total,
+                finished: !running,
+            };
+            if last.as_ref() != Some(&frame) && !send(frames, response(id, reply(&frame))) {
+                return;
+            }
+            if !running {
+                return;
+            }
+            last = Some(frame);
+        }
+    }
+}
+
+/// The page of `items`, in uid order, after the uid `after` names.
+fn page(
+    mut items: Vec<ReplicaItem>,
+    after: Option<&str>,
+    mounts: &[Mount],
+) -> CallResult<PageResult> {
+    let after = after
+        .map(|after| {
+            after.parse::<u64>().map_err(|_| {
+                CallError::new(
+                    FileProviderErrorCode::PageExpired,
+                    format!("page {after:?}"),
+                )
+            })
+        })
+        .transpose()?;
+    items.sort_by_key(|item| item.uid);
+    items.retain(|item| after.is_none_or(|after| item.uid > after));
+    let next_page = (items.len() > PAGE_SIZE).then(|| {
+        items.truncate(PAGE_SIZE);
+        items.last().map(|item| item.uid.to_string())
+    });
+    Ok(PageResult {
+        items: items
+            .iter()
+            .map(|item| Domain::present(item, mounts))
+            .collect(),
+        next_page: next_page.flatten(),
+    })
 }
 
 // Re-export so callers can build a server without pulling the

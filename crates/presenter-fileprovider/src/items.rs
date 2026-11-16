@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use cascade_engine::content::replica::{ItemKind, ReplicaItem};
 use cascade_engine::types::{CacheState, ItemId, VfsItem};
 use cascade_engine::vfs::neutral_root_item_id;
 use serde::{Deserialize, Serialize};
@@ -78,6 +79,121 @@ impl TryFrom<FileProviderItem> for VfsItem {
             cache_state: item.cache_state,
             mime_type: item.content_type,
         })
+    }
+}
+
+/// Kind of a [`DomainItem`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DomainItemKind {
+    File,
+    Folder,
+}
+
+/// An `NSFileProviderItemCapabilities` member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Capability {
+    AllowsReading,
+    AllowsWriting,
+    AllowsReparenting,
+    AllowsRenaming,
+    AllowsDeleting,
+    AllowsAddingSubItems,
+    AllowsContentEnumerating,
+    AllowsEvicting,
+}
+
+/// An item of protocol v2, named by a decimal uid or [`EXTENSION_ROOT_ID`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DomainItem {
+    pub uid: String,
+    pub parent_uid: String,
+    pub name: String,
+    pub kind: DomainItemKind,
+    pub size: Option<u64>,
+    pub btime: Option<chrono::DateTime<chrono::Utc>>,
+    pub mtime: Option<chrono::DateTime<chrono::Utc>>,
+    pub content_version: String,
+    pub metadata_version: String,
+    pub pinned: bool,
+    pub uploaded: bool,
+    pub capabilities: Vec<Capability>,
+}
+
+impl DomainItem {
+    /// The neutral root, whose children are the mounted backends.
+    #[must_use]
+    pub fn root() -> Self {
+        Self {
+            uid: EXTENSION_ROOT_ID.to_owned(),
+            parent_uid: EXTENSION_ROOT_ID.to_owned(),
+            name: String::new(),
+            kind: DomainItemKind::Folder,
+            size: None,
+            btime: None,
+            mtime: None,
+            content_version: String::new(),
+            metadata_version: String::new(),
+            pinned: false,
+            uploaded: true,
+            capabilities: vec![
+                Capability::AllowsReading,
+                Capability::AllowsContentEnumerating,
+            ],
+        }
+    }
+
+    /// The replica item; `mount` names a backend root, which is presented
+    /// under the neutral root by that name.
+    #[must_use]
+    pub fn from_replica(item: &ReplicaItem, mount: Option<&str>) -> Self {
+        let kind = match item.kind {
+            ItemKind::File => DomainItemKind::File,
+            ItemKind::Folder => DomainItemKind::Folder,
+        };
+        let capabilities = match (kind, mount) {
+            (DomainItemKind::Folder, Some(_)) => vec![
+                Capability::AllowsReading,
+                Capability::AllowsContentEnumerating,
+                Capability::AllowsAddingSubItems,
+            ],
+            (DomainItemKind::Folder, None) => vec![
+                Capability::AllowsReading,
+                Capability::AllowsContentEnumerating,
+                Capability::AllowsAddingSubItems,
+                Capability::AllowsReparenting,
+                Capability::AllowsRenaming,
+                Capability::AllowsDeleting,
+                Capability::AllowsEvicting,
+            ],
+            (DomainItemKind::File, _) => vec![
+                Capability::AllowsReading,
+                Capability::AllowsWriting,
+                Capability::AllowsReparenting,
+                Capability::AllowsRenaming,
+                Capability::AllowsDeleting,
+                Capability::AllowsEvicting,
+            ],
+        };
+        Self {
+            uid: item.uid.to_string(),
+            parent_uid: item
+                .parent_uid
+                .map_or_else(|| EXTENSION_ROOT_ID.to_owned(), |uid| uid.to_string()),
+            name: mount.map_or_else(|| item.name.clone(), str::to_owned),
+            kind,
+            size: (kind == DomainItemKind::File)
+                .then_some(item.size)
+                .flatten(),
+            btime: None,
+            mtime: item.mtime,
+            content_version: item.content_version.clone(),
+            metadata_version: item.metadata_version.clone(),
+            pinned: item.pinned,
+            uploaded: item.uploaded,
+            capabilities,
+        }
     }
 }
 

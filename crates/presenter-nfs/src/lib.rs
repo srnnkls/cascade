@@ -90,6 +90,19 @@ impl NfsPresenter {
         self
     }
 
+    /// Serve the backends registered in `cache` from it (see
+    /// [`NfsContext::with_content_cache`]); call before the presenter starts,
+    /// as the context is rebuilt with only the root file handle registered.
+    #[must_use]
+    pub fn with_content_cache(
+        mut self,
+        cache: cascade_engine::content::cache::ContentCache,
+    ) -> Self {
+        let vfs = Arc::clone(self.context.vfs());
+        self.context = Arc::new(NfsContext::new(vfs).with_content_cache(cache));
+        self
+    }
+
     /// Override the cache directory. Mainly used by tests so each test gets a
     /// unique tempdir and they don't race on the shared system cache path
     /// (which the running daemon also writes to).

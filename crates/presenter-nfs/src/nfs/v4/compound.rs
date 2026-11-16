@@ -9,15 +9,15 @@ use super::state::StateManager;
 use super::xdr::{
     self, ACCESS4_DELETE, ACCESS4_EXECUTE, ACCESS4_LOOKUP, ACCESS4_MODIFY, ACCESS4_READ,
     FATTR4_FILEID, FATTR4_MODE, FATTR4_SIZE, FATTR4_TYPE, FILE_SYNC4, Fattr4, NF4DIR, NFS4_OK,
-    NFS4ERR_ACCES, NFS4ERR_BADHANDLE, NFS4ERR_EXIST, NFS4ERR_INVAL, NFS4ERR_IO, NFS4ERR_NOSPC,
-    NFS4ERR_NOTEMPTY, NFS4ERR_ROFS, NFS4ERR_STALE, NfsFh4, OP_ACCESS, OP_CLOSE, OP_COMMIT,
-    OP_CREATE, OP_GETATTR, OP_GETFH, OP_LINK, OP_LOCK, OP_LOCKT, OP_LOCKU, OP_LOOKUP, OP_LOOKUPP,
-    OP_OPEN, OP_PUTFH, OP_PUTROOTFH, OP_READ, OP_READDIR, OP_READLINK, OP_REMOVE, OP_RENAME,
-    OP_RESTOREFH, OP_SAVEFH, OP_SETATTR, OP_WRITE,
+    NFS4ERR_ACCES, NFS4ERR_BADHANDLE, NFS4ERR_EXIST, NFS4ERR_INVAL, NFS4ERR_IO, NFS4ERR_NOENT,
+    NFS4ERR_NOSPC, NFS4ERR_NOTEMPTY, NFS4ERR_ROFS, NFS4ERR_STALE, NfsFh4, OP_ACCESS, OP_CLOSE,
+    OP_COMMIT, OP_CREATE, OP_GETATTR, OP_GETFH, OP_LINK, OP_LOCK, OP_LOCKT, OP_LOCKU, OP_LOOKUP,
+    OP_LOOKUPP, OP_OPEN, OP_PUTFH, OP_PUTROOTFH, OP_READ, OP_READDIR, OP_READLINK, OP_REMOVE,
+    OP_RENAME, OP_RESTOREFH, OP_SAVEFH, OP_SETATTR, OP_WRITE, OPEN4_CREATE,
 };
 use crate::nfs::context::NfsContext;
 use crate::nfs::server::NfsCacheMode;
-use crate::nfs::write::{self, WriteError};
+use crate::nfs::write::{self, CreateMode, WriteError};
 use std::sync::Arc;
 
 /// Map a [`WriteError`] to the appropriate `NFS4ERR_*` status code.
@@ -136,9 +136,18 @@ pub fn handle_compound(
                         } else {
                             format!("{dir_path}/{name_str}")
                         };
-                        ctx.register_path(&child_path);
-                        current_fh = Some(NfsFh4::from_path(&child_path));
-                        op_status_reply(NFS4_OK)
+                        match ctx.cached(&child_path).map(|cached| cached.resolve()) {
+                            Some(Ok(None)) => op_status_reply(NFS4ERR_NOENT),
+                            Some(Err(e)) => {
+                                tracing::warn!(path = %child_path, error = %e, "LOOKUP: failed to resolve");
+                                op_status_reply(NFS4ERR_IO)
+                            }
+                            None | Some(Ok(Some(_))) => {
+                                ctx.register_path(&child_path);
+                                current_fh = Some(NfsFh4::from_path(&child_path));
+                                op_status_reply(NFS4_OK)
+                            }
+                        }
                     }
                     None => op_status_reply(NFS4ERR_BADHANDLE),
                 }
@@ -204,7 +213,13 @@ pub fn handle_compound(
             OP_READDIR => handle_readdir(&mut cursor, ctx, current_fh.as_ref()),
             OP_READ => handle_read(&mut cursor, ctx, current_fh.as_ref()),
             OP_WRITE => handle_write(&mut cursor, ctx, current_fh.as_ref(), writes_permitted),
-            OP_OPEN => handle_open(&mut cursor, ctx, state_mgr, current_fh.as_ref()),
+            OP_OPEN => handle_open(
+                &mut cursor,
+                ctx,
+                state_mgr,
+                current_fh.as_ref(),
+                writes_permitted,
+            ),
             OP_CLOSE => handle_close(&mut cursor, state_mgr),
             OP_CREATE => handle_create(&mut cursor, ctx, current_fh.as_ref(), writes_permitted),
             OP_REMOVE => handle_remove(&mut cursor, ctx, current_fh.as_ref(), writes_permitted),
@@ -415,6 +430,7 @@ fn handle_open(
     ctx: &NfsContext,
     state_mgr: &Arc<StateManager>,
     current_fh: Option<&NfsFh4>,
+    writes_permitted: bool,
 ) -> Vec<u8> {
     let Ok((_seqid, rest)) = xdr::decode_u32(cursor) else {
         return op_status_reply(NFS4ERR_INVAL);
@@ -469,12 +485,24 @@ fn handle_open(
     } else {
         return op_status_reply(NFS4ERR_INVAL);
     };
+    if let Err(e) = write::check_cached_name(ctx, &file_name) {
+        return op_status_reply(write_error_status(e));
+    }
+    let creates = create_mode == OPEN4_CREATE;
+    if creates && !writes_permitted {
+        return op_status_reply(NFS4ERR_ROFS);
+    }
 
     current_fh.map_or_else(
         || op_status_reply(NFS4ERR_BADHANDLE),
         |dir_fh| {
             let dir_path = dir_fh.to_path().unwrap_or_default();
-            let file_path = if dir_path == "/" {
+            let file_path = if creates {
+                match write::create_file(ctx, &dir_path, &file_name, CreateMode::Unchecked) {
+                    Ok(path) => path,
+                    Err(e) => return op_status_reply(write_error_status(e)),
+                }
+            } else if dir_path == "/" {
                 format!("/{file_name}")
             } else {
                 format!("{dir_path}/{file_name}")
@@ -755,13 +783,10 @@ fn parent_path(path: &str) -> String {
     }
 }
 
-/// Fetch the current size of a file via the backend, returning 0 when the file
-/// is absent or its size is unknown.
+/// The current size of a file, returning 0 when the file is absent or its
+/// size is unknown.
 fn file_size_sync(ctx: &NfsContext, path: &str) -> u64 {
-    ctx.metadata_sync(path)
-        .ok()
-        .and_then(|entry| entry.size)
-        .unwrap_or(0)
+    ctx.file_size_blocking(path)
 }
 
 #[cfg(test)]

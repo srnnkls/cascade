@@ -12,15 +12,16 @@ use super::server::NfsCacheMode;
 use super::write::{self, CreateMode, WriteError};
 use super::xdr::{
     Fattr3, NF3DIR, NF3REG, NFS3_CREATE_EXCLUSIVE, NFS3_CREATE_GUARDED, NFS3_FILE_SYNC, NFS3_OK,
-    NFS3ERR_ACCES, NFS3ERR_EXIST, NFS3ERR_INVAL, NFS3ERR_IO, NFS3ERR_NOSPC, NFS3ERR_NOTEMPTY,
-    NFS3ERR_ROFS, NFS3ERR_STALE, NFS3PROC_COMMIT, NFS3PROC_CREATE, NFS3PROC_FSSTAT,
-    NFS3PROC_GETATTR, NFS3PROC_LOOKUP, NFS3PROC_MKDIR, NFS3PROC_NULL, NFS3PROC_READ,
-    NFS3PROC_READDIR, NFS3PROC_REMOVE, NFS3PROC_RENAME, NFS3PROC_RMDIR, NFS3PROC_SETATTR,
-    NFS3PROC_WRITE, NfsFh3, NfsTime, PostOpAttr, Sattr3, Specdata3, decode_fh, decode_opaque,
-    decode_sattr3, decode_string, decode_u32, decode_u64, encode_bool, encode_fh,
+    NFS3ERR_ACCES, NFS3ERR_EXIST, NFS3ERR_INVAL, NFS3ERR_IO, NFS3ERR_NOENT, NFS3ERR_NOSPC,
+    NFS3ERR_NOTEMPTY, NFS3ERR_ROFS, NFS3ERR_STALE, NFS3PROC_COMMIT, NFS3PROC_CREATE,
+    NFS3PROC_FSSTAT, NFS3PROC_GETATTR, NFS3PROC_LOOKUP, NFS3PROC_MKDIR, NFS3PROC_NULL,
+    NFS3PROC_READ, NFS3PROC_READDIR, NFS3PROC_REMOVE, NFS3PROC_RENAME, NFS3PROC_RMDIR,
+    NFS3PROC_SETATTR, NFS3PROC_WRITE, NfsFh3, NfsTime, PostOpAttr, Sattr3, Specdata3, decode_fh,
+    decode_opaque, decode_sattr3, decode_string, decode_u32, decode_u64, encode_bool, encode_fh,
     encode_post_op_attr, encode_post_op_fh3, encode_string, encode_u32, encode_u64,
     encode_wcc_data,
 };
+use cascade_engine::content::replica::ItemKind;
 use std::sync::Arc;
 
 /// Handle an NFS procedure call with VFS context.
@@ -148,12 +149,31 @@ fn handle_lookup(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
                 format!("{parent_path}/{name}")
             };
 
+            let child_attr = match ctx.cached(&child_path).map(|cached| cached.item()) {
+                None => make_attributes(&child_path, false),
+                Some(Ok(Some(item))) => make_attributes_with_size(
+                    &child_path,
+                    item.kind == ItemKind::Folder,
+                    item.size.unwrap_or(0),
+                ),
+                Some(Ok(None)) => {
+                    encode_u32(&mut reply, NFS3ERR_NOENT);
+                    encode_post_op_attr(&mut reply, &PostOpAttr::none());
+                    return reply;
+                }
+                Some(Err(e)) => {
+                    tracing::warn!(path = %child_path, error = %e, "LOOKUP: failed to resolve");
+                    encode_u32(&mut reply, NFS3ERR_IO);
+                    encode_post_op_attr(&mut reply, &PostOpAttr::none());
+                    return reply;
+                }
+            };
+
             // Register the child path.
             let child_key = ctx.register_path(&child_path);
             let child_fh = NfsFh3::from_item_id(&child_key.to_string());
 
             let dir_attr = make_attributes(&parent_path, parent_path == "/");
-            let child_attr = make_attributes(&child_path, false);
 
             encode_u32(&mut reply, NFS3_OK);
             encode_fh(&mut reply, &child_fh);
@@ -640,13 +660,10 @@ fn lookup_existing_path(ctx: &NfsContext, fh: &NfsFh3) -> Option<String> {
     ctx.lookup_path(key)
 }
 
-/// Fetch the current size of a file via the backend, returning 0 when the file
-/// is absent or its size is unknown.
+/// The current size of a file, returning 0 when the file is absent or its
+/// size is unknown.
 fn file_size_sync(ctx: &NfsContext, path: &str) -> u64 {
-    ctx.metadata_sync(path)
-        .ok()
-        .and_then(|entry| entry.size)
-        .unwrap_or(0)
+    ctx.file_size_blocking(path)
 }
 
 /// Build synthetic attributes for a file/directory with an unknown (zero)

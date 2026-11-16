@@ -19,6 +19,7 @@ use std::sync::{Arc, PoisonError};
 use anyhow::{Result, anyhow};
 use tokio::sync::broadcast;
 
+use super::domain::WorkingSetSignal;
 use super::evict::{Eviction, ReadGuard};
 use super::names::check_name;
 use super::range_map::{RangeMap, align};
@@ -36,7 +37,7 @@ use crate::db::content::{ContentObject, ContentState, NewContentObject};
 use crate::types::{FileEntry, Revision};
 
 /// Attempts of one request across remote changes before it gives up.
-const MAX_RESTARTS: usize = 4;
+pub(super) const MAX_RESTARTS: usize = 4;
 
 /// A partial fetch as File Provider issues it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +86,8 @@ impl From<&ContentObject> for Complete {
 pub(super) enum Source {
     Complete(Complete, ReadGuard),
     Transfer(Arc<Transfer>, ReadGuard),
+    /// An object edited in place, served under the item's operation lock.
+    Edited,
     /// The remote changed; the request starts over.
     Changed,
 }
@@ -92,7 +95,7 @@ pub(super) enum Source {
 pub(super) type Slot = Arc<tokio::sync::Mutex<Option<Arc<Transfer>>>>;
 
 pub(super) struct Shared {
-    replicas: ReplicaStore,
+    pub(super) replicas: ReplicaStore,
     backends: std::sync::RwLock<HashMap<String, Arc<Replica>>>,
     pub(super) store: ObjectStore,
     staging_dir: PathBuf,
@@ -103,6 +106,7 @@ pub(super) struct Shared {
     handoffs: AtomicU64,
     pub(super) writeback: WriteBack,
     pub(super) eviction: Eviction,
+    pub(super) working_set: WorkingSetSignal,
 }
 
 /// Cache of the replica store's content: one sparse object per cached item
@@ -139,7 +143,7 @@ impl ContentCache {
     ) -> Result<Self> {
         let store = ObjectStore::open(cache_dir)?;
         fs::create_dir_all(&staging_dir)?;
-        let remote = Remote::new(config.call_timeout);
+        let remote = Remote::new(config.call_timeout, replicas.shared_db())?;
         Ok(Self {
             shared: Arc::new(Shared {
                 replicas,
@@ -153,6 +157,7 @@ impl ContentCache {
                 handoffs: AtomicU64::new(0),
                 writeback: WriteBack::new(config.upload_transfers),
                 eviction: Eviction::default(),
+                working_set: WorkingSetSignal::default(),
             }),
         })
     }
@@ -192,7 +197,7 @@ impl ContentCache {
 
     /// Rescans the scan set of every registered backend, once start-up
     /// [recovery](Self::recover) finished. Returns whether a replica's
-    /// revision advanced.
+    /// revision advanced, and raises the working-set signal when one did.
     ///
     /// # Errors
     ///
@@ -202,6 +207,9 @@ impl ContentCache {
         let mut advanced = false;
         for replica in self.replicas() {
             advanced |= super::scan::scan(&replica).await?;
+        }
+        if advanced {
+            self.shared.working_set.raise();
         }
         Ok(advanced)
     }
@@ -232,6 +240,7 @@ impl ContentCache {
                     }
                     Ok(bytes)
                 }
+                Source::Edited => self.read_edit(uid, offset, len).await,
                 Source::Changed => Ok(None),
             }
         })
@@ -299,6 +308,7 @@ impl ContentCache {
                     }
                     Ok(handoff)
                 }
+                Source::Edited => self.hand_off_edit(uid, range_of).await,
                 Source::Changed => Ok(None),
             }
         })
@@ -370,7 +380,12 @@ impl ContentCache {
             .ok_or_else(|| anyhow!("backend {backend_id} of item {uid} is not registered"))
     }
 
-    pub(super) fn item(&self, uid: u64) -> Result<Option<ReplicaItem>> {
+    /// The item as the replica holds it.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the state database fails.
+    pub fn item(&self, uid: u64) -> Result<Option<ReplicaItem>> {
         self.db().replica_item(uid)
     }
 
@@ -429,6 +444,9 @@ impl ContentCache {
             .content_objects_of(item.uid)?
             .into_iter()
             .find(|object| object.content_version == item.content_version);
+        if existing.as_ref().is_some_and(|object| object.edited) {
+            return Ok(Source::Edited);
+        }
         if let Some(object) = &existing
             && (object.state == ContentState::Complete || object.dirty)
         {
@@ -604,6 +622,24 @@ impl ContentCache {
             range,
             content_version: object.content_version.clone(),
         })
+    }
+
+    /// Completes `range_of` the item's edited object and hands out a clone of
+    /// it. Returns `None` when the item has no edited object any more.
+    async fn hand_off_edit(
+        &self,
+        uid: u64,
+        range_of: impl Fn(u64) -> Range<u64>,
+    ) -> Result<Option<Handoff>> {
+        let _operation = self.shared.writeback.lock(uid).await;
+        let Some(object) = self.edit_of(uid)? else {
+            return Ok(None);
+        };
+        let range = range_of(object.size);
+        self.fill_edit(&object, range.clone()).await?;
+        let handoff = self.hand_off_complete(&Complete::from(&object), range)?;
+        self.shared.eviction.touch(object.object_id);
+        Ok(Some(handoff))
     }
 
     /// Waits for `range` and the carried ranges, clones the object and checks
@@ -875,14 +911,7 @@ impl ContentCache {
         let remote = &self.shared.remote;
         let backend = replica.backend();
         let entry = remote.call(backend.move_entry(&item_path, &target)).await?;
-        let revision = remote.call(backend.revision(&entry)).await?;
-        self.db().upsert_replica_children(
-            replica.backend_id(),
-            parent.uid,
-            &[(entry, revision)],
-        )?;
-        self.item(uid)?
-            .ok_or_else(|| BackendError::NotFound(format!("item {uid}")).into())
+        self.record_created(&replica, parent.uid, entry).await
     }
 
     /// Deletes the item with its descendants on the backend and in the
@@ -950,32 +979,76 @@ impl ContentCache {
     /// # Errors
     ///
     /// Fails with [`NameError`](super::names::NameError) for a name rejected by TR-10 before anything
-    /// is applied, when the parent is unknown, and when the backend fails.
+    /// is applied, with [`BackendError::Conflict`] when the parent holds the
+    /// name, when the parent is unknown, and when the backend fails.
     pub async fn create_folder(&self, parent_uid: u64, name: &str) -> Result<ReplicaItem> {
         check_name(name)?;
         let parent = self.folder(parent_uid)?;
         let replica = self.replica(parent_uid)?;
+        self.ensure_absent(&parent, name).await?;
         let path = self
             .item_path(parent.uid)?
             .ok_or_else(|| BackendError::NotFound(format!("item {parent_uid}")))?
             .join(name);
-        let remote = &self.shared.remote;
-        let backend = replica.backend();
-        let entry = remote.call(backend.create_dir(&path)).await?;
-        let revision = remote.call(backend.revision(&entry)).await?;
-        let uids = self.db().upsert_replica_children(
-            replica.backend_id(),
-            parent.uid,
-            &[(entry, revision)],
-        )?;
-        uids.first()
+        let entry = self
+            .shared
+            .remote
+            .call(replica.backend().create_dir(&path))
+            .await?;
+        self.record_created(&replica, parent.uid, entry).await
+    }
+
+    /// The child named `name` of a folder, relisting a folder no presenter
+    /// listed first, so a child only the backend holds is seen.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the folder is unknown, the listing or the state database
+    /// fails.
+    pub async fn existing_child(&self, folder_uid: u64, name: &str) -> Result<Option<ReplicaItem>> {
+        let folder = self.folder(folder_uid)?;
+        if !folder.listed {
+            let replica = self.replica(folder_uid)?;
+            self.shared.remote.call(replica.refresh(folder_uid)).await?;
+        }
+        self.db().replica_child(folder_uid, name)
+    }
+
+    /// Refuses a create of `name` in `parent` with
+    /// [`BackendError::Conflict`] when the folder holds that name.
+    pub(super) async fn ensure_absent(&self, parent: &ReplicaItem, name: &str) -> Result<()> {
+        if self.existing_child(parent.uid, name).await?.is_some() {
+            return Err(
+                BackendError::Conflict(format!("{name:?} exists in item {}", parent.uid)).into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Records `entry`, which the daemon created or moved into `parent_uid`
+    /// on the backend, in the replica, with the revision the backend reports.
+    pub(super) async fn record_created(
+        &self,
+        replica: &Replica,
+        parent_uid: u64,
+        entry: FileEntry,
+    ) -> Result<ReplicaItem> {
+        let name = entry.name.clone();
+        let revision = self
+            .shared
+            .remote
+            .call(replica.backend().revision(&entry))
+            .await?;
+        self.db()
+            .upsert_replica_children(replica.backend_id(), parent_uid, &[(entry, revision)])?
+            .first()
             .map(|&uid| self.item(uid))
             .transpose()?
             .flatten()
-            .ok_or_else(|| anyhow!("folder {name:?} not recorded"))
+            .ok_or_else(|| anyhow!("{name:?} not recorded"))
     }
 
-    fn folder(&self, uid: u64) -> Result<ReplicaItem> {
+    pub(super) fn folder(&self, uid: u64) -> Result<ReplicaItem> {
         let folder = self
             .item(uid)?
             .ok_or_else(|| BackendError::NotFound(format!("item {uid}")))?;
@@ -986,7 +1059,7 @@ impl ContentCache {
     }
 }
 
-fn remove_clone(path: &Path) {
+pub(super) fn remove_clone(path: &Path) {
     if let Err(error) = fs::remove_file(path)
         && error.kind() != ErrorKind::NotFound
     {

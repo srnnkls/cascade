@@ -116,6 +116,10 @@ impl ReplicaStore {
         &self.db
     }
 
+    pub(crate) fn shared_db(&self) -> Arc<StateDb> {
+        Arc::clone(&self.db)
+    }
+
     /// Return the anchor of the latest change in the store.
     ///
     /// # Errors

@@ -162,6 +162,44 @@ fn write_back_state_records_upload_before_clean() {
 }
 
 #[test]
+fn finished_upload_leaves_an_object_that_reentered_editing_dirty() {
+    let db = StateDb::open_in_memory().unwrap();
+    add_item(&db, 1, false);
+    let id = insert(&db, 1, 100);
+    db.begin_content_edit(1, id, &[Range { start: 0, end: 100 }])
+        .unwrap();
+
+    let (entry, file) = uploaded("file-77");
+    assert!(!db.finish_content_upload(1, id, &entry, &file).unwrap());
+    let object = db.content_object(id).unwrap().unwrap();
+    assert!(object.dirty, "an edited object was marked clean");
+    assert!(object.edited);
+    assert!(!db.replica_item(1).unwrap().unwrap().uploaded);
+}
+
+#[test]
+fn an_edited_object_awaits_upload_whether_or_not_it_is_dirty() {
+    let db = StateDb::open_in_memory().unwrap();
+    add_item(&db, 1, false);
+    let id = insert(&db, 1, 100);
+    db.begin_content_edit(1, id, &[Range { start: 0, end: 100 }])
+        .unwrap();
+    db.conn
+        .lock()
+        .unwrap()
+        .execute("UPDATE content_objects SET dirty = FALSE", [])
+        .unwrap();
+
+    let pending: Vec<ObjectId> = db
+        .dirty_content_objects()
+        .unwrap()
+        .iter()
+        .map(|object| object.object_id)
+        .collect();
+    assert_eq!(pending, [id], "recovery would never re-arm the edit");
+}
+
+#[test]
 fn eviction_candidates_are_clean_unpinned_and_least_recent_first() {
     let db = StateDb::open_in_memory().unwrap();
     let recent = insert(&db, 1, 100);

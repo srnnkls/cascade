@@ -399,13 +399,17 @@ fn v8_exec_sessions(conn: &Connection) -> Result<()> {
 /// `remote_ctime`) beside the presented attributes; an item is pinned while
 /// it is pinned explicitly (`pinned`) or by a pin rule (`rule_pinned`).
 /// `replica_tombstones` and the single-row `replica_meta` back change
-/// enumeration from a sync anchor.
+/// enumeration from a sync anchor; `replica_meta` also keeps whether the last
+/// backend call failed as unreachable.
 ///
 /// `content_objects` holds one cached sparse file per row with its
 /// `source_revision` (`source_*` columns) and write-back state; the upload's
 /// temporary name and file id are recorded before the rename so a restart
 /// recognises a finished rename. `content_ranges` is the authority for the
-/// fetched byte ranges of an object, kept merged. `materialized_items` is the
+/// present byte ranges of an object, kept merged. An object `edited` in place
+/// by NFS writes is dirty before its edit is accepted as a save; its
+/// `content_written` ranges hold the written bytes, and its other present
+/// ranges come from its source revision. `materialized_items` is the
 /// set of items the system reports as on disk. `replica_deletes` marks the
 /// items whose backend delete was issued and whose local state is not yet
 /// removed. Times are nanoseconds since the Unix epoch.
@@ -452,7 +456,8 @@ fn v9_replica_and_content(conn: &Connection) -> Result<()> {
             id            INTEGER PRIMARY KEY CHECK (id = 1),
             store_id      TEXT NOT NULL,
             revision      INTEGER NOT NULL DEFAULT 0,
-            floor         INTEGER NOT NULL DEFAULT 0
+            floor         INTEGER NOT NULL DEFAULT 0,
+            remote_unreachable BOOLEAN NOT NULL DEFAULT FALSE
         );
 
         INSERT OR IGNORE INTO replica_meta (id, store_id) VALUES (1, lower(hex(randomblob(16))));
@@ -470,13 +475,21 @@ fn v9_replica_and_content(conn: &Connection) -> Result<()> {
             dirty             BOOLEAN NOT NULL DEFAULT FALSE,
             upload_temp_name  TEXT,
             upload_file_id    TEXT,
-            last_access       INTEGER
+            last_access       INTEGER,
+            edited            BOOLEAN NOT NULL DEFAULT FALSE
         );
 
         CREATE INDEX IF NOT EXISTS idx_content_objects_uid ON content_objects(uid);
         CREATE INDEX IF NOT EXISTS idx_content_objects_last_access ON content_objects(last_access);
 
         CREATE TABLE IF NOT EXISTS content_ranges (
+            object_id     INTEGER NOT NULL REFERENCES content_objects(object_id) ON DELETE CASCADE,
+            start         INTEGER NOT NULL,
+            end           INTEGER NOT NULL,
+            PRIMARY KEY (object_id, start)
+        );
+
+        CREATE TABLE IF NOT EXISTS content_written (
             object_id     INTEGER NOT NULL REFERENCES content_objects(object_id) ON DELETE CASCADE,
             start         INTEGER NOT NULL,
             end           INTEGER NOT NULL,

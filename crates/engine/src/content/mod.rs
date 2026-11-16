@@ -9,10 +9,16 @@ pub mod anchor;
 #[cfg(unix)]
 pub mod cache;
 #[cfg(unix)]
+pub mod domain;
+#[cfg(unix)]
+mod edit;
+#[cfg(unix)]
 pub mod evict;
 #[cfg(all(test, cascade_loom, unix))]
 mod loom_model;
 pub mod names;
+#[cfg(unix)]
+mod paths;
 pub mod range_map;
 pub mod replica;
 pub mod scan;

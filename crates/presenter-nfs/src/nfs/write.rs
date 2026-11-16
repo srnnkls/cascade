@@ -7,17 +7,27 @@
 //! engine; the NFS layer only translates RFC 1813 / RFC 5661 procedure arguments
 //! into those calls and maps the resulting errors back to NFS status codes.
 //!
+//! When the context has a content cache serving the path's backend, paths
+//! resolve to item uids through its replica instead: WRITE and SETATTR size
+//! become dirty objects that write-back uploads, CREATE, REMOVE, RENAME and
+//! MKDIR apply directly through the cache, and names the backend cannot store are refused
+//! before anything is applied.
+//!
 //! Writes are unauthenticated at the NFS layer by protocol — the trust model is
 //! a localhost mount. A write must nonetheless not escape the export root, so
 //! every path is validated by [`validate_vfs_path`] before it reaches a backend.
 
 use std::path::Path;
+#[cfg(test)]
 use std::sync::Arc;
 
 use cascade_engine::backend::{Backend, BackendError};
+use cascade_engine::content::domain::DomainError;
+use cascade_engine::content::names::{NameError, check_name};
+use cascade_engine::content::replica::ItemKind;
 use cascade_engine::types::FileId;
 
-use super::context::NfsContext;
+use super::context::{CachedPath, NfsContext};
 
 /// A write rejected before it reached a backend, or a categorised backend error.
 ///
@@ -47,6 +57,15 @@ impl WriteError {
     /// inspecting the error chain for a disk-full `io::Error`, and finally
     /// falling back to a generic I/O failure.
     fn from_backend(err: &anyhow::Error) -> Self {
+        if err.downcast_ref::<NameError>().is_some() {
+            return Self::Invalid;
+        }
+        if matches!(
+            err.downcast_ref::<DomainError>(),
+            Some(DomainError::DirectoryNotEmpty)
+        ) {
+            return Self::Conflict;
+        }
         if let Some(backend_err) = err.downcast_ref::<BackendError>() {
             return match backend_err {
                 BackendError::NotFound(_) => Self::NotFound,
@@ -112,6 +131,72 @@ pub fn validate_name(name: &str) -> Result<(), WriteError> {
     Ok(())
 }
 
+/// Refuse a name the content cache's backends cannot store (TR-10), before
+/// anything is applied.
+///
+/// # Errors
+///
+/// Returns [`WriteError::Invalid`] for a rejected name when the context has a
+/// content cache.
+pub fn check_cached_name(ctx: &NfsContext, name: &str) -> Result<(), WriteError> {
+    if ctx.content_cache().is_some() {
+        check_name(name).map_err(|_| WriteError::Invalid)?;
+    }
+    Ok(())
+}
+
+/// The uid of the item at `cached`, failing with [`WriteError::NotFound`]
+/// when it does not exist.
+fn existing_uid(cached: &CachedPath<'_>) -> Result<u64, WriteError> {
+    cached
+        .resolve()
+        .map_err(|e| WriteError::from_backend(&e))?
+        .ok_or(WriteError::NotFound)
+}
+
+/// Create an empty file at `cached` through the content cache and return its
+/// uid.
+fn create_cached(cached: &CachedPath<'_>) -> Result<u64, WriteError> {
+    let name = cached
+        .relative
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(WriteError::Invalid)?;
+    let parent = CachedPath {
+        cache: cached.cache,
+        backend_id: cached.backend_id.clone(),
+        relative: cached
+            .relative
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default(),
+    };
+    let parent_uid = existing_uid(&parent)?;
+    block_on(cached.cache.create_file(parent_uid, name, None))
+        .map(|item| item.uid)
+        .map_err(|e| WriteError::from_backend(&e))
+}
+
+/// Delete the item at `cached` through the content cache. A kind other than
+/// `expect_dir` is [`WriteError::Invalid`] and a folder with children
+/// [`WriteError::Conflict`].
+fn remove_cached(cached: &CachedPath<'_>, expect_dir: Option<bool>) -> Result<(), WriteError> {
+    let item = cached
+        .existing()
+        .map_err(|e| WriteError::from_backend(&e))?;
+    let is_dir = item.kind == ItemKind::Folder;
+    if expect_dir.is_some_and(|expect_dir| expect_dir != is_dir) {
+        return Err(WriteError::Invalid);
+    }
+    let cache = cached.cache;
+    let deleted = if is_dir {
+        block_on(cache.delete_item(item.uid, false))
+    } else {
+        block_on(cache.delete(item.uid))
+    };
+    deleted.map_err(|e| WriteError::from_backend(&e))
+}
+
 /// Join a validated parent path and child name into a server-absolute VFS path.
 fn join_child(parent: &str, name: &str) -> String {
     if parent == "/" {
@@ -119,27 +204,6 @@ fn join_child(parent: &str, name: &str) -> String {
     } else {
         format!("{parent}/{name}")
     }
-}
-
-/// Resolve a VFS path to its owning backend and the path relative to that
-/// backend, cloning the `Arc` so the `VfsTree` read lock is released before any
-/// await — the same pattern the read path uses.
-///
-/// The resolved path is made backend-relative by stripping any leading
-/// separator. A leading `/` would otherwise cause `Path::join` inside a
-/// path-based backend (e.g. the local backend's `upload`/`create_dir`) to
-/// discard the configured root and escape the export — the very traversal the
-/// write path must prevent. Stripping it here keeps every write contained.
-fn resolve(ctx: &NfsContext, path: &str) -> (Arc<dyn Backend>, std::path::PathBuf) {
-    let vfs = ctx
-        .vfs()
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (backend, relative) = vfs.resolve(Path::new(path));
-    let relative = relative
-        .strip_prefix("/")
-        .map_or_else(|_| relative.clone(), Path::to_path_buf);
-    (Arc::clone(backend), relative)
 }
 
 /// Run an async backend operation to completion on the current Tokio runtime.
@@ -176,7 +240,20 @@ pub fn write_file(
     data: &[u8],
 ) -> Result<u64, WriteError> {
     validate_vfs_path(path)?;
-    let (backend, relative) = resolve(ctx, path);
+    if let Some(cached) = ctx.cached(path) {
+        let resolved = cached.resolve().map_err(|e| WriteError::from_backend(&e))?;
+        let uid = if let Some(uid) = resolved {
+            uid
+        } else {
+            let name = path.rsplit('/').next().unwrap_or_default();
+            check_cached_name(ctx, name)?;
+            create_cached(&cached)?
+        };
+        let item = block_on(cached.cache.write_at(uid, offset, data))
+            .map_err(|e| WriteError::from_backend(&e))?;
+        return Ok(item.size.unwrap_or(0));
+    }
+    let (backend, relative) = ctx.route(path);
     let off = usize::try_from(offset).map_err(|_| WriteError::Invalid)?;
 
     block_on(async move {
@@ -263,8 +340,22 @@ pub fn create_file(
 ) -> Result<String, WriteError> {
     validate_vfs_path(parent_path)?;
     validate_name(name)?;
+    check_cached_name(ctx, name)?;
     let child_path = join_child(parent_path, name);
-    let (backend, relative) = resolve(ctx, &child_path);
+    if let Some(cached) = ctx.cached(&child_path) {
+        let existing = cached.resolve().map_err(|e| WriteError::from_backend(&e))?;
+        match (mode, existing) {
+            (CreateMode::Guarded | CreateMode::Exclusive, Some(_)) => {
+                return Err(WriteError::Conflict);
+            }
+            (CreateMode::Unchecked, Some(_)) => {}
+            (_, None) => {
+                create_cached(&cached)?;
+            }
+        }
+        return Ok(child_path);
+    }
+    let (backend, relative) = ctx.route(&child_path);
 
     block_on(async move {
         let existing = lookup_existing(backend.as_ref(), &relative).await?;
@@ -295,7 +386,12 @@ pub fn create_file(
 /// exist, or the backend rejects the write.
 pub fn truncate_file(ctx: &NfsContext, path: &str, size: u64) -> Result<(), WriteError> {
     validate_vfs_path(path)?;
-    let (backend, relative) = resolve(ctx, path);
+    if let Some(cached) = ctx.cached(path) {
+        let uid = existing_uid(&cached)?;
+        block_on(cached.cache.set_size(uid, size)).map_err(|e| WriteError::from_backend(&e))?;
+        return Ok(());
+    }
+    let (backend, relative) = ctx.route(path);
     let target = usize::try_from(size).map_err(|_| WriteError::Invalid)?;
 
     block_on(async move {
@@ -329,8 +425,19 @@ pub fn truncate_file(ctx: &NfsContext, path: &str, size: u64) -> Result<(), Writ
 pub fn make_dir(ctx: &NfsContext, parent_path: &str, name: &str) -> Result<String, WriteError> {
     validate_vfs_path(parent_path)?;
     validate_name(name)?;
+    check_cached_name(ctx, name)?;
     let child_path = join_child(parent_path, name);
-    let (backend, relative) = resolve(ctx, &child_path);
+    if let Some(parent) = ctx.cached(parent_path)
+        && ctx
+            .cached(&child_path)
+            .is_some_and(|child| child.backend_id == parent.backend_id)
+    {
+        let parent_uid = existing_uid(&parent)?;
+        block_on(parent.cache.create_folder(parent_uid, name))
+            .map_err(|e| WriteError::from_backend(&e))?;
+        return Ok(child_path);
+    }
+    let (backend, relative) = ctx.route(&child_path);
 
     block_on(async move {
         backend
@@ -360,7 +467,11 @@ pub fn remove_entry(
     validate_vfs_path(parent_path)?;
     validate_name(name)?;
     let child_path = join_child(parent_path, name);
-    let (backend, relative) = resolve(ctx, &child_path);
+    if let Some(cached) = ctx.cached(&child_path) {
+        remove_cached(&cached, Some(expect_dir))?;
+        return Ok(child_path);
+    }
+    let (backend, relative) = ctx.route(&child_path);
 
     block_on(async move {
         let entry = backend
@@ -390,7 +501,11 @@ pub fn remove_any(ctx: &NfsContext, parent_path: &str, name: &str) -> Result<Str
     validate_vfs_path(parent_path)?;
     validate_name(name)?;
     let child_path = join_child(parent_path, name);
-    let (backend, relative) = resolve(ctx, &child_path);
+    if let Some(cached) = ctx.cached(&child_path) {
+        remove_cached(&cached, None)?;
+        return Ok(child_path);
+    }
+    let (backend, relative) = ctx.route(&child_path);
 
     block_on(async move {
         let entry = backend
@@ -425,8 +540,21 @@ pub fn rename_entry(
     validate_vfs_path(to_parent)?;
     validate_name(from_name)?;
     validate_name(to_name)?;
+    check_cached_name(ctx, to_name)?;
     let src_path = join_child(from_parent, from_name);
     let dst_path = join_child(to_parent, to_name);
+    if let (Some(src), Some(parent)) = (ctx.cached(&src_path), ctx.cached(to_parent))
+        && src.backend_id == parent.backend_id
+        && ctx
+            .cached(&dst_path)
+            .is_some_and(|dst| dst.backend_id == src.backend_id)
+    {
+        let uid = existing_uid(&src)?;
+        let parent_uid = existing_uid(&parent)?;
+        block_on(src.cache.rename(uid, parent_uid, to_name))
+            .map_err(|e| WriteError::from_backend(&e))?;
+        return Ok((src_path, dst_path));
+    }
 
     block_on(async {
         ctx.rename(&src_path, &dst_path)
