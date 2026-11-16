@@ -598,6 +598,7 @@ dependencies = [
  "cascade-backend-local",
  "cascade-backend-p2p",
  "cascade-backend-s3",
+ "cascade-backend-smb",
  "cascade-config",
  "cascade-engine",
  "cascade-expr",

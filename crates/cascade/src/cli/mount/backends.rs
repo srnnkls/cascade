@@ -63,6 +63,8 @@ pub(super) fn create_backend(
             .with_context(|| format!("failed to create local backend `{name}`")),
         "p2p" => cascade_backend_p2p::create_backend(config)
             .with_context(|| format!("failed to create p2p backend `{name}`")),
+        "smb" => cascade_backend_smb::create_backend(config)
+            .with_context(|| format!("failed to create smb backend `{name}`")),
         other => anyhow::bail!("unsupported backend type: {other}"),
     }
 }
@@ -163,4 +165,105 @@ pub(super) fn load_backend_config(config_dir: &Path, name: &str) -> Result<toml:
         .with_context(|| format!("failed to parse {}", config_path.display()))?;
     tracing::info!(path = ?config_path, "Loaded backend config");
     Ok(value)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use cascade_engine::backend::BackendFactory as _;
+
+    use crate::cli::CliContext;
+    use crate::cli::init::{InitFlags, run};
+
+    fn smb_config(host: &str, share: &str) -> toml::Value {
+        toml::from_str(&format!(
+            r#"
+            type = "smb"
+            host = "{host}"
+            share = "{share}"
+            port = 4445
+            username = "alice"
+            password = "s3cret"
+            "#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn create_backend_builds_smb_backend_for_the_configured_share() {
+        let config = smb_config("nas.local", "media");
+
+        let backend = create_backend("nas", "smb", &config, None).unwrap();
+
+        assert_eq!(backend.display_name(), "nas.local/media");
+    }
+
+    #[test]
+    fn backend_factory_builds_smb_backend_from_toml_fragment() {
+        let fragment = toml::to_string(&smb_config("10.0.0.7", "photos")).unwrap();
+
+        let backend = CliBackendFactory.create("nas", "smb", &fragment).unwrap();
+
+        assert_eq!(backend.display_name(), "10.0.0.7/photos");
+    }
+
+    #[test]
+    fn create_backend_rejects_smb_config_without_share() {
+        let config: toml::Value = toml::from_str(
+            r#"
+            type = "smb"
+            host = "nas.local"
+            username = "alice"
+            password = "s3cret"
+            "#,
+        )
+        .unwrap();
+
+        let err = create_backend("nas", "smb", &config, None).err().unwrap();
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("share"), "error was: {msg}");
+        assert!(
+            !msg.contains("unsupported backend type"),
+            "error was: {msg}"
+        );
+    }
+
+    #[test]
+    fn smb_config_written_by_init_is_accepted_by_backend_factory() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = CliContext {
+            config_dir: dir.path().to_path_buf(),
+            db_path: dir.path().join("state.db"),
+            pid_path: dir.path().join("cascade.pid"),
+        };
+        let flags = InitFlags {
+            backend_type: Some("smb".to_string()),
+            name: Some("nas".to_string()),
+            mount_point: Some(dir.path().join("mnt").to_string_lossy().to_string()),
+            smb_host: Some("nas.local".to_string()),
+            smb_share: Some("media".to_string()),
+            smb_port: Some(4445),
+            smb_username: Some("alice".to_string()),
+            smb_password: Some("s3cret".to_string()),
+            ..Default::default()
+        };
+        run(&ctx, flags).unwrap();
+
+        let main_config = load_main_config(dir.path()).unwrap();
+        let entry: BackendConfig = main_config
+            .backends
+            .get("nas")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let per_backend_config = load_backend_config(dir.path(), "nas").unwrap();
+        let backend =
+            create_backend("nas", &entry.backend_type, &per_backend_config, None).unwrap();
+
+        assert_eq!(entry.backend_type, "smb");
+        assert_eq!(backend.display_name(), "nas.local/media");
+    }
 }

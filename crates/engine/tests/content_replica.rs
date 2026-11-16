@@ -211,7 +211,6 @@ async fn scan_mints_version_for_timestamp_preserving_edit_and_only_follows_dirty
     let listed = replica.list(docs).await.unwrap();
     let photo = uid_named(&listed, "photo.raw");
     let draft = uid_named(&listed, "draft.txt");
-    let cache = tempfile::tempdir().unwrap();
     for (uid, native_id) in [
         (photo, photo_entry.id.native_id()),
         (draft, draft_entry.id.native_id()),
@@ -229,7 +228,6 @@ async fn scan_mints_version_for_timestamp_preserving_edit_and_only_follows_dirty
                 content_version: &item.content_version,
                 source_revision: &revision,
                 size: entry.size.unwrap(),
-                cache_path: &cache.path().join(native_id),
             })
             .unwrap();
         db.mark_content_complete(object).unwrap();

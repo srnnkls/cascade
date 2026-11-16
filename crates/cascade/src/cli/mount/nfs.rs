@@ -27,11 +27,13 @@ pub(super) async fn try_nfs(
     p2p: &ResolvedP2pConfig,
     web: &WebOptions,
 ) -> Result<()> {
+    let paths = ctx.app_paths()?;
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
         mount_point: mount_path.to_path_buf(),
         backends,
-        cache_dir: None,
+        cache_dir: Some(paths.cache_dir),
+        staging_dir: Some(paths.staging_dir),
         enable_p2p: p2p.enable_p2p,
         p2p_data_dir: None,
         p2p_posture: p2p.posture,

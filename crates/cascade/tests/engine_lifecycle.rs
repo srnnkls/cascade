@@ -24,6 +24,7 @@ fn make_engine_with_backends(
             .map(MountedBackend::at_default)
             .collect(),
         cache_dir: None,
+        staging_dir: None,
         enable_p2p: false,
         p2p_data_dir: None,
         p2p_posture: None,

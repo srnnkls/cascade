@@ -125,6 +125,7 @@ impl CascadeNode {
             mount_point: config_root.clone(),
             backends: vec![MountedBackend::new(Some(NODE_MOUNT.to_owned()), backend)],
             cache_dir: Some(config_root.join("cache")),
+            staging_dir: None,
             enable_p2p: false,
             p2p_data_dir: None,
             p2p_posture: None,

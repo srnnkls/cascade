@@ -58,6 +58,7 @@ fn make_engine_with_p2p_data_authority(
                 "p2p-only",
             )))],
             cache_dir: None,
+            staging_dir: None,
             enable_p2p: false,
             p2p_data_dir: None,
             p2p_posture: None,

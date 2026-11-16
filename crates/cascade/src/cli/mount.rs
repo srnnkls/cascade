@@ -751,11 +751,13 @@ async fn try_fskit(
     p2p: &ResolvedP2pConfig,
     web: &WebOptions,
 ) -> Result<()> {
+    let paths = ctx.app_paths()?;
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
         mount_point: mount_path.to_path_buf(),
         backends,
-        cache_dir: None,
+        cache_dir: Some(paths.cache_dir),
+        staging_dir: Some(paths.staging_dir),
         enable_p2p: p2p.enable_p2p,
         p2p_data_dir: None,
         p2p_posture: p2p.posture,
@@ -865,11 +867,14 @@ async fn try_projfs(
     let backends_for_provider: Vec<Arc<dyn cascade_engine::backend::Backend>> =
         backends.iter().map(|mb| mb.backend.clone()).collect();
 
+    let paths = ctx.app_paths()?;
+
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
         mount_point: mount_path.to_path_buf(),
         backends,
-        cache_dir: None,
+        cache_dir: Some(paths.cache_dir),
+        staging_dir: Some(paths.staging_dir),
         enable_p2p: p2p.enable_p2p,
         p2p_data_dir: None,
         p2p_posture: p2p.posture,
@@ -1011,11 +1016,13 @@ async fn try_webdav(
     p2p: &ResolvedP2pConfig,
     web: &WebOptions,
 ) -> Result<()> {
+    let paths = ctx.app_paths()?;
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
         mount_point: mount_path.to_path_buf(),
         backends,
-        cache_dir: None,
+        cache_dir: Some(paths.cache_dir),
+        staging_dir: Some(paths.staging_dir),
         enable_p2p: p2p.enable_p2p,
         p2p_data_dir: None,
         p2p_posture: p2p.posture,
@@ -1155,11 +1162,13 @@ async fn try_fuse(
     p2p: &ResolvedP2pConfig,
     web: &WebOptions,
 ) -> Result<()> {
+    let paths = ctx.app_paths()?;
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
         mount_point: mount_path.to_path_buf(),
         backends,
-        cache_dir: None,
+        cache_dir: Some(paths.cache_dir),
+        staging_dir: Some(paths.staging_dir),
         enable_p2p: p2p.enable_p2p,
         p2p_data_dir: None,
         p2p_posture: p2p.posture,

@@ -41,6 +41,12 @@ pub struct InitFlags {
     pub p2p_listen_addr: Option<String>,
     pub p2p_relay_endpoint: Option<String>,
     pub p2p_relay_secret: Option<String>,
+    // SMB backend flags.
+    pub smb_host: Option<String>,
+    pub smb_share: Option<String>,
+    pub smb_port: Option<u16>,
+    pub smb_username: Option<String>,
+    pub smb_password: Option<String>,
 }
 
 use super::CliContext;
@@ -166,6 +172,7 @@ const BACKEND_TYPES: &[(&str, &str)] = &[
     ("s3", "S3-compatible"),
     ("local", "Local filesystem"),
     ("p2p", "P2P content-addressed store"),
+    ("smb", "SMB share"),
 ];
 
 /// Run the init command.
@@ -392,6 +399,25 @@ fn write_provider_config(
                 );
             }
         }
+        "smb" => {
+            let required = |value: Option<&str>, flag: &str| -> Result<String> {
+                let value = value.ok_or_else(|| {
+                    anyhow::anyhow!("--{flag} is required for backend type 'smb'")
+                })?;
+                if value.is_empty() {
+                    anyhow::bail!("--{flag} must not be empty");
+                }
+                Ok(value.to_string())
+            };
+            let settings = SmbSettings {
+                host: required(flags.smb_host.as_deref(), "smb-host")?,
+                share: required(flags.smb_share.as_deref(), "smb-share")?,
+                port: flags.smb_port,
+                username: required(flags.smb_username.as_deref(), "smb-username")?,
+                password: required(flags.smb_password.as_deref(), "smb-password")?,
+            };
+            backend_table.extend(settings.into_table());
+        }
         other => anyhow::bail!("unsupported backend type '{other}'"),
     }
 
@@ -399,6 +425,62 @@ fn write_provider_config(
     let backend_config_path = ctx.config_dir.join(format!("{name}.toml"));
     std::fs::write(&backend_config_path, &backend_toml)?;
     Ok(())
+}
+
+/// Connection settings written to an SMB backend's per-backend TOML.
+pub(super) struct SmbSettings {
+    pub host: String,
+    pub share: String,
+    pub port: Option<u16>,
+    pub username: String,
+    pub password: String,
+}
+
+impl SmbSettings {
+    /// Prompt for the settings on stdin.
+    pub(super) fn prompt() -> Result<Self> {
+        let required = |prompt: &str, key: &str| -> Result<String> {
+            let value = read_input(prompt)?;
+            if value.is_empty() {
+                anyhow::bail!("{key} must not be empty");
+            }
+            Ok(value)
+        };
+        let host = required("Server host name or address", "host")?;
+        let share = required("Share name", "share")?;
+        let port_input = read_input("Port (blank for 445)")?;
+        let port = if port_input.is_empty() {
+            None
+        } else {
+            Some(
+                port_input
+                    .parse::<u16>()
+                    .map_err(|e| anyhow::anyhow!("invalid port `{port_input}`: {e}"))?,
+            )
+        };
+        let username = required("User name", "username")?;
+        let password = required("Password", "password")?;
+        Ok(Self {
+            host,
+            share,
+            port,
+            username,
+            password,
+        })
+    }
+
+    /// The `host`, `share`, `username`, `password` and optional `port` keys.
+    pub(super) fn into_table(self) -> toml::Table {
+        let mut table = toml::Table::new();
+        table.insert("host".to_string(), toml::Value::String(self.host));
+        table.insert("share".to_string(), toml::Value::String(self.share));
+        if let Some(port) = self.port {
+            table.insert("port".to_string(), toml::Value::Integer(i64::from(port)));
+        }
+        table.insert("username".to_string(), toml::Value::String(self.username));
+        table.insert("password".to_string(), toml::Value::String(self.password));
+        table
+    }
 }
 
 /// Validate that a posture string is one of the accepted values.
@@ -658,6 +740,18 @@ fn run_interactive(ctx: &CliContext) -> Result<()> {
                     toml::Value::String(listen_addr_input),
                 );
             }
+
+            let backend_toml = toml::to_string_pretty(&backend_table)?;
+            let backend_config_path = ctx.config_dir.join(format!("{name}.toml"));
+            std::fs::write(&backend_config_path, &backend_toml)?;
+        }
+        "smb" => {
+            println!("SMB share:");
+            println!();
+
+            let mut backend_table = toml::Table::new();
+            backend_table.insert("type".to_string(), toml::Value::String("smb".to_string()));
+            backend_table.extend(SmbSettings::prompt()?.into_table());
 
             let backend_toml = toml::to_string_pretty(&backend_table)?;
             let backend_config_path = ctx.config_dir.join(format!("{name}.toml"));
@@ -1210,5 +1304,98 @@ relay_shared_secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
             msg.contains("relay shared secret must be exactly 64"),
             "error was: {msg}"
         );
+    }
+
+    fn smb_flags(mount: &std::path::Path) -> InitFlags {
+        InitFlags {
+            backend_type: Some("smb".to_string()),
+            name: Some("nas".to_string()),
+            mount_point: Some(mount.to_string_lossy().to_string()),
+            smb_host: Some("nas.local".to_string()),
+            smb_share: Some("media".to_string()),
+            smb_port: Some(4445),
+            smb_username: Some("alice".to_string()),
+            smb_password: Some("s3cret".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn noninteractive_smb_writes_config_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = make_context(dir.path());
+        let mount = dir.path().join("mnt");
+
+        run(&ctx, smb_flags(&mount)).unwrap();
+
+        let backend: toml::Value =
+            toml::from_str(&std::fs::read_to_string(dir.path().join("nas.toml")).unwrap()).unwrap();
+        assert_eq!(backend.get("type").unwrap().as_str(), Some("smb"));
+        assert_eq!(backend.get("host").unwrap().as_str(), Some("nas.local"));
+        assert_eq!(backend.get("share").unwrap().as_str(), Some("media"));
+        assert_eq!(backend.get("port").unwrap().as_integer(), Some(4445));
+        assert_eq!(backend.get("username").unwrap().as_str(), Some("alice"));
+        assert_eq!(backend.get("password").unwrap().as_str(), Some("s3cret"));
+
+        let config: CascadeConfig =
+            toml::from_str(&std::fs::read_to_string(dir.path().join("config.toml")).unwrap())
+                .unwrap();
+        let entry: BackendConfig = config
+            .backends
+            .get("nas")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!(entry.backend_type, "smb");
+        assert_eq!(entry.mount.as_deref(), Some("nas"));
+        assert!(mount.is_dir());
+    }
+
+    #[test]
+    fn noninteractive_smb_without_port_omits_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = make_context(dir.path());
+        let flags = InitFlags {
+            smb_port: None,
+            ..smb_flags(&dir.path().join("mnt"))
+        };
+
+        run(&ctx, flags).unwrap();
+
+        let backend: toml::Value =
+            toml::from_str(&std::fs::read_to_string(dir.path().join("nas.toml")).unwrap()).unwrap();
+        assert!(backend.get("port").is_none(), "backend was: {backend}");
+    }
+
+    #[test]
+    fn noninteractive_smb_missing_share_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = make_context(dir.path());
+        let flags = InitFlags {
+            smb_share: None,
+            ..smb_flags(&dir.path().join("mnt"))
+        };
+
+        let err = run(&ctx, flags).unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--smb-share"), "error was: {msg}");
+        assert!(!dir.path().join("nas.toml").exists());
+    }
+
+    #[test]
+    fn noninteractive_smb_missing_password_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = make_context(dir.path());
+        let flags = InitFlags {
+            smb_password: None,
+            ..smb_flags(&dir.path().join("mnt"))
+        };
+
+        let err = run(&ctx, flags).unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--smb-password"), "error was: {msg}");
     }
 }

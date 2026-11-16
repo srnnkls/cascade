@@ -19,7 +19,7 @@ Every cloud provider ships their own desktop client. They all share the same sha
 
 Cascade is what happens when you want a single tool, with a single config language, that:
 
-- Presents every backend — Google Drive, S3, the local filesystem — as one virtual tree under one mount point, mounted with the same shape on macOS, Linux, and Windows.
+- Presents every backend — Google Drive, S3, SMB shares, the local filesystem — as one virtual tree under one mount point, mounted with the same shape on macOS, Linux, and Windows.
 - Streams file content on demand. Directory listings work without downloading anything; only `open()` triggers a fetch.
 - Uses the OS's native filesystem APIs — FSKit on macOS (15.4+), FUSE on Linux, WebDAV via the built-in `WebClient` on Windows — with no kernel extension, no admin escalation, no third-party driver.
 - Takes its rules from `.cascade` files scattered through the tree (gitignore-style precedence), so behaviour can vary per directory without restarting anything.
@@ -170,6 +170,7 @@ crates/
   backend-s3/             S3-compatible
   backend-local/          Local filesystem (adopt-and-sync)
   backend-p2p/            P2P-only content-addressed store (no cloud authority; blocks local, metadata in SQLite)
+  backend-smb/            SMB share (SMB2/3, NTLM)
   presenter-nfs/          NFSv3 server
   presenter-fuse/         Linux FUSE presenter
   presenter-webdav/       WebDAV server presenter (cross-platform)

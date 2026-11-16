@@ -21,6 +21,7 @@ fn make_test_engine() -> NativeEngine {
             "test",
         )))],
         cache_dir: None,
+        staging_dir: None,
         backend_factory: None,
         #[cfg(feature = "p2p")]
         enable_p2p: false,
@@ -127,6 +128,7 @@ async fn engine_new_requires_at_least_one_backend() {
         mount_point: PathBuf::from("/tmp/test-mount"),
         backends: vec![],
         cache_dir: None,
+        staging_dir: None,
         backend_factory: None,
         #[cfg(feature = "p2p")]
         enable_p2p: false,
@@ -157,6 +159,7 @@ async fn engine_at_root_mount_uses_empty_prefix() {
             Arc::new(NullBackend::new("solo")),
         )],
         cache_dir: None,
+        staging_dir: None,
         backend_factory: None,
         #[cfg(feature = "p2p")]
         enable_p2p: false,
@@ -197,6 +200,7 @@ async fn engine_named_mount_binds_at_configured_prefix() {
             Arc::new(NullBackend::new("gdrive-personal")),
         )],
         cache_dir: None,
+        staging_dir: None,
         backend_factory: None,
         #[cfg(feature = "p2p")]
         enable_p2p: false,
@@ -228,6 +232,7 @@ async fn engine_defaults_mount_to_backend_id_when_unset() {
             "work",
         )))],
         cache_dir: None,
+        staging_dir: None,
         backend_factory: None,
         #[cfg(feature = "p2p")]
         enable_p2p: false,
@@ -261,6 +266,7 @@ async fn engine_rejects_duplicate_mount_paths() {
             MountedBackend::new(Some("shared".to_owned()), Arc::new(NullBackend::new("b"))),
         ],
         cache_dir: None,
+        staging_dir: None,
         backend_factory: None,
         #[cfg(feature = "p2p")]
         enable_p2p: false,
@@ -300,6 +306,7 @@ async fn engine_hydrates_mount_from_db_on_restart() {
                 Arc::new(NullBackend::new("gdrive")),
             )],
             cache_dir: None,
+            staging_dir: None,
             backend_factory: None,
             #[cfg(feature = "p2p")]
             enable_p2p: false,
@@ -328,6 +335,7 @@ async fn engine_hydrates_mount_from_db_on_restart() {
             "gdrive",
         )))],
         cache_dir: None,
+        staging_dir: None,
         backend_factory: None,
         #[cfg(feature = "p2p")]
         enable_p2p: false,
@@ -363,6 +371,7 @@ async fn engine_with_multiple_backends() {
             MountedBackend::at_default(Arc::new(NullBackend::new("work"))),
         ],
         cache_dir: None,
+        staging_dir: None,
         backend_factory: None,
         #[cfg(feature = "p2p")]
         enable_p2p: false,

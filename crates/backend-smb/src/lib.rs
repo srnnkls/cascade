@@ -30,6 +30,8 @@ use smb::{
 mod client;
 mod config;
 mod listing;
+mod names;
+mod write;
 
 use client::{MAX_REQUEST, REQUEST_DEADLINE, SmbClient};
 use listing::file_time_to_utc;
@@ -123,6 +125,17 @@ fn child_native_id(parent: &str, name: &str) -> String {
     }
 }
 
+/// The SMB status a server replied with, if `err` carries one.
+fn status_of(err: &anyhow::Error) -> Option<u32> {
+    err.chain()
+        .find_map(|e| e.downcast_ref::<smb::Error>())
+        .and_then(|e| match e {
+            smb::Error::ReceivedErrorMessage(status, _)
+            | smb::Error::UnexpectedMessageStatus(status) => Some(*status),
+            _ => None,
+        })
+}
+
 impl SmbBackend {
     /// Build a backend without connecting.
     ///
@@ -143,15 +156,22 @@ impl SmbBackend {
         })
     }
 
-    /// UNC path of the item with the given native id.
-    fn unc_for(&self, native_id: &str) -> UncPath {
+    /// Share-relative path of the item with the given native id, backslash-separated.
+    fn share_relative(&self, native_id: &str) -> String {
         let relative = if native_id == ROOT_ID { "" } else { native_id };
         let full = match (&self.config.prefix, relative) {
             (Some(prefix), "") => prefix.clone(),
             (Some(prefix), rel) => format!("{prefix}/{rel}"),
             (None, rel) => rel.to_string(),
         };
-        self.share_path.clone().with_path(&full.replace('/', "\\"))
+        full.replace('/', "\\")
+    }
+
+    /// UNC path of the item with the given native id.
+    fn unc_for(&self, native_id: &str) -> UncPath {
+        self.share_path
+            .clone()
+            .with_path(&self.share_relative(native_id))
     }
 
     async fn open(
@@ -160,21 +180,31 @@ impl SmbBackend {
         native_id: &str,
         access: FileAccessMask,
     ) -> anyhow::Result<Resource> {
+        self.open_with(
+            client,
+            native_id,
+            &FileCreateArgs::make_open_existing(access),
+        )
+        .await
+    }
+
+    async fn open_with(
+        &self,
+        client: &Client,
+        native_id: &str,
+        args: &FileCreateArgs,
+    ) -> anyhow::Result<Resource> {
         client
-            .create_file(
-                &self.unc_for(native_id),
-                &FileCreateArgs::make_open_existing(access),
-            )
+            .create_file(&self.unc_for(native_id), args)
             .await
-            .map_err(|err| match err {
-                smb::Error::ReceivedErrorMessage(status, _)
-                | smb::Error::UnexpectedMessageStatus(status)
-                    if status == Status::U32_OBJECT_NAME_NOT_FOUND
-                        || status == Status::U32_OBJECT_PATH_NOT_FOUND =>
-                {
-                    BackendError::NotFound(native_id.to_string()).into()
+            .map_err(|err| {
+                let err = anyhow::Error::from(err);
+                match status_of(&err) {
+                    Some(Status::U32_OBJECT_NAME_NOT_FOUND | Status::U32_OBJECT_PATH_NOT_FOUND) => {
+                        BackendError::NotFound(native_id.to_string()).into()
+                    }
+                    _ => err,
                 }
-                other => other.into(),
             })
     }
 
@@ -245,6 +275,9 @@ impl SmbBackend {
         length: Option<usize>,
     ) -> anyhow::Result<Vec<u8>> {
         let handle = std::sync::Mutex::new(None);
+        let read_args =
+            || FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
+        let read_args = &read_args;
         let mut data = Vec::new();
         let result = loop {
             let want = length.map_or(MAX_REQUEST, |l| {
@@ -258,7 +291,9 @@ impl SmbBackend {
             let read = self
                 .client
                 .run(move |client| async move {
-                    let file = self.file_on(handle, &client, native_id).await?;
+                    let file = self
+                        .file_on(handle, &client, native_id, read_args, read_args)
+                        .await?;
                     let mut chunk = vec![0u8; want];
                     let n = file.read_at(&mut chunk, at).await?;
                     chunk.truncate(n);
@@ -271,35 +306,34 @@ impl SmbBackend {
                 Err(e) => break Err(e),
             }
         };
-        let open = handle.into_inner().unwrap_or_else(PoisonError::into_inner);
-        if let Some((_, file)) = open {
-            match tokio::time::timeout(REQUEST_DEADLINE, file.close()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::debug!(native_id, error = %e, "closing SMB file failed"),
-                Err(_) => tracing::debug!(native_id, "closing SMB file timed out"),
-            }
-        }
+        close_open_file(handle, native_id).await;
         result.map(|()| data)
     }
 
-    /// The open file in `handle` when it belongs to `client`, otherwise a newly opened one.
+    /// The open file in `handle` when it belongs to `client`, otherwise one
+    /// opened with `first`, or with `reopen` when `handle` held a file of an
+    /// earlier client.
     async fn file_on(
         &self,
         handle: &std::sync::Mutex<Option<OpenFile>>,
         client: &Arc<Client>,
         native_id: &str,
+        first: &(dyn Fn() -> FileCreateArgs + Sync),
+        reopen: &(dyn Fn() -> FileCreateArgs + Sync),
     ) -> anyhow::Result<Arc<File>> {
-        let reusable = handle
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .filter(|(owner, _)| Arc::ptr_eq(owner, client))
-            .map(|(_, file)| Arc::clone(file));
+        let (reusable, reopened) = {
+            let held = handle.lock().unwrap_or_else(PoisonError::into_inner);
+            let reusable = held
+                .as_ref()
+                .filter(|(owner, _)| Arc::ptr_eq(owner, client))
+                .map(|(_, file)| Arc::clone(file));
+            (reusable, held.is_some())
+        };
         if let Some(file) = reusable {
             return Ok(file);
         }
-        let access = FileAccessMask::new().with_generic_read(true);
-        let Resource::File(file) = self.open(client, native_id, access).await? else {
+        let args = if reopened { reopen() } else { first() };
+        let Resource::File(file) = self.open_with(client, native_id, &args).await? else {
             anyhow::bail!("SMB path {native_id} is not a file");
         };
         let file = Arc::new(file);
@@ -308,10 +342,10 @@ impl SmbBackend {
         Ok(file)
     }
 
-    /// Every entry under the share, parents before children.
-    async fn list_tree(&self) -> anyhow::Result<Vec<FileEntry>> {
+    /// Every entry under the directory `root`, parents before children.
+    async fn list_tree(&self, root: &str) -> anyhow::Result<Vec<FileEntry>> {
         let mut all = Vec::new();
-        let mut pending = vec![ROOT_ID.to_string()];
+        let mut pending = vec![root.to_string()];
         while let Some(dir) = pending.pop() {
             for (entry, _) in self.list_dir(&dir).await? {
                 if entry.is_dir {
@@ -321,6 +355,18 @@ impl SmbBackend {
             }
         }
         Ok(all)
+    }
+}
+
+/// Close the file left in `handle`, logging a failure.
+async fn close_open_file(handle: std::sync::Mutex<Option<OpenFile>>, native_id: &str) {
+    let open = handle.into_inner().unwrap_or_else(PoisonError::into_inner);
+    if let Some((_, file)) = open {
+        match tokio::time::timeout(REQUEST_DEADLINE, file.close()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::debug!(native_id, error = %e, "closing SMB file failed"),
+            Err(_) => tracing::debug!(native_id, "closing SMB file timed out"),
+        }
     }
 }
 
@@ -351,7 +397,7 @@ impl Backend for SmbBackend {
         let new_cursor = Cursor(Utc::now().to_rfc3339());
 
         let changes = self
-            .list_tree()
+            .list_tree(ROOT_ID)
             .await?
             .into_iter()
             .filter(|e| since.is_none_or(|since_dt| e.mod_time.is_none_or(|mt| mt > since_dt)))
@@ -407,27 +453,76 @@ impl Backend for SmbBackend {
 
     async fn upload(
         &self,
-        _path: &Path,
-        _data: &[u8],
+        path: &Path,
+        data: &[u8],
         _parent_id: &FileId,
     ) -> anyhow::Result<FileEntry> {
-        anyhow::bail!("SMB backend does not support writes yet")
+        let native_id = native_id_for_path(path);
+        names::check(&native_id)?;
+        self.write_content(&native_id, write::Target::CreateOrReplace, data, None)
+            .await
     }
 
-    async fn update(&self, _file_id: &FileId, _data: &[u8]) -> anyhow::Result<FileEntry> {
-        anyhow::bail!("SMB backend does not support writes yet")
+    async fn update(&self, file_id: &FileId, data: &[u8]) -> anyhow::Result<FileEntry> {
+        self.write_content(file_id.native_id(), write::Target::Existing, data, None)
+            .await
     }
 
-    async fn create_dir(&self, _path: &Path) -> anyhow::Result<FileEntry> {
-        anyhow::bail!("SMB backend does not support writes yet")
+    async fn upload_from_path(
+        &self,
+        path: &Path,
+        local: &Path,
+        _parent_id: &FileId,
+    ) -> anyhow::Result<FileEntry> {
+        let native_id = native_id_for_path(path);
+        names::check(&native_id)?;
+        let (source, last_write) = write::local_source(local).await?;
+        self.write_content(
+            &native_id,
+            write::Target::CreateOrReplace,
+            source,
+            last_write,
+        )
+        .await
     }
 
-    async fn delete(&self, _file: &FileEntry) -> anyhow::Result<()> {
-        anyhow::bail!("SMB backend does not support writes yet")
+    async fn update_from_path(&self, file_id: &FileId, local: &Path) -> anyhow::Result<FileEntry> {
+        let (source, last_write) = write::local_source(local).await?;
+        self.write_content(
+            file_id.native_id(),
+            write::Target::Existing,
+            source,
+            last_write,
+        )
+        .await
     }
 
-    async fn move_entry(&self, _src: &Path, _dst: &Path) -> anyhow::Result<FileEntry> {
-        anyhow::bail!("SMB backend does not support writes yet")
+    async fn replace(&self, source: &Path, target: &Path) -> anyhow::Result<(FileEntry, Revision)> {
+        self.rename(
+            &native_id_for_path(source),
+            &native_id_for_path(target),
+            true,
+        )
+        .await
+    }
+
+    async fn create_dir(&self, path: &Path) -> anyhow::Result<FileEntry> {
+        let native_id = native_id_for_path(path);
+        names::check(&native_id)?;
+        self.create_directory(&native_id).await
+    }
+
+    async fn delete(&self, file: &FileEntry) -> anyhow::Result<()> {
+        self.delete_tree(file.id.native_id(), file.is_dir).await
+    }
+
+    async fn move_entry(&self, src: &Path, dst: &Path) -> anyhow::Result<FileEntry> {
+        let destination = native_id_for_path(dst);
+        names::check(&destination)?;
+        let (entry, _) = self
+            .rename(&native_id_for_path(src), &destination, false)
+            .await?;
+        Ok(entry)
     }
 
     async fn list_children(&self, parent_native_id: &str) -> anyhow::Result<Vec<FileEntry>> {

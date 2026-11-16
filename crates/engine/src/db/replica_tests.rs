@@ -1,7 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::path::Path;
-
 use chrono::DateTime;
 
 use super::ItemKind;
@@ -51,7 +49,6 @@ fn dirty(db: &StateDb, uid: u64) -> ObjectId {
             content_version: "local",
             source_revision: &source,
             size: 1,
-            cache_path: Path::new("/cache/objects/x"),
         })
         .unwrap();
     db.mark_content_dirty(object, "local", 1).unwrap();

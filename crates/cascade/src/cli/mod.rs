@@ -133,7 +133,7 @@ pub struct Cli {
 /// fields into the `Init` variant for argument parsing.
 #[derive(Debug, clap::Args)]
 pub struct InitArgs {
-    /// Backend type (gdrive, s3, local, p2p)
+    /// Backend type (gdrive, s3, local, p2p, smb)
     #[arg(long)]
     pub backend_type: Option<String>,
 
@@ -196,6 +196,26 @@ pub struct InitArgs {
     /// 64-char hex HMAC secret for the relay server (for --backend-type p2p)
     #[arg(long)]
     pub p2p_relay_secret: Option<String>,
+
+    /// SMB server host name or address (for --backend-type smb)
+    #[arg(long)]
+    pub smb_host: Option<String>,
+
+    /// SMB share name (for --backend-type smb)
+    #[arg(long)]
+    pub smb_share: Option<String>,
+
+    /// SMB TCP port, default 445 (for --backend-type smb)
+    #[arg(long)]
+    pub smb_port: Option<u16>,
+
+    /// SMB user name (for --backend-type smb)
+    #[arg(long)]
+    pub smb_username: Option<String>,
+
+    /// SMB password (for --backend-type smb)
+    #[arg(long)]
+    pub smb_password: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -308,7 +328,7 @@ pub enum Commands {
     /// Add a backend
     #[command(name = "backend-add")]
     BackendAdd {
-        /// Backend type (gdrive, s3, p2p)
+        /// Backend type (gdrive, s3, p2p, smb)
         backend_type: String,
 
         /// Name for this backend instance
@@ -950,6 +970,11 @@ impl Cli {
                     p2p_listen_addr: args.p2p_listen_addr,
                     p2p_relay_endpoint: args.p2p_relay_endpoint,
                     p2p_relay_secret: args.p2p_relay_secret,
+                    smb_host: args.smb_host,
+                    smb_share: args.smb_share,
+                    smb_port: args.smb_port,
+                    smb_username: args.smb_username,
+                    smb_password: args.smb_password,
                 },
             ),
             Commands::Start {

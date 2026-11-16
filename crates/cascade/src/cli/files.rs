@@ -38,6 +38,7 @@ pub fn build_engine(ctx: &CliContext) -> Result<NativeEngine> {
         mount_point: PathBuf::from("/"),
         backends,
         cache_dir: None,
+        staging_dir: None,
         enable_p2p: false,
         p2p_data_dir: None,
         p2p_posture: None,

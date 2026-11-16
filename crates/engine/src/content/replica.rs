@@ -4,6 +4,7 @@
 //! The store is the unit of identity and change tracking across every
 //! backend; a [`Replica`] is the unit of listing and scanning for one.
 
+use std::collections::HashSet;
 use std::path::{Component, Path};
 use std::sync::Arc;
 
@@ -11,6 +12,7 @@ use anyhow::{Result, anyhow};
 use chrono::Utc;
 
 use super::anchor::SyncAnchor;
+use super::is_not_found;
 use crate::backend::Backend;
 use crate::db::StateDb;
 pub use crate::db::replica::{ItemKind, ReplicaItem};
@@ -89,6 +91,10 @@ impl ReplicaStore {
         self.db.replica_item(uid)
     }
 
+    pub(crate) fn db(&self) -> &StateDb {
+        &self.db
+    }
+
     /// Return the anchor of the latest change in the store.
     ///
     /// # Errors
@@ -165,6 +171,10 @@ impl Replica {
         self.backend.id()
     }
 
+    pub(crate) const fn backend(&self) -> &Arc<dyn Backend> {
+        &self.backend
+    }
+
     /// Return the uid of the item at `path`, relative to the backend root,
     /// listing and registering folders along the way whose child is missing.
     /// Returns `None` when no such item exists.
@@ -223,16 +233,58 @@ impl Replica {
         Ok(children)
     }
 
-    async fn refresh(&self, folder_uid: u64) -> Result<()> {
-        let folder = self
-            .db
-            .replica_item(folder_uid)?
-            .ok_or_else(|| anyhow!("no replica item {folder_uid}"))?;
-        let children = self.fetch_children(&folder).await?;
-        let seen = self
-            .db
-            .upsert_replica_children(self.backend_id(), folder_uid, &children)?;
-        self.db.remove_replica_children_except(folder_uid, &seen)?;
+    /// Relist a folder and remove the children the listing no longer holds.
+    /// A folder gone on the backend is removed by relisting the nearest
+    /// ancestor that still exists.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `folder_uid` is unknown, a listing fails for a reason other
+    /// than a missing folder, or the state database fails.
+    pub(crate) async fn refresh(&self, folder_uid: u64) -> Result<()> {
+        if self.db.replica_item(folder_uid)?.is_none() {
+            return Err(anyhow!("no replica item {folder_uid}"));
+        }
+        if let Some((listed_uid, seen)) =
+            self.list_existing(folder_uid, &mut HashSet::new()).await?
+        {
+            self.db.remove_replica_children_except(listed_uid, &seen)?;
+        }
         Ok(())
+    }
+
+    /// List `folder_uid`, or the nearest ancestor still on the backend when it
+    /// is gone, skipping folders in `visited`, and record the children.
+    /// Returns the listed folder and the uids its listing holds, for removing
+    /// the rest; `None` when no unvisited folder on the way exists.
+    pub(crate) async fn list_existing(
+        &self,
+        folder_uid: u64,
+        visited: &mut HashSet<u64>,
+    ) -> Result<Option<(u64, Vec<u64>)>> {
+        let mut next = self.db.replica_item(folder_uid)?;
+        while let Some(folder) = next.take() {
+            if !visited.insert(folder.uid) {
+                break;
+            }
+            match self.fetch_children(&folder).await {
+                Ok(children) => {
+                    let seen = self.db.upsert_replica_children(
+                        self.backend_id(),
+                        folder.uid,
+                        &children,
+                    )?;
+                    return Ok(Some((folder.uid, seen)));
+                }
+                Err(error) if is_not_found(&error) => {
+                    next = match folder.parent_uid {
+                        Some(parent_uid) => self.db.replica_item(parent_uid)?,
+                        None => None,
+                    };
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(None)
     }
 }

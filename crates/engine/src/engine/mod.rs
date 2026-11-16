@@ -29,6 +29,12 @@ use crate::backend::{Backend, BackendFactory, MountedBackend, NullBackend};
 use crate::cache::manager::{CacheManager, CacheManagerConfig};
 use crate::changefeed::ChangeFeed;
 use crate::config::ConfigResolver;
+#[cfg(all(feature = "native", unix))]
+use crate::content::cache::ContentCache;
+#[cfg(all(feature = "native", unix))]
+use crate::content::replica::ReplicaStore;
+#[cfg(all(feature = "native", unix))]
+use crate::content::transfer::TransferConfig;
 use crate::db::PinRuleRecord;
 #[cfg(feature = "native")]
 use crate::db::StateDb;
@@ -57,8 +63,11 @@ pub struct EngineConfig {
     /// overrides the configured mount, so a runtime-added backend reclaims its
     /// place rather than being lost.
     pub backends: Vec<MountedBackend>,
-    /// Cache directory override. `None` uses the default.
+    /// Directory of the content cache's object files. The content cache is
+    /// available only when this and `staging_dir` are set.
     pub cache_dir: Option<PathBuf>,
+    /// Directory the content cache stages handoff clones in.
+    pub staging_dir: Option<PathBuf>,
     /// Whether to enable P2P block sharing.
     #[cfg(feature = "p2p")]
     pub enable_p2p: bool,
@@ -104,7 +113,8 @@ impl fmt::Debug for EngineConfig {
             .field("db_path", &self.db_path)
             .field("mount_point", &self.mount_point)
             .field("backends", &backends_count)
-            .field("cache_dir", &self.cache_dir);
+            .field("cache_dir", &self.cache_dir)
+            .field("staging_dir", &self.staging_dir);
         #[cfg(feature = "p2p")]
         {
             let relay_count = format!("[{} endpoint(s)]", self.p2p_relay_endpoints.len());
@@ -166,6 +176,12 @@ pub struct Engine<R: RuntimeHandle, C: Clock> {
     /// wires p2p and the manage dispatch.
     #[cfg(feature = "exec")]
     exec: Option<std::sync::Arc<dyn cascade_exec::ExecProvider>>,
+    /// Object and staging directories of the content cache, when configured.
+    #[cfg(all(feature = "native", unix))]
+    content_dirs: Option<(PathBuf, PathBuf)>,
+    /// The content cache, opened on first use.
+    #[cfg(all(feature = "native", unix))]
+    content_cache: std::sync::Mutex<Option<ContentCache>>,
 }
 
 impl<R: RuntimeHandle, C: Clock> fmt::Debug for Engine<R, C> {
@@ -282,6 +298,8 @@ impl Engine<TokioRuntimeHandle, NativeClock> {
         };
 
         let cancel = Arc::new(AtomicBool::new(false));
+        #[cfg(unix)]
+        let content_dirs = config.cache_dir.zip(config.staging_dir);
 
         Ok(Self {
             db,
@@ -299,7 +317,55 @@ impl Engine<TokioRuntimeHandle, NativeClock> {
             cancel,
             #[cfg(feature = "exec")]
             exec: None,
+            #[cfg(unix)]
+            content_dirs,
+            #[cfg(unix)]
+            content_cache: std::sync::Mutex::default(),
         })
+    }
+
+    /// The content cache, opened on first use over the replica store with
+    /// every mounted backend registered.
+    ///
+    /// # Errors
+    ///
+    /// Fails when no cache and staging directories are configured, or when
+    /// the replica store or either directory cannot be opened.
+    #[cfg(unix)]
+    pub fn content_cache(&self) -> Result<ContentCache> {
+        let cache = {
+            let mut slot = self
+                .content_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cache) = slot.as_ref() {
+                cache.clone()
+            } else {
+                let (cache_dir, staging_dir) = self.content_dirs.clone().ok_or_else(|| {
+                    anyhow::anyhow!("no content cache and staging directories configured")
+                })?;
+                let cache = ContentCache::open(
+                    ReplicaStore::open(Arc::clone(&self.db))?,
+                    cache_dir,
+                    staging_dir,
+                    TransferConfig::default(),
+                )?;
+                *slot = Some(cache.clone());
+                cache
+            }
+        };
+        let backends: Vec<_> = self
+            .vfs
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .children()
+            .iter()
+            .map(|(_, backend)| Arc::clone(backend))
+            .collect();
+        for backend in backends {
+            cache.register(backend)?;
+        }
+        Ok(cache)
     }
 
     /// Inject the exec capability provider, returning the engine.

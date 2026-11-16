@@ -2,7 +2,6 @@
 //! `materialized_items`.
 
 use std::ops::Range;
-use std::path::{Path, PathBuf};
 use std::sync::MutexGuard;
 
 use anyhow::{Result, anyhow};
@@ -15,7 +14,7 @@ use crate::content::range_map::RangeMap;
 use crate::types::Revision;
 
 const OBJECT_COLUMNS: &str = "o.object_id, o.uid, o.content_version, o.source_stable_id, \
-     o.source_size, o.source_mtime, o.source_ctime, o.size, o.cache_path, o.state, o.dirty, \
+     o.source_size, o.source_mtime, o.source_ctime, o.size, o.state, o.dirty, \
      o.upload_temp_name, o.upload_file_id, o.last_access";
 
 const POPULATED_BYTES: &str = "COALESCE((SELECT SUM(r.\"end\" - r.start) FROM content_ranges r \
@@ -68,8 +67,6 @@ pub struct NewContentObject<'a> {
     pub source_revision: &'a Revision,
     /// Logical size of the object in bytes.
     pub size: u64,
-    /// Path of the sparse cache file.
-    pub cache_path: &'a Path,
 }
 
 /// One cached object and its write-back state.
@@ -85,8 +82,6 @@ pub struct ContentObject {
     pub source_revision: Revision,
     /// Logical size of the object in bytes.
     pub size: u64,
-    /// Path of the sparse cache file.
-    pub cache_path: PathBuf,
     /// Fill state.
     pub state: ContentState,
     /// Whether the object holds an edit not yet uploaded.
@@ -142,9 +137,9 @@ pub(super) fn time_column(row: &Row<'_>, idx: usize) -> rusqlite::Result<Option<
 }
 
 fn object_from_row(row: &Row<'_>) -> rusqlite::Result<ContentObject> {
-    let state: String = row.get(9)?;
-    let temp_name: Option<String> = row.get(11)?;
-    let file_id: Option<String> = row.get(12)?;
+    let state: String = row.get(8)?;
+    let temp_name: Option<String> = row.get(10)?;
+    let file_id: Option<String> = row.get(11)?;
     Ok(ContentObject {
         object_id: object_id_column(row, 0)?,
         uid: u64_column(row, 1)?,
@@ -156,19 +151,18 @@ fn object_from_row(row: &Row<'_>) -> rusqlite::Result<ContentObject> {
             change_time: time_column(row, 6)?,
         },
         size: u64_column(row, 7)?,
-        cache_path: PathBuf::from(row.get::<_, String>(8)?),
         state: ContentState::parse(&state).ok_or_else(|| {
             rusqlite::Error::FromSqlConversionFailure(
-                9,
+                8,
                 rusqlite::types::Type::Text,
                 format!("unknown content state {state:?}").into(),
             )
         })?,
-        dirty: row.get(10)?,
+        dirty: row.get(9)?,
         upload: temp_name
             .zip(file_id)
             .map(|(temp_name, file_id)| UploadRecord { temp_name, file_id }),
-        last_access: time_column(row, 13)?,
+        last_access: time_column(row, 12)?,
     })
 }
 
@@ -192,8 +186,8 @@ impl StateDb {
         let revision = object.source_revision;
         conn.execute(
             "INSERT INTO content_objects (uid, content_version, source_stable_id, source_size,
-                 source_mtime, source_ctime, size, cache_path, state)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 source_mtime, source_ctime, size, state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 id_to_sql(object.uid)?,
                 object.content_version,
@@ -202,7 +196,6 @@ impl StateDb {
                 time_to_sql(revision.last_write_time),
                 time_to_sql(revision.change_time),
                 id_to_sql(object.size)?,
-                object.cache_path.to_string_lossy(),
                 ContentState::Partial.as_str(),
             ],
         )?;
@@ -391,7 +384,7 @@ impl StateDb {
             .query_map([], |row| {
                 Ok(EvictionCandidate {
                     object: object_from_row(row)?,
-                    populated_bytes: u64_column(row, 14)?,
+                    populated_bytes: u64_column(row, 13)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;

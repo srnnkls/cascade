@@ -3,12 +3,20 @@
 
 use std::fmt;
 
+use crate::backend::BackendError;
+
 pub mod anchor;
+#[cfg(unix)]
+pub mod cache;
+#[cfg(all(test, cascade_loom, unix))]
+mod loom_model;
 pub mod range_map;
 pub mod replica;
 pub mod scan;
 #[cfg(unix)]
 pub mod store;
+#[cfg(unix)]
+pub mod transfer;
 
 /// Id of a cached object: its `content_objects` row and the name of its
 /// object file.
@@ -31,4 +39,12 @@ impl fmt::Display for ObjectId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
+}
+
+/// Whether `error` reports an item missing on the backend.
+pub(crate) fn is_not_found(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<BackendError>(),
+        Some(BackendError::NotFound(_))
+    )
 }

@@ -2,13 +2,13 @@
 //! Tests that pause or restart the share drive the Docker container `cascade-smb`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use cascade_engine::backend::{Backend, BackendError, TransientError};
-use cascade_engine::types::{Change, FileEntry, Revision};
+use cascade_engine::types::{Change, FileEntry, FileId, Revision};
 use chrono::{DateTime, TimeZone, Utc};
 use tokio::sync::RwLock;
 
@@ -530,4 +530,252 @@ async fn read_during_server_restart_finishes_within_budget_and_next_read_succeed
         bytes == full[offset..offset + MIB as usize],
         "read after restart returned wrong bytes"
     );
+}
+
+/// Output of `script` run in the share root as the share's owner, outside SMB.
+async fn share_output(script: &str) -> String {
+    let output = tokio::process::Command::new("docker")
+        .args([
+            "exec",
+            "-u",
+            "1000:1000",
+            "-e",
+            "TZ=UTC",
+            "-w",
+            "/storage",
+            CONTAINER,
+            "sh",
+            "-c",
+            script,
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success(), "{script} failed: {output:?}");
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn local_file(dir: &Path, name: &str, content: &[u8], modified: DateTime<Utc>) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, content).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(modified.into())
+        .unwrap();
+    path
+}
+
+fn parent_id(native_id: &str) -> FileId {
+    FileId(format!("nas:{native_id}"))
+}
+
+#[tokio::test]
+#[ignore = "requires a live SMB share"]
+async fn save_to_temporary_name_then_replace_over_target_returns_renamed_revision() {
+    let _share = SHARE.write().await;
+    on_share(
+        "rm -rf write-replace && mkdir write-replace \
+         && printf 'nas version\\n' > write-replace/target.txt",
+    )
+    .await;
+    let backend = backend();
+    let local = std::env::temp_dir().join(format!("cascade-smb-write-{}", std::process::id()));
+    std::fs::create_dir_all(&local).unwrap();
+    let (_, old_target) = listed(&*backend, "write-replace", "target.txt").await;
+
+    let first_write = Utc.with_ymd_and_hms(2021, 3, 4, 5, 6, 7).unwrap();
+    let first = local_file(&local, "first", b"first save\n", first_write);
+    let temp = backend
+        .upload_from_path(
+            Path::new("write-replace/.cascade-tmp-42"),
+            &first,
+            &parent_id("write-replace"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(temp.id.native_id(), "write-replace/.cascade-tmp-42");
+    assert_eq!(
+        share_output("cat write-replace/.cascade-tmp-42").await,
+        "first save\n"
+    );
+    assert_eq!(
+        share_output("cat write-replace/target.txt").await,
+        "nas version\n",
+        "upload to the temporary name touched the target"
+    );
+
+    let second_write = Utc.with_ymd_and_hms(2022, 5, 6, 7, 8, 9).unwrap();
+    let second = local_file(&local, "second", b"second, longer save\n", second_write);
+    let temp = backend
+        .update_from_path(&FileId(temp.id.0.clone()), &second)
+        .await
+        .unwrap();
+    let (_, temp_revision) = listed(&*backend, "write-replace", ".cascade-tmp-42").await;
+    assert_eq!(temp_revision.last_write_time, Some(second_write));
+
+    let (renamed, revision) = backend
+        .replace(
+            Path::new(temp.id.native_id()),
+            Path::new("write-replace/target.txt"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(renamed.id.native_id(), "write-replace/target.txt");
+    assert_eq!(revision.stable_id, temp_revision.stable_id);
+    assert_ne!(revision.stable_id, old_target.stable_id);
+    assert_eq!(revision.size, Some(20));
+    assert_eq!(revision.last_write_time, Some(second_write));
+    assert_eq!(
+        share_output("cat write-replace/target.txt").await,
+        "second, longer save\n"
+    );
+    assert_eq!(share_output("ls -A write-replace").await, "target.txt\n");
+
+    std::fs::remove_dir_all(&local).unwrap();
+    on_share("rm -rf write-replace").await;
+}
+
+/// Opens `native_id` on a second SMB client and keeps the handle open.
+async fn hold_open(spec: &ShareSpec, native_id: &str) -> (smb::Client, smb::Resource) {
+    let client = smb::Client::new(smb::ClientConfig {
+        dfs: false,
+        connection: smb::ConnectionConfig {
+            port: Some(u16::try_from(spec.port).unwrap()),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let share: smb::UncPath = format!(r"\\{}\{}", spec.host, spec.share).parse().unwrap();
+    client
+        .share_connect(&share, &spec.user, spec.password.clone())
+        .await
+        .unwrap();
+    let access = smb::FileAccessMask::new()
+        .with_file_read_data(true)
+        .with_synchronize(true);
+    let handle = client
+        .create_file(
+            &share.with_path(&native_id.replace('/', "\\")),
+            &smb::FileCreateArgs::make_open_existing(access),
+        )
+        .await
+        .unwrap();
+    (client, handle)
+}
+
+#[tokio::test]
+#[ignore = "requires a live SMB share"]
+async fn replace_over_target_held_open_elsewhere_is_busy_and_changes_nothing() {
+    let _share = SHARE.write().await;
+    on_share(
+        "rm -rf write-busy && mkdir write-busy \
+         && printf 'held\\n' > write-busy/target.txt \
+         && printf 'incoming\\n' > write-busy/.cascade-tmp-7",
+    )
+    .await;
+    let spec = share_spec();
+    let backend = backend_for(&spec);
+    let (client, handle) = hold_open(&spec, "write-busy/target.txt").await;
+
+    let err = backend
+        .replace(
+            Path::new("write-busy/.cascade-tmp-7"),
+            Path::new("write-busy/target.txt"),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err.downcast_ref::<TransientError>(),
+            Some(TransientError::Busy(_))
+        ),
+        "expected TransientError::Busy, got {err:#}"
+    );
+
+    if let smb::Resource::File(file) = handle {
+        file.close().await.unwrap();
+    }
+    client.close().await.unwrap();
+    assert_eq!(share_output("cat write-busy/target.txt").await, "held\n");
+    assert_eq!(
+        share_output("cat write-busy/.cascade-tmp-7").await,
+        "incoming\n"
+    );
+
+    on_share("rm -rf write-busy").await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live SMB share"]
+async fn folder_create_rename_move_and_recursive_delete_reject_names_smb_cannot_hold() {
+    let _share = SHARE.write().await;
+    on_share("rm -rf write-tree").await;
+    let backend = backend();
+
+    let root = backend.create_dir(Path::new("write-tree")).await.unwrap();
+    assert!(root.is_dir);
+    let dest = backend
+        .create_dir(Path::new("write-tree/dest"))
+        .await
+        .unwrap();
+    assert_eq!(dest.id.native_id(), "write-tree/dest");
+    backend
+        .upload(
+            Path::new("write-tree/a.txt"),
+            b"moving\n",
+            &parent_id("write-tree"),
+        )
+        .await
+        .unwrap();
+    let (_, before) = listed(&*backend, "write-tree", "a.txt").await;
+
+    let moved = backend
+        .move_entry(
+            Path::new("write-tree/a.txt"),
+            Path::new("write-tree/dest/b.txt"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(moved.id.native_id(), "write-tree/dest/b.txt");
+    assert_eq!(moved.parent_id.native_id(), "write-tree/dest");
+    let (_, after) = listed(&*backend, "write-tree/dest", "b.txt").await;
+    assert_eq!(
+        after.stable_id, before.stable_id,
+        "move changed the stable id"
+    );
+    assert_eq!(share_output("cat write-tree/dest/b.txt").await, "moving\n");
+
+    for name in ["a?b", "a*b", "a<b", "a>b", "a\"b", "a\\b", "a|b", "a:b"] {
+        let dir = format!("write-tree/dir {name}");
+        let upload = format!("write-tree/file {name}");
+        let renamed = format!("write-tree/dest/renamed {name}");
+        for err in [
+            backend.create_dir(Path::new(&dir)).await.unwrap_err(),
+            backend
+                .upload(Path::new(&upload), b"x", &parent_id("write-tree"))
+                .await
+                .unwrap_err(),
+            backend
+                .move_entry(Path::new("write-tree/dest/b.txt"), Path::new(&renamed))
+                .await
+                .unwrap_err(),
+        ] {
+            assert!(
+                err.downcast_ref::<TransientError>().is_none(),
+                "name {name:?} rejected as transient: {err:#}"
+            );
+        }
+    }
+    assert_eq!(
+        share_output("cd write-tree && find . | sort").await,
+        ".\n./dest\n./dest/b.txt\n",
+        "a rejected name reached the share"
+    );
+
+    let tree = backend.metadata(Path::new("write-tree")).await.unwrap();
+    backend.delete(&tree).await.unwrap();
+    assert_eq!(share_output("ls -A").await, "big.bin\nsub\n");
+    assert_not_found(&backend.metadata(Path::new("write-tree")).await.unwrap_err());
 }

@@ -8,7 +8,7 @@ use cascade_engine::portable::native::{SqliteStorage, TokioRuntimeHandle};
 use std::sync::Arc;
 
 use super::CliContext;
-use super::init::{BackendConfig, CascadeConfig};
+use super::init::{BackendConfig, CascadeConfig, SmbSettings};
 
 /// Open the state database.
 fn open_db(ctx: &CliContext) -> Result<StateDb> {
@@ -339,6 +339,21 @@ pub fn backend_add(
             let config_str = render_p2p_config(&full_config, &peers)?;
             std::fs::write(&config_path, &config_str)?;
         }
+        "smb" => {
+            println!("\nSMB configuration:");
+
+            let mut full_config = toml::Table::new();
+            full_config.insert("type".to_string(), toml::Value::String("smb".to_string()));
+            if let Some(mp) = mount_path {
+                full_config.insert(
+                    "mount_path".to_string(),
+                    toml::Value::String(mp.to_string()),
+                );
+            }
+            full_config.extend(SmbSettings::prompt()?.into_table());
+            let config_str = toml::to_string_pretty(&full_config)?;
+            std::fs::write(&config_path, &config_str)?;
+        }
         "gdrive" => {
             // Use CLI flags if provided, otherwise prompt interactively.
             let client_id = if let Some(cid) = cli_client_id {
@@ -459,7 +474,7 @@ pub fn backend_add(
         "gdrive" => {
             println!("\nRun `cascade backend auth {backend_name}` to authenticate.");
         }
-        "s3" => {}
+        "s3" | "smb" => {}
         _ => {
             println!("\nEdit {} to add credentials.", config_path.display());
         }
@@ -587,6 +602,7 @@ fn backend_type_display(backend_type: &str) -> &str {
         "gdrive" => "Google Drive",
         "s3" => "S3 Compatible",
         "p2p" => "P2P",
+        "smb" => "SMB",
         _ => backend_type,
     }
 }

@@ -457,6 +457,18 @@ impl StateDb {
             .optional()?)
     }
 
+    /// Return the id of the backend holding the item with the given uid.
+    pub fn replica_item_backend(&self, uid: u64) -> Result<Option<String>> {
+        let conn = self.lock_conn()?;
+        Ok(conn
+            .query_row(
+                "SELECT backend_id FROM replica_items WHERE uid = ?1",
+                [id_to_sql(uid)?],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     /// Return the child of a folder with the given name.
     pub fn replica_child(&self, parent_uid: u64, name: &str) -> Result<Option<ReplicaItem>> {
         let conn = self.lock_conn()?;

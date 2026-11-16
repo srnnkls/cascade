@@ -1,7 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::ops::Range;
-use std::path::Path;
 
 use chrono::DateTime;
 
@@ -26,7 +25,6 @@ fn insert(db: &StateDb, uid: u64, size: u64) -> ObjectId {
         content_version: "v1",
         source_revision: &source,
         size,
-        cache_path: Path::new("/cache/objects/x"),
     })
     .unwrap()
 }
@@ -52,7 +50,6 @@ fn inserted_object_round_trips_as_partial_and_clean() {
     assert_eq!(object.content_version, "v1");
     assert_eq!(object.source_revision, revision("stable-3"));
     assert_eq!(object.size, 100);
-    assert_eq!(object.cache_path, Path::new("/cache/objects/x"));
     assert_eq!(object.state, ContentState::Partial);
     assert!(!object.dirty);
     assert_eq!(object.upload, None);

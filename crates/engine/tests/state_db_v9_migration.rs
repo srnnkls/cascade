@@ -230,7 +230,6 @@ fn v8_database_migrates_to_v9_with_existing_rows_intact() {
             "uid",
             "content_version",
             "size",
-            "cache_path",
             "state",
             "dirty",
             "upload_temp_name",

@@ -130,6 +130,7 @@ async fn daemon_wired_node_accepts_authorised_management_over_the_wire() {
             mount_point: node_data.path().join("mnt"),
             backends,
             cache_dir: None,
+            staging_dir: None,
             enable_p2p: false,
             p2p_data_dir: None,
             p2p_posture: None,

@@ -90,11 +90,13 @@ pub(super) async fn try_fileprovider(
     use cascade_presenter_fileprovider::engine_handlers::EngineHandlers;
     use cascade_presenter_fileprovider::server::FileProviderServer;
 
+    let paths = ctx.app_paths().context("resolve File Provider paths")?;
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
         mount_point: mount_path.to_path_buf(),
         backends,
-        cache_dir: None,
+        cache_dir: Some(paths.cache_dir.clone()),
+        staging_dir: Some(paths.staging_dir.clone()),
         enable_p2p: p2p.enable_p2p,
         p2p_data_dir: None,
         p2p_posture: p2p.posture,
@@ -116,7 +118,6 @@ pub(super) async fn try_fileprovider(
     // The File Provider RPC server answers inbound queries from the Swift
     // extension against the engine's live VFS, state DB, cache directory,
     // and change feed.
-    let paths = ctx.app_paths().context("resolve File Provider paths")?;
     let socket_path = paths.bindable_socket_path()?.to_path_buf();
     ensure_directory(&paths.cache_dir, "File Provider cache directory")?;
     ensure_directory(&paths.staging_dir, "File Provider staging directory")?;

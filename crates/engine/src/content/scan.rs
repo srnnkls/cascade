@@ -4,9 +4,7 @@ use std::collections::HashSet;
 
 use anyhow::Result;
 
-use super::replica::{Replica, ReplicaItem};
-use crate::backend::BackendError;
-use crate::types::{FileEntry, Revision};
+use super::replica::Replica;
 
 /// Rescan every listed folder and every folder holding a materialised item or
 /// a cached object, parents first.
@@ -29,40 +27,10 @@ pub async fn scan(replica: &Replica) -> Result<bool> {
     let mut listed = Vec::new();
     let mut visited = HashSet::new();
     for folder_uid in db.replica_scan_folders(replica.backend_id())? {
-        let mut next = db.replica_item(folder_uid)?;
-        while let Some(folder) = next.take() {
-            if !visited.insert(folder.uid) {
-                break;
-            }
-            match fetch_existing(replica, &folder).await? {
-                Some(children) => {
-                    let seen =
-                        db.upsert_replica_children(replica.backend_id(), folder.uid, &children)?;
-                    listed.push((folder.uid, seen));
-                }
-                None => {
-                    next = match folder.parent_uid {
-                        Some(parent_uid) => db.replica_item(parent_uid)?,
-                        None => None,
-                    };
-                }
-            }
-        }
+        listed.extend(replica.list_existing(folder_uid, &mut visited).await?);
     }
     for (folder_uid, seen) in listed {
         db.remove_replica_children_except(folder_uid, &seen)?;
     }
     Ok(db.replica_meta()?.revision != before)
-}
-
-/// The children of `folder`, or `None` when the folder is gone on the backend.
-async fn fetch_existing(
-    replica: &Replica,
-    folder: &ReplicaItem,
-) -> Result<Option<Vec<(FileEntry, Revision)>>> {
-    match replica.fetch_children(folder).await {
-        Ok(children) => Ok(Some(children)),
-        Err(err) if matches!(err.downcast_ref(), Some(BackendError::NotFound(_))) => Ok(None),
-        Err(err) => Err(err),
-    }
 }

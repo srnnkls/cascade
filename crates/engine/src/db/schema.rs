@@ -462,7 +462,6 @@ fn v9_replica_and_content(conn: &Connection) -> Result<()> {
             source_mtime      INTEGER,
             source_ctime      INTEGER,
             size              INTEGER NOT NULL,
-            cache_path        TEXT NOT NULL,
             state             TEXT NOT NULL DEFAULT 'partial',
             dirty             BOOLEAN NOT NULL DEFAULT FALSE,
             upload_temp_name  TEXT,
