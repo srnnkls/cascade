@@ -349,3 +349,104 @@ async fn a_local_save_wins_over_a_remote_change_made_after_open() {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy)]
+enum LocalEdit {
+    FileProviderSave,
+    NfsWriteInPlace,
+}
+
+const LOCAL_EDIT: &[u8] = b"local edit";
+
+#[tokio::test(start_paused = true)]
+async fn ac21_a_file_deleted_on_the_nas_after_open_is_recreated_with_the_local_edit() {
+    for edit in [LocalEdit::FileProviderSave, LocalEdit::NfsWriteInPlace] {
+        for seed in SEEDS {
+            let share = Arc::new(MockBackend::new(seed));
+            share.add_file(TARGET, b"original");
+            share.add_file("docs/other.txt", b"other");
+            let (_root, disk) = disk();
+            let daemon = start(&disk, recording(&share)).await;
+            let uid = uid_of(&daemon, TARGET).await;
+            daemon.cache.fetch(uid, None).await.unwrap();
+
+            share.remove(TARGET).unwrap();
+            match edit {
+                LocalEdit::FileProviderSave => {
+                    save(&daemon, uid, LOCAL_EDIT).await;
+                }
+                LocalEdit::NfsWriteInPlace => {
+                    daemon.cache.write_at(uid, 0, LOCAL_EDIT).await.unwrap();
+                }
+            }
+            tokio::time::sleep(SETTLE).await;
+
+            assert_eq!(
+                share.content(Path::new(TARGET)).as_deref(),
+                Some(LOCAL_EDIT),
+                "{edit:?} {seed}: the NAS does not hold the local edit"
+            );
+            assert_eq!(
+                remote_names(&share, "docs").await,
+                ["other.txt", "report.txt"],
+                "{edit:?} {seed}: one file of the name and no temporary file"
+            );
+            assert_eq!(
+                daemon.resolve(TARGET).await.unwrap(),
+                Some(uid),
+                "{edit:?} {seed}: the recreated file has another uid"
+            );
+            assert_clean(&daemon, uid);
+        }
+    }
+}
+
+#[test]
+fn d008_a_marked_delete_unreachable_at_recovery_completes_once_the_nas_returns() {
+    for seed in SEEDS {
+        let share = Arc::new(MockBackend::new(seed));
+        share.add_file(TARGET, b"original");
+        share.add_file("docs/other.txt", b"other");
+        let (_root, disk) = disk();
+
+        let uid = runtime().block_on(async {
+            let daemon = start(&disk, recording(&share)).await;
+            let uid = uid_of(&daemon, TARGET).await;
+            let held = share.stop_at(MockOp::Delete);
+            let cache = daemon.cache.clone();
+            tokio::spawn(async move { cache.delete(uid).await });
+            held.reached().await;
+            uid
+        });
+        let (db, _) = disk.replicas().unwrap();
+        assert_eq!(
+            db.replica_deletes().unwrap(),
+            [uid],
+            "{seed}: the kill left no marked delete"
+        );
+        assert!(share.content(Path::new(TARGET)).is_some(), "{seed}");
+
+        let restarted = recording(&share);
+        runtime().block_on(async {
+            share.inject(MockOp::Delete, Fault::Unreachable);
+            let daemon = start(&disk, restarted.clone()).await;
+            assert!(
+                share.content(Path::new(TARGET)).is_some(),
+                "{seed}: the injected fault was not taken at recovery"
+            );
+            tokio::time::sleep(SETTLE).await;
+
+            assert_eq!(
+                share.content(Path::new(TARGET)),
+                None,
+                "{seed}: the marked delete was not completed once the NAS returned"
+            );
+            assert_eq!(remote_names(&share, "docs").await, ["other.txt"], "{seed}");
+            assert!(
+                daemon.db.replica_deletes().unwrap().is_empty(),
+                "{seed}: the delete mark was not cleared"
+            );
+            assert_eq!(daemon.store.item(uid).unwrap(), None, "{seed}");
+        });
+    }
+}

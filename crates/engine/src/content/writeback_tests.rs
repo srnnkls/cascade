@@ -7,15 +7,19 @@
 //! and the cases of `resources/writeback-cases.md` and the write-back rows of
 //! the design's Verification table follow.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use super::{TRANSITIONS, Transition, WriteBackEvent as E, WriteBackState as S};
+use super::{
+    MAX_UPLOAD_DELAY, TRANSITIONS, Transition, WRITE_BACK_DELAY, WriteBackEvent as E,
+    WriteBackState as S,
+};
 use crate::backend::{Backend, TransientError};
+use crate::content::ObjectId;
 use crate::content::replica::{ReplicaItem, is_temp_upload};
 use crate::content::scan::scan;
 use crate::content::transfer::TransferConfig;
@@ -224,6 +228,7 @@ struct Case {
     share: Arc<MockBackend>,
     disk: Disk,
     log: BackendLog,
+    objects: PathBuf,
     _root: tempfile::TempDir,
 }
 
@@ -237,6 +242,7 @@ impl Case {
             share,
             disk: Disk::at(root.path(), TransferConfig::default()).unwrap(),
             log: BackendLog::default(),
+            objects: root.path().join("cache"),
             _root: root,
         }
     }
@@ -450,6 +456,9 @@ kill_tests! {
     kill_deleting_delete_failed_dirty: Deleting DeleteFailed Dirty => deleting_delete_failed_dirty;
     kill_deleting_restart: Deleting Restart Deleted => deleting_restart;
     kill_deleted_restart: Deleted Restart Deleted => deleted_restart;
+    kill_deleting_restart_deleting: Deleting Restart Deleting => deleting_restart_deleting;
+    kill_deleting_timer_due_deleted: Deleting TimerDue Deleted => deleting_timer_due_deleted;
+    kill_deleting_timer_due_deleting: Deleting TimerDue Deleting => deleting_timer_due_deleting;
 }
 
 fn clean_save(seed: u64) {
@@ -2532,4 +2541,344 @@ fn deleting_delete_failed_editing(seed: u64) {
     });
     case.restart_and_settle(uid, &at(TARGET, WRITTEN));
     assert_eq!(placed(&case.log), [WRITTEN], "{seed}");
+}
+
+const CHANGING_OPS: [MockOp; 5] = [
+    MockOp::Upload,
+    MockOp::Update,
+    MockOp::CreateDir,
+    MockOp::Move,
+    MockOp::Replace,
+];
+
+impl Case {
+    fn object_file(&self, object_id: ObjectId) -> PathBuf {
+        self.objects.join(object_id.to_string())
+    }
+
+    /// Durable state of a marked, unapplied delete of a target holding [`EDIT`].
+    fn assert_delete_pending(&self, uid: u64) -> Vec<ObjectId> {
+        let seed = self.seed;
+        let (db, store) = self.disk.replicas().unwrap();
+        assert_eq!(db.replica_deletes().unwrap(), [uid], "{seed}: mark");
+        assert_eq!(
+            self.share.content(Path::new(TARGET)).as_deref(),
+            Some(ORIGINAL),
+            "{seed}: the backend file"
+        );
+        assert!(store.item(uid).unwrap().is_some(), "{seed}: replica row");
+        let objects = db.content_objects_of(uid).unwrap();
+        let dirty = objects
+            .iter()
+            .find(|object| object.dirty)
+            .unwrap_or_else(|| panic!("{seed}: the dirty object is kept"));
+        assert_eq!(
+            std::fs::read(self.object_file(dirty.object_id)).unwrap(),
+            EDIT,
+            "{seed}: object file"
+        );
+        objects.iter().map(|object| object.object_id).collect()
+    }
+
+    fn assert_delete_finished(&self, uid: u64, objects: &[ObjectId]) {
+        let seed = self.seed;
+        let (db, store) = self.disk.replicas().unwrap();
+        assert!(
+            db.replica_deletes().unwrap().is_empty(),
+            "{seed}: mark left"
+        );
+        assert_eq!(self.share.content(Path::new(TARGET)), None, "{seed}");
+        assert!(store.item(uid).unwrap().is_none(), "{seed}: replica row");
+        assert!(db.content_objects_of(uid).unwrap().is_empty(), "{seed}");
+        for object in objects {
+            assert!(
+                !self.object_file(*object).exists(),
+                "{seed}: object file {object} left"
+            );
+        }
+    }
+
+    fn assert_only_deletes(&self) {
+        for op in CHANGING_OPS {
+            assert_eq!(calls(&self.log, op), 0, "{}: {op:?} issued", self.seed);
+        }
+    }
+
+    async fn restart_with_delete_unreachable(&self, backend: Arc<Recording>) -> Daemon {
+        self.share.inject(MockOp::Delete, Fault::Unreachable);
+        let deletes = calls(&self.log, MockOp::Delete);
+        let daemon = self.disk.start(backend).await.unwrap();
+        assert_eq!(
+            calls(&self.log, MockOp::Delete),
+            deletes + 1,
+            "{}: recovery issued no delete",
+            self.seed
+        );
+        daemon
+    }
+}
+
+/// Saves [`EDIT`], kills while the delete of the item `deleted` picks is held.
+fn kill_during_delete(case: &Case, deleted: fn(&Daemon, u64) -> u64) -> u64 {
+    runtime().block_on(async {
+        let (daemon, uid) = case.start(case.recording()).await;
+        daemon.save(uid, EDIT).await;
+        let held = case.share.stop_at(MockOp::Delete);
+        let _deleting = daemon.spawn_delete(deleted(&daemon, uid));
+        held.reached().await;
+        uid
+    })
+}
+
+const fn the_item(_: &Daemon, uid: u64) -> u64 {
+    uid
+}
+
+fn its_folder(daemon: &Daemon, uid: u64) -> u64 {
+    daemon.folder_uid(uid)
+}
+
+/// When each of `count` further calls of `op` was seen, within 100 ms.
+async fn call_times(log: &BackendLog, op: MockOp, count: usize) -> Vec<Instant> {
+    let before = calls(log, op);
+    let deadline = Instant::now() + SETTLE;
+    let mut times = Vec::new();
+    while times.len() < count {
+        assert!(Instant::now() < deadline, "timed out waiting for {op:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let made = calls(log, op) - before;
+        while times.len() < made {
+            times.push(Instant::now());
+        }
+    }
+    times
+}
+
+fn deleting_restart_deleting(seed: u64) {
+    let case = Case::new(seed);
+    let uid = kill_during_delete(&case, the_item);
+    let objects = case.assert_delete_pending(uid);
+    runtime().block_on(async {
+        case.restart_with_delete_unreachable(case.recording()).await;
+    });
+    assert_eq!(case.assert_delete_pending(uid), objects, "{seed}");
+    case.restart_and_settle(uid, &Outcome::Gone);
+    case.assert_delete_finished(uid, &objects);
+    case.assert_only_deletes();
+}
+
+/// Kill after the retried backend delete applied, before the local state went.
+fn deleting_timer_due_deleted(seed: u64) {
+    let case = Case::new(seed);
+    let uid = kill_during_delete(&case, the_item);
+    let objects = case.assert_delete_pending(uid);
+    runtime().block_on(async {
+        let killed = Recording::freezing_after(&case.share, &case.log, MockOp::Delete);
+        case.restart_with_delete_unreachable(Arc::clone(&killed))
+            .await;
+        let recovered = Instant::now();
+        killed.frozen().await;
+        let waited = recovered.elapsed();
+        assert!(
+            waited >= WRITE_BACK_DELAY && waited <= WRITE_BACK_DELAY + Duration::from_secs(1),
+            "{seed}: the retry came after {waited:?}"
+        );
+    });
+    let (db, store) = case.disk.replicas().unwrap();
+    assert_eq!(db.replica_deletes().unwrap(), [uid], "{seed}: mark");
+    assert_eq!(case.share.content(Path::new(TARGET)), None, "{seed}");
+    assert!(store.item(uid).unwrap().is_some(), "{seed}: replica row");
+    for object in &objects {
+        assert!(
+            case.object_file(*object).exists(),
+            "{seed}: object {object}"
+        );
+    }
+    drop((db, store));
+    case.restart_and_settle(uid, &Outcome::Gone);
+    case.assert_delete_finished(uid, &objects);
+    case.assert_only_deletes();
+}
+
+fn deleting_timer_due_deleting(seed: u64) {
+    let case = Case::new(seed);
+    let uid = kill_during_delete(&case, the_item);
+    let objects = case.assert_delete_pending(uid);
+    let mut expected = vec![WRITE_BACK_DELAY];
+    while expected.last() != Some(&MAX_UPLOAD_DELAY) {
+        let next = expected
+            .last()
+            .unwrap()
+            .saturating_mul(2)
+            .min(MAX_UPLOAD_DELAY);
+        expected.push(next);
+    }
+    expected.push(MAX_UPLOAD_DELAY);
+    runtime().block_on(async {
+        for _ in &expected {
+            case.share.inject(MockOp::Delete, Fault::Unreachable);
+        }
+        case.restart_with_delete_unreachable(case.recording()).await;
+        let mut previous = Instant::now();
+        let mut gaps = Vec::new();
+        for at in call_times(&case.log, MockOp::Delete, expected.len()).await {
+            gaps.push(at - previous);
+            previous = at;
+        }
+        let slack = Duration::from_secs(1);
+        for (gap, delay) in gaps.iter().zip(&expected) {
+            assert!(
+                *gap + slack >= *delay && *gap <= *delay + slack,
+                "{seed}: retry gaps {gaps:?}, expected {expected:?}"
+            );
+        }
+    });
+    assert_eq!(case.assert_delete_pending(uid), objects, "{seed}");
+    case.restart_and_settle(uid, &Outcome::Gone);
+    case.assert_delete_finished(uid, &objects);
+    case.assert_only_deletes();
+}
+
+/// FR-7: a delete that fails clears the mark; the retry due meanwhile deletes nothing.
+#[test]
+fn overlap_delete_retry_during_a_failing_delete() {
+    for seed in SEEDS {
+        let case = Case::new(seed);
+        let uid = kill_during_delete(&case, the_item);
+        runtime().block_on(async {
+            let daemon = case.restart_with_delete_unreachable(case.recording()).await;
+            let held = case.share.stop_at(MockOp::Metadata);
+            case.share.inject(MockOp::Delete, Fault::Unreachable);
+            let deleting = daemon.spawn_delete(uid);
+            held.reached().await;
+            tokio::time::sleep(WRITE_BACK_DELAY + Duration::from_secs(1)).await;
+            held.release();
+            assert!(deleting.await.unwrap().is_err(), "{seed}");
+            let deletes = calls(&case.log, MockOp::Delete);
+            tokio::time::sleep(SETTLE).await;
+            assert_eq!(
+                calls(&case.log, MockOp::Delete),
+                deletes,
+                "{seed}: the timer deleted the item"
+            );
+            assert!(daemon.db.replica_deletes().unwrap().is_empty(), "{seed}");
+            case.assert_outcome(&daemon, uid, &at(TARGET, EDIT)).await;
+        });
+        assert_eq!(placed(&case.log), [EDIT], "{seed}");
+    }
+}
+
+async fn assert_not_resurrected(case: &Case, daemon: &Daemon, uid: u64) {
+    let seed = case.seed;
+    daemon.scan().await;
+    assert!(daemon.item(uid).is_none(), "{seed}: scan resurrected");
+    let folder = daemon
+        .replica()
+        .unwrap()
+        .resolve(Path::new(FOLDER))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        daemon.db.replica_children(folder).unwrap().is_empty(),
+        "{seed}: the deleted file is listed under another uid"
+    );
+}
+
+/// FR-8: a scan that listed the item before the retry deleted it does not bring it back.
+#[test]
+fn overlap_delete_retry_after_a_scan_listed_the_item() {
+    for seed in SEEDS {
+        let case = Case::new(seed);
+        let uid = kill_during_delete(&case, the_item);
+        runtime().block_on(async {
+            let backend = case.recording();
+            let daemon = case
+                .restart_with_delete_unreachable(Arc::clone(&backend))
+                .await;
+            let listed = backend.pause_after(MockOp::ListChildren);
+            let scanning = daemon.spawn_scan();
+            listed.reached.notified().await;
+            tokio::time::sleep(WRITE_BACK_DELAY + Duration::from_secs(1)).await;
+            assert_eq!(
+                case.share.content(Path::new(TARGET)),
+                None,
+                "{seed}: the retry waited for the scan"
+            );
+            listed.released.notify_one();
+            scanning.await.unwrap().unwrap();
+            assert_not_resurrected(&case, &daemon, uid).await;
+            tokio::time::sleep(SETTLE).await;
+            case.assert_outcome(&daemon, uid, &Outcome::Gone).await;
+        });
+        case.assert_only_deletes();
+    }
+}
+
+/// FR-8: a scan seeing the item while the retried delete is held keeps the delete.
+#[test]
+fn overlap_delete_retry_held_while_a_scan_runs() {
+    for seed in SEEDS {
+        let case = Case::new(seed);
+        let uid = kill_during_delete(&case, the_item);
+        runtime().block_on(async {
+            let daemon = case.restart_with_delete_unreachable(case.recording()).await;
+            let held = case.share.stop_at(MockOp::Delete);
+            held.reached().await;
+            daemon.scan().await;
+            held.release();
+            until("the retried delete", || {
+                case.share.content(Path::new(TARGET)).is_none()
+            })
+            .await;
+            let_run().await;
+            assert_not_resurrected(&case, &daemon, uid).await;
+            tokio::time::sleep(SETTLE).await;
+            case.assert_outcome(&daemon, uid, &Outcome::Gone).await;
+        });
+        case.assert_only_deletes();
+    }
+}
+
+/// FR-8: a save into the marked item does not undo the delete it follows.
+#[test]
+fn overlap_save_into_the_marked_item_before_the_delete_retry() {
+    for seed in SEEDS {
+        let case = Case::new(seed);
+        let uid = kill_during_delete(&case, the_item);
+        let objects = case.assert_delete_pending(uid);
+        runtime().block_on(async {
+            let daemon = case.restart_with_delete_unreachable(case.recording()).await;
+            daemon.save(uid, SECOND).await;
+            tokio::time::sleep(SETTLE).await;
+            case.assert_outcome(&daemon, uid, &Outcome::Gone).await;
+        });
+        case.assert_delete_finished(uid, &objects);
+        case.assert_only_deletes();
+    }
+}
+
+/// FR-8: a save into a file of a marked folder neither recreates nor uploads.
+#[test]
+fn overlap_save_into_the_marked_subtree_before_the_delete_retry() {
+    for seed in SEEDS {
+        let case = Case::new(seed);
+        let uid = kill_during_delete(&case, its_folder);
+        runtime().block_on(async {
+            let daemon = case.restart_with_delete_unreachable(case.recording()).await;
+            let folder = daemon.folder_uid(uid);
+            assert_eq!(daemon.db.replica_deletes().unwrap(), [folder], "{seed}");
+            daemon.save(uid, SECOND).await;
+            tokio::time::sleep(SETTLE).await;
+            assert!(
+                case.share.metadata(Path::new(FOLDER)).await.is_err(),
+                "{seed}: the deleted folder was recreated"
+            );
+            assert!(daemon.dirty_objects().is_empty(), "{seed}");
+            assert!(daemon.item(uid).is_none(), "{seed}: file kept");
+            assert!(daemon.item(folder).is_none(), "{seed}: folder kept");
+            assert!(daemon.db.replica_deletes().unwrap().is_empty(), "{seed}");
+        });
+        case.assert_only_deletes();
+    }
 }

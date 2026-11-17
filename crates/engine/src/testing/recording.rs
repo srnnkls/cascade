@@ -329,7 +329,9 @@ impl Backend for RecordingBackend {
 
     async fn list_children(&self, parent_native_id: &str) -> anyhow::Result<Vec<FileEntry>> {
         self.note(MockOp::ListChildren);
-        self.inner.list_children(parent_native_id).await
+        let children = self.inner.list_children(parent_native_id).await?;
+        self.applied(MockOp::ListChildren).await?;
+        Ok(children)
     }
 
     async fn revision(&self, entry: &FileEntry) -> anyhow::Result<Revision> {
