@@ -311,3 +311,35 @@ func aCompletionHandlerRunsExactlyOnceIncludingUnderCancellation() async throws 
     #expect(cancelled.count == 1, "the operation finishing after cancellation completes again")
     #expect(racing.allSatisfy { $0.count == 1 }, "a completion racing a cancel runs twice")
 }
+
+@Test(.timeLimit(.minutes(1)))
+func cancelReturnsOnlyAfterTheCompletionRanWithUserCancelledAndTheOperationIsCancelled() async throws {
+    for round in 0 ..< 20 {
+        let recorder = Recorder()
+        let started = Gate()
+        let release = Gate()
+        let cancelledWhenReleased = Locked<Bool?>(nil)
+        let progress = completeOnce({ recorder.record($0) }) {
+            started.open()
+            await release.wait()
+            cancelledWhenReleased.update { $0 = Task.isCancelled }
+            return "late"
+        }
+        await started.wait()
+
+        progress.cancel()
+        let completedAtCancel = recorder.count
+        release.open()
+
+        #expect(completedAtCancel == 1, "round \(round): the completion had not run when cancel returned")
+        switch await recorder.first() {
+        case let .failure(error)?:
+            let error = error as NSError
+            #expect(error.domain == NSCocoaErrorDomain && error.code == CocoaError.Code.userCancelled.rawValue)
+        default:
+            Issue.record("round \(round): cancellation did not complete with userCancelled")
+        }
+        #expect(await eventually { cancelledWhenReleased.value != nil })
+        #expect(cancelledWhenReleased.value == true, "round \(round): the operation ran on uncancelled")
+    }
+}

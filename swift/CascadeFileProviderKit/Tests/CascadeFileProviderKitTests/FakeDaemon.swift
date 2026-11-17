@@ -40,7 +40,7 @@ final class FakeDaemon: @unchecked Sendable {
     private var received: [WireRequest] = []
     private var withheld: [Int: Int32] = [:]
     private var accepted = 0
-    private var listener: Int32 = -1
+    private var stopped = false
 
     init(
         socketPath: String? = nil,
@@ -52,18 +52,23 @@ final class FakeDaemon: @unchecked Sendable {
         self.hello = hello
         self.respond = respond
         self.socketPath = socketPath ?? "/tmp/cfpk-\(UUID().uuidString.prefix(8)).sock"
-        listener = try Self.listen(at: self.socketPath)
-        let listener = listener
+        let listener = try Self.listen(at: self.socketPath)
         Thread.detachNewThread { [self] in
+            defer { close(listener) }
             while true {
                 let connection = accept(listener, nil, nil)
                 if connection < 0 { return }
-                var noSigPipe: Int32 = 1
-                setsockopt(connection, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
-                let number = lock.withLock {
+                let number: Int? = lock.withLock {
+                    if stopped { return nil }
                     accepted += 1
                     return accepted
                 }
+                guard let number else {
+                    close(connection)
+                    return
+                }
+                var noSigPipe: Int32 = 1
+                setsockopt(connection, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
                 Thread.detachNewThread { [self] in serve(connection, number: number) }
             }
         }
@@ -91,9 +96,15 @@ final class FakeDaemon: @unchecked Sendable {
         }
     }
 
+    /// Ends the accept loop. Only the accept thread closes the listener: a
+    /// descriptor closed here could be reused by another test's daemon while
+    /// the thread is about to accept on it again. A listening socket ignores
+    /// `shutdown` on Darwin, so a last connection wakes the thread.
     func stop() {
-        shutdown(listener, SHUT_RDWR)
-        close(listener)
+        lock.withLock { stopped = true }
+        if let wake = try? Self.connect(to: socketPath) {
+            close(wake)
+        }
         unlink(socketPath)
     }
 
@@ -150,8 +161,23 @@ final class FakeDaemon: @unchecked Sendable {
     }
 
     private static func listen(at path: String) throws -> Int32 {
-        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { throw POSIXError(.EIO) }
+        let fd = try socket(at: path) { fd, address, length in bind(fd, address, length) }
+        guard Darwin.listen(fd, 8) == 0 else {
+            close(fd)
+            throw POSIXError(.EADDRINUSE)
+        }
+        return fd
+    }
+
+    private static func connect(to path: String) throws -> Int32 {
+        try socket(at: path) { fd, address, length in Darwin.connect(fd, address, length) }
+    }
+
+    /// A new socket that `attach` binds or connects to `path`.
+    private static func socket(
+        at path: String,
+        _ attach: (Int32, UnsafePointer<sockaddr>, socklen_t) -> Int32
+    ) throws -> Int32 {
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
         let bytes = Array(path.utf8) + [0]
@@ -159,12 +185,17 @@ final class FakeDaemon: @unchecked Sendable {
             throw POSIXError(.ENAMETOOLONG)
         }
         withUnsafeMutableBytes(of: &address.sun_path) { $0.copyBytes(from: bytes) }
-        let bound = withUnsafePointer(to: &address) {
+        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw POSIXError(.EIO) }
+        let attached = withUnsafePointer(to: &address) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                attach(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
-        guard bound == 0, Darwin.listen(fd, 8) == 0 else { throw POSIXError(.EADDRINUSE) }
+        guard attached == 0 else {
+            close(fd)
+            throw POSIXError(.EADDRINUSE)
+        }
         return fd
     }
 
