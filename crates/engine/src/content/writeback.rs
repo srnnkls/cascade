@@ -129,10 +129,11 @@ const fn row(from: WriteBackState, event: WriteBackEvent, to: WriteBackState) ->
 /// - A reparent removes the temporary file of a dirty object from the folder
 ///   the item leaves and clears its record; an upload that finds its item
 ///   moved removes its temporary file and starts again.
-/// - A delete keeps the objects until the backend delete returned; write-back
+/// - A delete removes the temporary file of its dirty object before the item
+///   and keeps the objects until both backend deletes returned; write-back
 ///   skips a marked item and recovery finishes a marked delete. A marked
-///   delete recovery cannot finish keeps its mark and is retried by the
-///   item's timer with the upload retry delay.
+///   delete recovery cannot finish drops its mark and leaves the item as it
+///   was, with the timers of its dirty objects armed.
 /// - Recovery finishes a rename it finds under the target name by file id,
 ///   resumes a recorded temporary file that still exists and removes every
 ///   other temporary file in the scan set and the folders of dirty objects.
@@ -194,10 +195,12 @@ pub const TRANSITIONS: &[Transition] = {
         row(S::Deleting, E::DeleteFailed, S::Clean),
         row(S::Deleting, E::DeleteFailed, S::Dirty),
         row(S::Deleting, E::DeleteFailed, S::Editing),
+        row(S::Deleting, E::DeleteFailed, S::Recorded),
         row(S::Deleting, E::Restart, S::Deleted),
-        row(S::Deleting, E::Restart, S::Deleting),
-        row(S::Deleting, E::TimerDue, S::Deleted),
-        row(S::Deleting, E::TimerDue, S::Deleting),
+        row(S::Deleting, E::Restart, S::Clean),
+        row(S::Deleting, E::Restart, S::Dirty),
+        row(S::Deleting, E::Restart, S::Editing),
+        row(S::Deleting, E::Restart, S::Recorded),
         row(S::Deleted, E::Restart, S::Deleted),
     ]
 };
@@ -479,8 +482,7 @@ impl ContentCache {
         let writeback = &self.shared().writeback;
         for uid in self.db().replica_deletes()? {
             if let Err(error) = self.resume_delete(uid).await {
-                tracing::warn!(uid, error = %format!("{error:#}"), "delete deferred; retrying later");
-                writeback.add(uid);
+                tracing::warn!(uid, error = %format!("{error:#}"), "delete dropped");
             }
         }
         let mut sweeps: BTreeMap<u64, HashSet<String>> = BTreeMap::new();
@@ -533,8 +535,9 @@ impl ContentCache {
         Ok(())
     }
 
-    /// Finishes a delete whose mark survived a restart: the backend delete
-    /// when the item is still there, then its local state. An item no longer
+    /// Finishes a delete whose mark survived a restart: the backend steps of
+    /// [`ContentCache::delete`] for what is still there, then its local state. A delete that
+    /// fails drops the mark and leaves the item as it was. An item no longer
     /// marked is left as it is.
     async fn resume_delete(&self, uid: u64) -> Result<()> {
         let _operation = self.shared().writeback.lock(uid).await;
@@ -544,9 +547,16 @@ impl ContentCache {
         let Some(path) = self.item_path(uid)? else {
             return self.db().clear_replica_delete(uid);
         };
-        let replica = self.replica(uid)?;
-        self.remove_remote(&replica, &path).await?;
-        self.finish_delete(&replica, uid, &path).await
+        let outcome = async {
+            let replica = self.replica(uid)?;
+            self.delete_remote(&replica, uid, &path).await?;
+            self.finish_delete(uid).await
+        }
+        .await;
+        if outcome.is_err() {
+            self.db().clear_replica_delete(uid)?;
+        }
+        outcome
     }
 
     /// The item's object awaiting upload: dirty or edited.
@@ -577,7 +587,7 @@ impl ContentCache {
 
     async fn write_back(self, uid: u64) {
         let permit = self.shared().writeback.uploads.acquire().await;
-        let outcome = self.attempt(uid).await;
+        let outcome = self.upload(uid).await;
         drop(permit);
         if let Err(error) = &outcome {
             tracing::warn!(uid, error = %format!("{error:#}"), "upload failed; retrying later");
@@ -586,17 +596,6 @@ impl ContentCache {
             self.shared().working_set.raise();
         }
         self.shared().writeback.finish(uid, &outcome);
-    }
-
-    /// One attempt of the item's timer: the delete of an item marked by a
-    /// delete recovery could not finish, otherwise the upload of its dirty
-    /// object.
-    async fn attempt(&self, uid: u64) -> Result<Uploaded> {
-        if self.db().replica_deletes()?.contains(&uid) {
-            self.resume_delete(uid).await?;
-            return Ok(Uploaded::Gone);
-        }
-        self.upload(uid).await
     }
 
     /// One upload attempt of the item's dirty object.

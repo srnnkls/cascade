@@ -24,11 +24,11 @@ use cascade_presenter_nfs::nfs::v4::compound::handle_compound;
 use cascade_presenter_nfs::nfs::v4::state::StateManager;
 use cascade_presenter_nfs::nfs::v4::xdr as xdr4;
 use cascade_presenter_nfs::nfs::xdr::{
-    NFS3_OK, NFS3ERR_INVAL, NFS3ERR_IO, NFS3ERR_NOENT, NFS3ERR_ROFS, NFS3PROC_CREATE,
-    NFS3PROC_LOOKUP, NFS3PROC_MKDIR, NFS3PROC_READ, NFS3PROC_READDIR, NFS3PROC_REMOVE,
-    NFS3PROC_RENAME, NFS3PROC_SETATTR, NFS3PROC_WRITE, NfsFh3, decode_bool, decode_fh,
-    decode_string, decode_u32, decode_u64, encode_bool, encode_fh, encode_opaque, encode_string,
-    encode_u32, encode_u64,
+    NFS3_OK, NFS3ERR_INVAL, NFS3ERR_IO, NFS3ERR_NOENT, NFS3ERR_ROFS, NFS3ERR_STALE,
+    NFS3PROC_CREATE, NFS3PROC_LOOKUP, NFS3PROC_MKDIR, NFS3PROC_READ, NFS3PROC_READDIR,
+    NFS3PROC_REMOVE, NFS3PROC_RENAME, NFS3PROC_RMDIR, NFS3PROC_SETATTR, NFS3PROC_WRITE, NfsFh3,
+    decode_bool, decode_fh, decode_string, decode_u32, decode_u64, encode_bool, encode_fh,
+    encode_opaque, encode_string, encode_u32, encode_u64,
 };
 use tokio::task::JoinHandle;
 
@@ -272,6 +272,12 @@ impl Fixture {
 
     fn remove(&self, dir: &NfsFh3, name: &str) -> u32 {
         decode_u32(&self.v3(NFS3PROC_REMOVE, &dirop(dir, name)))
+            .unwrap()
+            .0
+    }
+
+    fn rmdir(&self, dir: &NfsFh3, name: &str) -> u32 {
+        decode_u32(&self.v3(NFS3PROC_RMDIR, &dirop(dir, name)))
             .unwrap()
             .0
     }
@@ -923,6 +929,152 @@ async fn rename_remove_and_mkdir_with_the_remote_unreachable_answer_io_and_apply
     assert_eq!(fixture.names_on_backend("docs").await, ["final.txt", "new"]);
 }
 
+/// RFC 1813 3.3.12 and 3.3.13: REMOVE and RMDIR of a name the directory
+/// does not hold answer NOENT and apply nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn remove_and_rmdir_of_a_missing_name_answer_noent() {
+    let fixture = Fixture::new(TransferConfig::default()).await;
+    fixture.mock.add_file("docs/report.txt", b"original");
+    let docs = fixture.walk("docs");
+
+    assert_eq!(
+        fixture.remove(&docs, "missing.txt"),
+        NFS3ERR_NOENT,
+        "REMOVE"
+    );
+    assert_eq!(fixture.rmdir(&docs, "missing"), NFS3ERR_NOENT, "RMDIR");
+
+    assert_eq!(fixture.log.calls(MockOp::Delete), 0);
+    assert_eq!(fixture.names_on_backend("docs").await, ["report.txt"]);
+}
+
+/// RFC 7530 16.25: v4 REMOVE of a name the directory does not hold answers
+/// NOENT.
+#[tokio::test(flavor = "multi_thread")]
+async fn v4_remove_of_a_missing_name_answers_noent() {
+    let fixture = Fixture::new(TransferConfig::default()).await;
+    fixture.mock.add_file("docs/report.txt", b"original");
+    let mut remove = Vec::new();
+    xdr4::encode_string(&mut remove, "missing.txt");
+
+    let (status, _) = fixture.v4_in_dir(NfsCacheMode::Minimal, "docs", (xdr4::OP_REMOVE, &remove));
+
+    assert_eq!(status, xdr4::NFS4ERR_NOENT);
+    assert_eq!(fixture.log.calls(MockOp::Delete), 0);
+}
+
+/// A directory handle the server does not know answers STALE, not NOENT.
+#[tokio::test(flavor = "multi_thread")]
+async fn remove_and_rmdir_under_a_directory_handle_the_server_does_not_know_answer_stale() {
+    let fixture = Fixture::new(TransferConfig::default()).await;
+    fixture.mock.add_file("docs/report.txt", b"original");
+    let stale = NfsFh3::from_item_id("4242424242");
+
+    assert_eq!(
+        fixture.remove(&stale, "missing.txt"),
+        NFS3ERR_STALE,
+        "REMOVE"
+    );
+    assert_eq!(fixture.rmdir(&stale, "missing"), NFS3ERR_STALE, "RMDIR");
+
+    assert_eq!(fixture.log.calls(MockOp::Delete), 0);
+}
+
+/// A root-level `report.txt` and `docs/report.txt`, and a directory handle
+/// the server never issued.
+async fn stale_handle_fixture() -> (Fixture, NfsFh3) {
+    let fixture = Fixture::new(TransferConfig::default()).await;
+    fixture.mock.add_file("report.txt", b"at the root");
+    fixture.mock.add_file("docs/report.txt", b"original");
+    (fixture, NfsFh3::from_item_id("4242424242"))
+}
+
+/// Asserts the root-level `report.txt` keeps its content and its item.
+async fn assert_root_report_untouched(fixture: &Fixture) {
+    assert_eq!(
+        fixture.on_backend("report.txt").as_deref(),
+        Some(b"at the root".as_slice())
+    );
+    assert!(
+        fixture
+            .daemon
+            .resolve("report.txt")
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// Asserts nothing named `name` exists at the export root, on the backend or
+/// in the replica.
+async fn assert_absent_at_root(fixture: &Fixture, name: &str) {
+    assert_eq!(fixture.on_backend(name), None, "{name} on the backend");
+    assert_eq!(
+        fixture.daemon.resolve(name).await.unwrap(),
+        None,
+        "{name} in the replica"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_under_a_directory_handle_the_server_does_not_know_answers_stale_and_creates_nothing()
+ {
+    let (fixture, stale) = stale_handle_fixture().await;
+
+    assert_eq!(fixture.create(&stale, "fresh.txt"), NFS3ERR_STALE);
+
+    assert_root_report_untouched(&fixture).await;
+    assert_absent_at_root(&fixture, "fresh.txt").await;
+    assert_eq!(fixture.log.calls(MockOp::Upload), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mkdir_under_a_directory_handle_the_server_does_not_know_answers_stale_and_creates_nothing()
+{
+    let (fixture, stale) = stale_handle_fixture().await;
+
+    assert_eq!(fixture.mkdir(&stale, "new"), NFS3ERR_STALE);
+
+    assert_root_report_untouched(&fixture).await;
+    assert_absent_at_root(&fixture, "new").await;
+    assert_eq!(fixture.log.calls(MockOp::CreateDir), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rename_from_a_directory_handle_the_server_does_not_know_answers_stale_and_moves_nothing() {
+    let (fixture, stale) = stale_handle_fixture().await;
+    let docs = fixture.walk("docs");
+
+    assert_eq!(
+        fixture.rename(&stale, "report.txt", &docs, "moved.txt"),
+        NFS3ERR_STALE
+    );
+
+    assert_root_report_untouched(&fixture).await;
+    assert_eq!(fixture.on_backend("docs/moved.txt"), None);
+    assert_eq!(fixture.lookup(&docs, "moved.txt").0, NFS3ERR_NOENT);
+    assert_eq!(fixture.log.calls(MockOp::Move), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rename_into_a_directory_handle_the_server_does_not_know_answers_stale_and_moves_nothing() {
+    let (fixture, stale) = stale_handle_fixture().await;
+    let docs = fixture.walk("docs");
+
+    assert_eq!(
+        fixture.rename(&docs, "report.txt", &stale, "report.txt"),
+        NFS3ERR_STALE
+    );
+
+    assert_root_report_untouched(&fixture).await;
+    assert_eq!(
+        fixture.on_backend("docs/report.txt").as_deref(),
+        Some(b"original".as_slice())
+    );
+    assert_eq!(fixture.lookup(&docs, "report.txt").0, NFS3_OK);
+    assert_eq!(fixture.log.calls(MockOp::Move), 0);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_write_while_the_remote_is_unreachable_is_accepted_and_uploaded_after_it_returns() {
     let fixture = Fixture::new(TransferConfig::default()).await;
@@ -1275,6 +1427,68 @@ fn open_create(name: &str) -> Vec<u8> {
     xdr4::encode_u32(&mut args, 0);
     xdr4::encode_string(&mut args, name);
     args
+}
+
+/// v4 handles carry their path; a handle the server never issued, empty or
+/// not UTF-8, names no directory that resolves to the export root.
+#[tokio::test(flavor = "multi_thread")]
+async fn v4_remove_create_and_rename_under_a_handle_the_server_never_issued_leave_the_root() {
+    let (fixture, _) = stale_handle_fixture().await;
+    let putfh = |data: &[u8]| {
+        let mut args = Vec::new();
+        xdr4::encode_opaque(&mut args, data);
+        args
+    };
+    let docs = putfh(b"/docs");
+    let mut remove = Vec::new();
+    xdr4::encode_string(&mut remove, "report.txt");
+    let mut mkdir = Vec::new();
+    xdr4::encode_u32(&mut mkdir, xdr4::NF4DIR);
+    xdr4::encode_string(&mut mkdir, "new");
+    xdr4::encode_attr_bitmap(&mut mkdir, &[]);
+    let open = open_create("fresh.txt");
+    let mut rename_out = Vec::new();
+    xdr4::encode_string(&mut rename_out, "report.txt");
+    xdr4::encode_string(&mut rename_out, "moved.txt");
+    let mut rename_in = Vec::new();
+    xdr4::encode_string(&mut rename_in, "report.txt");
+    xdr4::encode_string(&mut rename_in, "report.txt");
+
+    for handle in [b"/nowhere".as_slice(), b"", &[0xff, 0xfe, 0x00, 0x42]] {
+        let unknown = putfh(handle);
+        let compounds: [&[(u32, &[u8])]; 5] = [
+            &[(xdr4::OP_PUTFH, &unknown), (xdr4::OP_REMOVE, &remove)],
+            &[(xdr4::OP_PUTFH, &unknown), (xdr4::OP_CREATE, &mkdir)],
+            &[(xdr4::OP_PUTFH, &unknown), (xdr4::OP_OPEN, &open)],
+            &[
+                (xdr4::OP_PUTFH, &unknown),
+                (xdr4::OP_SAVEFH, &[]),
+                (xdr4::OP_PUTFH, &docs),
+                (xdr4::OP_RENAME, &rename_out),
+            ],
+            &[
+                (xdr4::OP_PUTFH, &docs),
+                (xdr4::OP_SAVEFH, &[]),
+                (xdr4::OP_PUTFH, &unknown),
+                (xdr4::OP_RENAME, &rename_in),
+            ],
+        ];
+        for ops in compounds {
+            assert_ne!(fixture.v4(ops), xdr4::NFS4_OK, "handle {handle:?}");
+        }
+    }
+
+    assert_root_report_untouched(&fixture).await;
+    for name in ["new", "fresh.txt", "moved.txt"] {
+        assert_absent_at_root(&fixture, name).await;
+    }
+    assert_eq!(
+        fixture.on_backend("docs/report.txt").as_deref(),
+        Some(b"original".as_slice())
+    );
+    assert_eq!(fixture.on_backend("docs/moved.txt"), None);
+    assert_eq!(fixture.log.calls(MockOp::Delete), 0);
+    assert_eq!(fixture.log.calls(MockOp::Move), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]

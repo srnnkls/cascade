@@ -1,9 +1,10 @@
 //! A [`Backend`] that forwards to a [`MockBackend`] and records what it
 //! applied.
 //!
-//! It can freeze forever after a chosen operation was applied, so that
-//! dropping the runtime kills the daemon right after it, or pause after it
-//! until released.
+//! It can freeze forever after a chosen operation, or the delete of a chosen
+//! path, was applied, so that dropping the runtime kills the daemon right
+//! after it, pause after it until released, or fail the delete of a chosen
+//! path.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -15,7 +16,7 @@ use async_trait::async_trait;
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
-use super::mock_backend::{MockBackend, MockOp};
+use super::mock_backend::{Fault, MockBackend, MockOp};
 use crate::backend::{Backend, TransientError};
 use crate::types::{Change, Cursor, FileEntry, FileId, Quota, Revision};
 
@@ -42,6 +43,7 @@ struct Entries {
     calls: HashMap<MockOp, usize>,
     replace_attempts: Vec<Instant>,
     fetched: Vec<Range<u64>>,
+    deleted: Vec<String>,
     uploading: usize,
     max_uploading: usize,
 }
@@ -85,6 +87,12 @@ impl BackendLog {
         self.entries().fetched.clone()
     }
 
+    /// Paths of the deletes the backend applied, in order.
+    #[must_use]
+    pub fn deleted(&self) -> Vec<String> {
+        self.entries().deleted.clone()
+    }
+
     /// The most uploads seen in flight at once.
     #[must_use]
     pub fn max_uploading(&self) -> usize {
@@ -106,9 +114,11 @@ pub struct RecordingBackend {
     id: String,
     log: BackendLog,
     freeze_after: Option<MockOp>,
+    freeze_after_delete_of: Mutex<Option<String>>,
     frozen: Notify,
     pause_after: Mutex<Option<(MockOp, Arc<Hold>)>>,
     fail_reply_after: Mutex<Option<MockOp>>,
+    fail_delete_of: Mutex<Vec<(String, Fault)>>,
 }
 
 impl RecordingBackend {
@@ -123,9 +133,11 @@ impl RecordingBackend {
             id: id.to_owned(),
             log: log.clone(),
             freeze_after: freeze,
+            freeze_after_delete_of: Mutex::new(None),
             frozen: Notify::new(),
             pause_after: Mutex::new(None),
             fail_reply_after: Mutex::new(None),
+            fail_delete_of: Mutex::new(Vec::new()),
         })
     }
 
@@ -145,6 +157,15 @@ impl RecordingBackend {
     #[must_use]
     pub fn freezing_after(inner: &Arc<MockBackend>, log: &BackendLog, op: MockOp) -> Arc<Self> {
         Self::with(inner, log, inner.id(), Some(op))
+    }
+
+    /// Freezes forever once the next delete of the root-relative `path` was
+    /// applied.
+    pub fn freeze_after_delete_of(&self, path: &str) {
+        *self
+            .freeze_after_delete_of
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(path.to_owned());
     }
 
     /// The log this backend records into.
@@ -177,6 +198,39 @@ impl RecordingBackend {
             .fail_reply_after
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(op);
+    }
+
+    /// Makes the next delete of the root-relative `path` take `fault`
+    /// before it reaches the backend.
+    pub fn fail_delete_of(&self, path: &str, fault: Fault) {
+        self.fail_delete_of
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((path.to_owned(), fault));
+    }
+
+    async fn delete_fault(&self, path: &str) -> anyhow::Result<()> {
+        let fault = {
+            let mut faults = self
+                .fail_delete_of
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            faults
+                .iter()
+                .position(|(failing, _)| failing == path)
+                .map(|at| faults.remove(at).1)
+        };
+        match fault {
+            Some(Fault::Unreachable) => {
+                Err(TransientError::Unreachable(format!("delete of {path}")).into())
+            }
+            Some(Fault::Busy) => Err(TransientError::Busy(format!("delete of {path}")).into()),
+            Some(Fault::Delay(delay)) => {
+                tokio::time::sleep(delay).await;
+                Ok(())
+            }
+            None => Ok(()),
+        }
     }
 
     fn note(&self, op: MockOp) {
@@ -307,7 +361,19 @@ impl Backend for RecordingBackend {
 
     async fn delete(&self, file: &FileEntry) -> anyhow::Result<()> {
         self.note(MockOp::Delete);
+        self.delete_fault(&file.path).await?;
         self.inner.delete(file).await?;
+        self.log.entries().deleted.push(file.path.clone());
+        let freezes = self
+            .freeze_after_delete_of
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take_if(|freezing| *freezing == file.path)
+            .is_some();
+        if freezes {
+            self.frozen.notify_one();
+            std::future::pending::<()>().await;
+        }
         self.applied(MockOp::Delete).await?;
         Ok(())
     }

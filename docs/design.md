@@ -1096,7 +1096,7 @@ NFS `WRITE` and size changes edit the object in place: the written range becomes
 
 A worker uploads a dirty object five seconds after its last save, up to four at once. The upload writes `.cascade-tmp-<uid>` in the target's folder, records the temporary name and file id on the object, and renames it over the target. After the rename the uid is re-linked to the new file id and the replica takes the renamed file's revision; the content version minted at the save stays. A failed upload, including `Access Denied` while another client holds the target open, is retried with a delay that doubles up to five minutes. Dirty objects survive restarts: start-up recovery finishes or resumes recorded uploads and removes stray `.cascade-tmp-*` files before the first scan.
 
-Renames, moves, deletes and folder creates run directly against the backend. While it is unreachable they fail with `serverUnreachable`; File Provider keeps the change pending and issues it again after the daemon signals `errorResolved`, which it does on the first successful backend call after an unreachable one. An NFS caller receives an I/O error.
+Renames, moves, deletes and folder creates run directly against the backend. While it is unreachable they fail with `serverUnreachable`; File Provider keeps the change pending and issues it again after the daemon signals `errorResolved`, which it does on the first successful backend call after an unreachable one. An NFS caller receives an I/O error. A delete is marked in `replica_deletes` for the duration of its backend calls, which remove the temporary upload of the item's unsent edit before the item itself, so a delete that fails leaves no temporary file behind; recovery after a restart finishes a marked delete when the backend answers and otherwise drops the mark, leaving the item as it was with its unsent edits still to be uploaded.
 
 ### Local edit wins
 
@@ -1429,7 +1429,7 @@ since the Unix epoch.
 | `content_ranges` | Present byte ranges per object, merged |
 | `content_written` | Ranges written in place through NFS into an `edited` object |
 | `materialized_items` | Items the system reports as on disk |
-| `replica_deletes` | Items whose backend delete was issued and whose local state is not yet removed |
+| `replica_deletes` | Items whose backend delete is in progress; recovery finishes the delete when the backend answers and drops the mark when it cannot be asked |
 
 ## CLI interface
 

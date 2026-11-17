@@ -916,10 +916,11 @@ impl ContentCache {
 
     /// Deletes the item with its descendants on the backend and in the
     /// replica. The item is marked as being deleted before the backend
-    /// delete, so write-back skips it and a restart finishes the delete;
-    /// its objects stay until the backend delete returned. A failed backend
-    /// delete clears the mark and leaves the item as it was. An unknown item
-    /// is already deleted.
+    /// steps, so write-back skips it and a restart finishes the delete; the
+    /// temporary file of its dirty object is removed before the item, and its
+    /// objects stay until both backend steps returned. A failure of either
+    /// step clears the mark and leaves the item as it was. An unknown item is
+    /// already deleted.
     ///
     /// # Errors
     ///
@@ -934,7 +935,7 @@ impl ContentCache {
             return Ok(());
         };
         self.db().mark_replica_delete(uid)?;
-        if let Err(error) = self.remove_remote(&replica, &path).await {
+        if let Err(error) = self.delete_remote(&replica, uid, &path).await {
             self.db().clear_replica_delete(uid)?;
             for object in self.db().subtree_content_objects(uid)? {
                 if object.dirty {
@@ -943,20 +944,25 @@ impl ContentCache {
             }
             return Err(error);
         }
-        self.finish_delete(&replica, uid, &path).await
+        self.finish_delete(uid).await
     }
 
-    /// Removes what is left of the item at `path` after its backend delete
-    /// returned: the temporary file of its dirty object, the write-back
-    /// timers, objects and replica items of its subtree, and the mark. Runs
-    /// under the item's operation lock.
-    pub(super) async fn finish_delete(
+    /// Removes the temporary file of the item's dirty object, then the item
+    /// at `path`, on the backend. Runs under the item's operation lock.
+    pub(super) async fn delete_remote(
         &self,
         replica: &Replica,
         uid: u64,
         path: &Path,
     ) -> Result<()> {
         self.remove_temp_upload(replica, uid, path).await?;
+        self.remove_remote(replica, path).await
+    }
+
+    /// Removes the local state of the item after its backend steps returned:
+    /// the write-back timers, objects and replica items of its subtree, and
+    /// the mark. Makes no backend call. Runs under the item's operation lock.
+    pub(super) async fn finish_delete(&self, uid: u64) -> Result<()> {
         let writeback = &self.shared.writeback;
         for object in self.db().subtree_content_objects(uid)? {
             writeback.remove(object.uid);

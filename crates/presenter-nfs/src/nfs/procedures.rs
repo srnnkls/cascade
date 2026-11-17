@@ -82,16 +82,6 @@ const fn write_error_status(err: WriteError) -> u32 {
     }
 }
 
-/// Resolve the VFS path for a directory file handle, defaulting to the export
-/// root when the handle is unknown (mirrors the read procedures).
-fn dir_path_for_fh(ctx: &NfsContext, fh: &NfsFh3) -> String {
-    let key = fh
-        .to_item_id()
-        .and_then(|id| id.parse::<u64>().ok())
-        .unwrap_or(0);
-    ctx.lookup_path(key).unwrap_or_else(|| "/".to_string())
-}
-
 /// NULL procedure — do nothing.
 const fn _handle_null() -> Vec<u8> {
     vec![]
@@ -426,7 +416,11 @@ fn handle_create(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
         NFS3_CREATE_EXCLUSIVE => CreateMode::Exclusive,
         _ => CreateMode::Unchecked,
     };
-    let parent_path = dir_path_for_fh(ctx, &dir_fh);
+    let Some(parent_path) = lookup_existing_path(ctx, &dir_fh) else {
+        encode_u32(&mut reply, NFS3ERR_STALE);
+        encode_wcc_data(&mut reply, &PostOpAttr::none());
+        return reply;
+    };
 
     match write::create_file(ctx, &parent_path, &name, create_mode) {
         Ok(child_path) => {
@@ -511,7 +505,11 @@ fn handle_mkdir(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
         encode_wcc_data(&mut reply, &PostOpAttr::none());
         return reply;
     };
-    let parent_path = dir_path_for_fh(ctx, &dir_fh);
+    let Some(parent_path) = lookup_existing_path(ctx, &dir_fh) else {
+        encode_u32(&mut reply, NFS3ERR_STALE);
+        encode_wcc_data(&mut reply, &PostOpAttr::none());
+        return reply;
+    };
 
     match write::make_dir(ctx, &parent_path, &name) {
         Ok(child_path) => {
@@ -557,7 +555,11 @@ fn handle_unlink(args: &[u8], ctx: &Arc<NfsContext>, expect_dir: bool) -> Vec<u8
         encode_wcc_data(&mut reply, &PostOpAttr::none());
         return reply;
     };
-    let parent_path = dir_path_for_fh(ctx, &dir_fh);
+    let Some(parent_path) = lookup_existing_path(ctx, &dir_fh) else {
+        encode_u32(&mut reply, NFS3ERR_STALE);
+        encode_wcc_data(&mut reply, &PostOpAttr::none());
+        return reply;
+    };
 
     match write::remove_entry(ctx, &parent_path, &name, expect_dir) {
         Ok(child_path) => {
@@ -569,8 +571,10 @@ fn handle_unlink(args: &[u8], ctx: &Arc<NfsContext>, expect_dir: bool) -> Vec<u8
             // A kind mismatch (file vs directory) is reported as `Invalid`. A
             // non-empty directory is refused by the backend's non-recursive
             // delete as `Conflict`, which for RMDIR maps to NFS3ERR_NOTEMPTY.
+            // The directory handle resolved, so a missing entry is the name's.
             let status = match (&e, expect_dir) {
                 (WriteError::Conflict, true) => NFS3ERR_NOTEMPTY,
+                (WriteError::NotFound, _) => NFS3ERR_NOENT,
                 _ => write_error_status(e),
             };
             encode_u32(&mut reply, status);
@@ -613,8 +617,15 @@ fn handle_rename(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
         return reply;
     };
 
-    let from_parent = dir_path_for_fh(ctx, &from_fh);
-    let to_parent = dir_path_for_fh(ctx, &to_fh);
+    let (Some(from_parent), Some(to_parent)) = (
+        lookup_existing_path(ctx, &from_fh),
+        lookup_existing_path(ctx, &to_fh),
+    ) else {
+        encode_u32(&mut reply, NFS3ERR_STALE);
+        encode_wcc_data(&mut reply, &PostOpAttr::none());
+        encode_wcc_data(&mut reply, &PostOpAttr::none());
+        return reply;
+    };
 
     match write::rename_entry(ctx, &from_parent, &from_name, &to_parent, &to_name) {
         Ok((src_path, _dst_path)) => {
@@ -1151,7 +1162,7 @@ mod write_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn rmdir_on_missing_directory_returns_stale() {
+    async fn rmdir_on_missing_directory_returns_noent() {
         let (ctx, _dir) = writable_ctx();
         let root_fh = NfsFh3::from_item_id(&ctx.root_key().to_string());
         let reply = call(
@@ -1160,6 +1171,47 @@ mod write_tests {
             &dirop_args(&root_fh, "ghost"),
             NfsCacheMode::Minimal,
         );
-        assert_eq!(decode_u32(&reply).unwrap().0, NFS3ERR_STALE);
+        assert_eq!(decode_u32(&reply).unwrap().0, NFS3ERR_NOENT);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mutations_under_a_directory_handle_the_server_does_not_know_answer_stale_and_leave_the_root()
+     {
+        let (ctx, dir) = writable_ctx();
+        std::fs::write(dir.path().join("report.txt"), b"at the root").unwrap();
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
+        std::fs::write(dir.path().join("docs/report.txt"), b"in docs").unwrap();
+        let docs_fh = fh_for(&ctx, "/docs");
+        let stale = NfsFh3::from_item_id("4242424242");
+        let mut rename_from_stale = dirop_args(&stale, "report.txt");
+        rename_from_stale.extend_from_slice(&dirop_args(&docs_fh, "moved.txt"));
+        let mut rename_into_stale = dirop_args(&docs_fh, "report.txt");
+        rename_into_stale.extend_from_slice(&dirop_args(&stale, "report.txt"));
+
+        for (what, proc, args) in [
+            ("CREATE", NFS3PROC_CREATE, create_args(&stale, "fresh.txt")),
+            ("MKDIR", NFS3PROC_MKDIR, mkdir_args(&stale, "new")),
+            ("RENAME from", NFS3PROC_RENAME, rename_from_stale),
+            ("RENAME into", NFS3PROC_RENAME, rename_into_stale),
+        ] {
+            let reply = call(&ctx, proc, &args, NfsCacheMode::Minimal);
+            assert_eq!(decode_u32(&reply).unwrap().0, NFS3ERR_STALE, "{what}");
+        }
+
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["docs", "report.txt"]);
+        assert_eq!(
+            std::fs::read(dir.path().join("report.txt")).unwrap(),
+            b"at the root"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("docs/report.txt")).unwrap(),
+            b"in docs"
+        );
+        assert!(!dir.path().join("docs/moved.txt").exists());
     }
 }

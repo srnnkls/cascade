@@ -642,6 +642,7 @@ fn handle_remove(
                 Err(e) => {
                     let status = match e {
                         WriteError::Conflict => NFS4ERR_NOTEMPTY,
+                        WriteError::NotFound => NFS4ERR_NOENT,
                         other => write_error_status(other),
                     };
                     op_status_reply(status)

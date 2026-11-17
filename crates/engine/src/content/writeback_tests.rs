@@ -14,10 +14,7 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use super::{
-    MAX_UPLOAD_DELAY, TRANSITIONS, Transition, WRITE_BACK_DELAY, WriteBackEvent as E,
-    WriteBackState as S,
-};
+use super::{TRANSITIONS, Transition, WRITE_BACK_DELAY, WriteBackEvent as E, WriteBackState as S};
 use crate::backend::{Backend, TransientError};
 use crate::content::ObjectId;
 use crate::content::replica::{ReplicaItem, is_temp_upload};
@@ -456,9 +453,11 @@ kill_tests! {
     kill_deleting_delete_failed_dirty: Deleting DeleteFailed Dirty => deleting_delete_failed_dirty;
     kill_deleting_restart: Deleting Restart Deleted => deleting_restart;
     kill_deleted_restart: Deleted Restart Deleted => deleted_restart;
-    kill_deleting_restart_deleting: Deleting Restart Deleting => deleting_restart_deleting;
-    kill_deleting_timer_due_deleted: Deleting TimerDue Deleted => deleting_timer_due_deleted;
-    kill_deleting_timer_due_deleting: Deleting TimerDue Deleting => deleting_timer_due_deleting;
+    kill_deleting_restart_clean: Deleting Restart Clean => deleting_restart_clean;
+    kill_deleting_restart_dirty: Deleting Restart Dirty => deleting_restart_dirty;
+    kill_deleting_restart_editing: Deleting Restart Editing => deleting_restart_editing;
+    kill_deleting_delete_failed_recorded: Deleting DeleteFailed Recorded => deleting_delete_failed_recorded;
+    kill_deleting_restart_recorded: Deleting Restart Recorded => deleting_restart_recorded;
 }
 
 fn clean_save(seed: u64) {
@@ -2543,13 +2542,8 @@ fn deleting_delete_failed_editing(seed: u64) {
     assert_eq!(placed(&case.log), [WRITTEN], "{seed}");
 }
 
-const CHANGING_OPS: [MockOp; 5] = [
-    MockOp::Upload,
-    MockOp::Update,
-    MockOp::CreateDir,
-    MockOp::Move,
-    MockOp::Replace,
-];
+/// Faults a backend that cannot take a delete at recovery answers with.
+const RECOVERY_FAULTS: [Fault; 2] = [Fault::Unreachable, Fault::Busy];
 
 impl Case {
     fn object_file(&self, object_id: ObjectId) -> PathBuf {
@@ -2580,42 +2574,46 @@ impl Case {
         objects.iter().map(|object| object.object_id).collect()
     }
 
-    fn assert_delete_finished(&self, uid: u64, objects: &[ObjectId]) {
+    /// Restarts with the backend failing the next delete with `fault`:
+    /// recovery tries the marked delete once and drops its mark.
+    async fn restart_with_delete_failing(&self, backend: Arc<Recording>, fault: Fault) -> Daemon {
         let seed = self.seed;
-        let (db, store) = self.disk.replicas().unwrap();
-        assert!(
-            db.replica_deletes().unwrap().is_empty(),
-            "{seed}: mark left"
-        );
-        assert_eq!(self.share.content(Path::new(TARGET)), None, "{seed}");
-        assert!(store.item(uid).unwrap().is_none(), "{seed}: replica row");
-        assert!(db.content_objects_of(uid).unwrap().is_empty(), "{seed}");
-        for object in objects {
-            assert!(
-                !self.object_file(*object).exists(),
-                "{seed}: object file {object} left"
-            );
-        }
-    }
-
-    fn assert_only_deletes(&self) {
-        for op in CHANGING_OPS {
-            assert_eq!(calls(&self.log, op), 0, "{}: {op:?} issued", self.seed);
-        }
-    }
-
-    async fn restart_with_delete_unreachable(&self, backend: Arc<Recording>) -> Daemon {
-        self.share.inject(MockOp::Delete, Fault::Unreachable);
+        self.share.inject(MockOp::Delete, fault);
         let deletes = calls(&self.log, MockOp::Delete);
         let daemon = self.disk.start(backend).await.unwrap();
         assert_eq!(
             calls(&self.log, MockOp::Delete),
             deletes + 1,
-            "{}: recovery issued no delete",
-            self.seed
+            "{seed} {fault:?}: recovery issued no delete"
+        );
+        assert!(
+            daemon.db.replica_deletes().unwrap().is_empty(),
+            "{seed} {fault:?}: recovery kept the mark of a delete it could not finish"
         );
         daemon
     }
+
+    /// Lets the daemon settle and checks that no delete reached the backend
+    /// meanwhile.
+    async fn settle_without_deletes(&self, what: &str) {
+        let deletes = calls(&self.log, MockOp::Delete);
+        tokio::time::sleep(SETTLE).await;
+        assert_eq!(
+            calls(&self.log, MockOp::Delete),
+            deletes,
+            "{} {what}: a delete no caller issued reached the backend",
+            self.seed
+        );
+    }
+}
+
+async fn assert_reads(daemon: &Daemon, uid: u64, data: &[u8], what: &str) {
+    let len = u32::try_from(data.len()).unwrap();
+    assert_eq!(
+        daemon.cache.read(uid, 0, len).await.unwrap(),
+        data,
+        "{what}"
+    );
 }
 
 /// Saves [`EDIT`], kills while the delete of the item `deleted` picks is held.
@@ -2638,130 +2636,161 @@ fn its_folder(daemon: &Daemon, uid: u64) -> u64 {
     daemon.folder_uid(uid)
 }
 
-/// When each of `count` further calls of `op` was seen, within 100 ms.
-async fn call_times(log: &BackendLog, op: MockOp, count: usize) -> Vec<Instant> {
-    let before = calls(log, op);
-    let deadline = Instant::now() + SETTLE;
-    let mut times = Vec::new();
-    while times.len() < count {
-        assert!(Instant::now() < deadline, "timed out waiting for {op:?}");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let made = calls(log, op) - before;
-        while times.len() < made {
-            times.push(Instant::now());
-        }
-    }
-    times
-}
-
-fn deleting_restart_deleting(seed: u64) {
-    let case = Case::new(seed);
-    let uid = kill_during_delete(&case, the_item);
-    let objects = case.assert_delete_pending(uid);
-    runtime().block_on(async {
-        case.restart_with_delete_unreachable(case.recording()).await;
-    });
-    assert_eq!(case.assert_delete_pending(uid), objects, "{seed}");
-    case.restart_and_settle(uid, &Outcome::Gone);
-    case.assert_delete_finished(uid, &objects);
-    case.assert_only_deletes();
-}
-
-/// Kill after the retried backend delete applied, before the local state went.
-fn deleting_timer_due_deleted(seed: u64) {
-    let case = Case::new(seed);
-    let uid = kill_during_delete(&case, the_item);
-    let objects = case.assert_delete_pending(uid);
-    runtime().block_on(async {
-        let killed = Recording::freezing_after(&case.share, &case.log, MockOp::Delete);
-        case.restart_with_delete_unreachable(Arc::clone(&killed))
-            .await;
-        let recovered = Instant::now();
-        killed.frozen().await;
-        let waited = recovered.elapsed();
-        assert!(
-            waited >= WRITE_BACK_DELAY && waited <= WRITE_BACK_DELAY + Duration::from_secs(1),
-            "{seed}: the retry came after {waited:?}"
-        );
-    });
-    let (db, store) = case.disk.replicas().unwrap();
-    assert_eq!(db.replica_deletes().unwrap(), [uid], "{seed}: mark");
-    assert_eq!(case.share.content(Path::new(TARGET)), None, "{seed}");
-    assert!(store.item(uid).unwrap().is_some(), "{seed}: replica row");
-    for object in &objects {
-        assert!(
-            case.object_file(*object).exists(),
-            "{seed}: object {object}"
-        );
-    }
-    drop((db, store));
-    case.restart_and_settle(uid, &Outcome::Gone);
-    case.assert_delete_finished(uid, &objects);
-    case.assert_only_deletes();
-}
-
-fn deleting_timer_due_deleting(seed: u64) {
-    let case = Case::new(seed);
-    let uid = kill_during_delete(&case, the_item);
-    let objects = case.assert_delete_pending(uid);
-    let mut expected = vec![WRITE_BACK_DELAY];
-    while expected.last() != Some(&MAX_UPLOAD_DELAY) {
-        let next = expected
-            .last()
-            .unwrap()
-            .saturating_mul(2)
-            .min(MAX_UPLOAD_DELAY);
-        expected.push(next);
-    }
-    expected.push(MAX_UPLOAD_DELAY);
-    runtime().block_on(async {
-        for _ in &expected {
-            case.share.inject(MockOp::Delete, Fault::Unreachable);
-        }
-        case.restart_with_delete_unreachable(case.recording()).await;
-        let mut previous = Instant::now();
-        let mut gaps = Vec::new();
-        for at in call_times(&case.log, MockOp::Delete, expected.len()).await {
-            gaps.push(at - previous);
-            previous = at;
-        }
-        let slack = Duration::from_secs(1);
-        for (gap, delay) in gaps.iter().zip(&expected) {
-            assert!(
-                *gap + slack >= *delay && *gap <= *delay + slack,
-                "{seed}: retry gaps {gaps:?}, expected {expected:?}"
+/// FR-7, AD-20: a clean item whose marked delete recovery could not finish
+/// is listed, read and evicted as any clean item, and nothing deletes it.
+fn deleting_restart_clean(seed: u64) {
+    for fault in RECOVERY_FAULTS {
+        let case = Case::new(seed);
+        let what = format!("{seed} {fault:?}");
+        let uid = runtime().block_on(async {
+            let (daemon, uid) = case.start(case.recording()).await;
+            daemon.cache.fetch(uid, None).await.unwrap();
+            let held = case.share.stop_at(MockOp::Delete);
+            let _deleting = daemon.spawn_delete(uid);
+            held.reached().await;
+            uid
+        });
+        runtime().block_on(async {
+            let daemon = case
+                .restart_with_delete_failing(case.recording(), fault)
+                .await;
+            assert_eq!(
+                daemon.list_folder_of(uid).await,
+                [name_of(TARGET)],
+                "{what}: listing"
             );
-        }
-    });
-    assert_eq!(case.assert_delete_pending(uid), objects, "{seed}");
-    case.restart_and_settle(uid, &Outcome::Gone);
-    case.assert_delete_finished(uid, &objects);
-    case.assert_only_deletes();
+            assert_reads(&daemon, uid, ORIGINAL, &what).await;
+            daemon.cache.set_max_size(0);
+            assert!(
+                daemon.cache.sweep().await.unwrap() > 0,
+                "{what}: eviction skipped the item"
+            );
+            assert!(
+                daemon.db.content_objects_of(uid).unwrap().is_empty(),
+                "{what}: object kept"
+            );
+            case.settle_without_deletes(&what).await;
+            case.assert_outcome(&daemon, uid, &at(TARGET, ORIGINAL))
+                .await;
+        });
+        assert!(uploads(&case.log).is_empty(), "{what}");
+    }
 }
 
-/// FR-7: a delete that fails clears the mark; the retry due meanwhile deletes nothing.
+/// FR-7, FR-8, AD-19: a dirty item whose marked delete recovery could not
+/// finish keeps its object, its timer uploads it and nothing deletes it.
+fn deleting_restart_dirty(seed: u64) {
+    for fault in RECOVERY_FAULTS {
+        let case = Case::new(seed);
+        let what = format!("{seed} {fault:?}");
+        let uid = kill_during_delete(&case, the_item);
+        let objects = case.assert_delete_pending(uid);
+        runtime().block_on(async {
+            let daemon = case
+                .restart_with_delete_failing(case.recording(), fault)
+                .await;
+            let dirty = daemon
+                .dirty_object(uid)
+                .unwrap_or_else(|| panic!("{what}: dirty object lost"));
+            assert!(objects.contains(&dirty.object_id), "{what}");
+            assert_eq!(
+                daemon.list_folder_of(uid).await,
+                [name_of(TARGET)],
+                "{what}: listing"
+            );
+            assert_reads(&daemon, uid, EDIT, &what).await;
+            tokio::time::sleep(WRITE_BACK_DELAY + Duration::from_secs(1)).await;
+            assert_eq!(
+                placed(&case.log),
+                [EDIT],
+                "{what}: the timer of the dirty object was not armed at recovery"
+            );
+            case.settle_without_deletes(&what).await;
+            case.assert_outcome(&daemon, uid, &at(TARGET, EDIT)).await;
+        });
+        assert_eq!(placed(&case.log), [EDIT], "{what}");
+    }
+}
+
+/// FR-7: an edited item whose marked delete recovery could not finish keeps
+/// its edit, which its timer uploads.
+fn deleting_restart_editing(seed: u64) {
+    for fault in RECOVERY_FAULTS {
+        let case = Case::new(seed);
+        let what = format!("{seed} {fault:?}");
+        let uid = runtime().block_on(async {
+            let (daemon, uid) = case.start(case.recording()).await;
+            daemon.write(uid, 2, b"XY").await;
+            let held = case.share.stop_at(MockOp::Delete);
+            let _deleting = daemon.spawn_delete(uid);
+            held.reached().await;
+            uid
+        });
+        runtime().block_on(async {
+            let daemon = case
+                .restart_with_delete_failing(case.recording(), fault)
+                .await;
+            assert!(daemon.edited_object(uid).is_some(), "{what}: edit lost");
+            assert_reads(&daemon, uid, WRITTEN, &what).await;
+            case.settle_without_deletes(&what).await;
+            case.assert_outcome(&daemon, uid, &at(TARGET, WRITTEN))
+                .await;
+        });
+        assert_eq!(placed(&case.log), [WRITTEN], "{what}");
+    }
+}
+
+/// FR-7: a delete issued again after recovery dropped the mark and failing
+/// unreachable keeps the edit; nothing deletes the item later.
 #[test]
-fn overlap_delete_retry_during_a_failing_delete() {
+fn overlap_a_delete_reissued_after_recovery_dropped_its_mark_fails_and_keeps_the_edit() {
     for seed in SEEDS {
         let case = Case::new(seed);
         let uid = kill_during_delete(&case, the_item);
         runtime().block_on(async {
-            let daemon = case.restart_with_delete_unreachable(case.recording()).await;
-            let held = case.share.stop_at(MockOp::Metadata);
+            let daemon = case
+                .restart_with_delete_failing(case.recording(), Fault::Unreachable)
+                .await;
             case.share.inject(MockOp::Delete, Fault::Unreachable);
-            let deleting = daemon.spawn_delete(uid);
-            held.reached().await;
-            tokio::time::sleep(WRITE_BACK_DELAY + Duration::from_secs(1)).await;
-            held.release();
-            assert!(deleting.await.unwrap().is_err(), "{seed}");
+            assert!(daemon.cache.delete(uid).await.is_err(), "{seed}");
+            assert!(daemon.db.replica_deletes().unwrap().is_empty(), "{seed}");
+            case.settle_without_deletes("after the failed delete").await;
+            case.assert_outcome(&daemon, uid, &at(TARGET, EDIT)).await;
+        });
+        assert_eq!(placed(&case.log), [EDIT], "{seed}");
+    }
+}
+
+/// FR-8: a scan after recovery dropped a delete lists the item under its uid;
+/// nothing deletes it while the scan is held or after.
+#[test]
+fn overlap_a_scan_after_recovery_dropped_a_delete_lists_the_item_and_deletes_nothing() {
+    for seed in SEEDS {
+        let case = Case::new(seed);
+        let uid = kill_during_delete(&case, the_item);
+        runtime().block_on(async {
+            let backend = case.recording();
+            let daemon = case
+                .restart_with_delete_failing(Arc::clone(&backend), Fault::Unreachable)
+                .await;
             let deletes = calls(&case.log, MockOp::Delete);
-            tokio::time::sleep(SETTLE).await;
+            let listed = backend.pause_after(MockOp::ListChildren);
+            let scanning = daemon.spawn_scan();
+            listed.reached.notified().await;
+            tokio::time::sleep(WRITE_BACK_DELAY.saturating_sub(Duration::from_secs(1))).await;
             assert_eq!(
                 calls(&case.log, MockOp::Delete),
                 deletes,
-                "{seed}: the timer deleted the item"
+                "{seed}: a delete ran while the scan was held"
             );
-            assert!(daemon.db.replica_deletes().unwrap().is_empty(), "{seed}");
+            listed.released.notify_one();
+            scanning.await.unwrap().unwrap();
+            assert_eq!(
+                daemon.uid(TARGET).await,
+                uid,
+                "{seed}: listed under another uid"
+            );
+            case.settle_without_deletes("after the scan").await;
             case.assert_outcome(&daemon, uid, &at(TARGET, EDIT)).await;
         });
         assert_eq!(placed(&case.log), [EDIT], "{seed}");
@@ -2785,100 +2814,629 @@ async fn assert_not_resurrected(case: &Case, daemon: &Daemon, uid: u64) {
     );
 }
 
-/// FR-8: a scan that listed the item before the retry deleted it does not bring it back.
+/// FR-8: a delete issued again after recovery dropped the mark, held while a
+/// scan runs, completes; the scan does not bring the item back.
 #[test]
-fn overlap_delete_retry_after_a_scan_listed_the_item() {
+fn overlap_a_delete_reissued_after_recovery_held_while_a_scan_runs_completes() {
     for seed in SEEDS {
         let case = Case::new(seed);
         let uid = kill_during_delete(&case, the_item);
         runtime().block_on(async {
-            let backend = case.recording();
             let daemon = case
-                .restart_with_delete_unreachable(Arc::clone(&backend))
+                .restart_with_delete_failing(case.recording(), Fault::Unreachable)
                 .await;
-            let listed = backend.pause_after(MockOp::ListChildren);
-            let scanning = daemon.spawn_scan();
-            listed.reached.notified().await;
-            tokio::time::sleep(WRITE_BACK_DELAY + Duration::from_secs(1)).await;
-            assert_eq!(
-                case.share.content(Path::new(TARGET)),
-                None,
-                "{seed}: the retry waited for the scan"
-            );
-            listed.released.notify_one();
-            scanning.await.unwrap().unwrap();
-            assert_not_resurrected(&case, &daemon, uid).await;
-            tokio::time::sleep(SETTLE).await;
-            case.assert_outcome(&daemon, uid, &Outcome::Gone).await;
-        });
-        case.assert_only_deletes();
-    }
-}
-
-/// FR-8: a scan seeing the item while the retried delete is held keeps the delete.
-#[test]
-fn overlap_delete_retry_held_while_a_scan_runs() {
-    for seed in SEEDS {
-        let case = Case::new(seed);
-        let uid = kill_during_delete(&case, the_item);
-        runtime().block_on(async {
-            let daemon = case.restart_with_delete_unreachable(case.recording()).await;
             let held = case.share.stop_at(MockOp::Delete);
+            let deleting = daemon.spawn_delete(uid);
             held.reached().await;
             daemon.scan().await;
             held.release();
-            until("the retried delete", || {
-                case.share.content(Path::new(TARGET)).is_none()
-            })
-            .await;
-            let_run().await;
+            let deleted = deleting.await.unwrap();
+            assert!(deleted.is_ok(), "{seed}: {deleted:?}");
             assert_not_resurrected(&case, &daemon, uid).await;
             tokio::time::sleep(SETTLE).await;
             case.assert_outcome(&daemon, uid, &Outcome::Gone).await;
         });
-        case.assert_only_deletes();
+        assert!(placed(&case.log).is_empty(), "{seed}");
     }
 }
 
-/// FR-8: a save into the marked item does not undo the delete it follows.
+/// FR-7: a save after recovery dropped a delete is uploaded, not dropped.
 #[test]
-fn overlap_save_into_the_marked_item_before_the_delete_retry() {
+fn overlap_a_save_after_recovery_dropped_a_delete_is_uploaded() {
     for seed in SEEDS {
         let case = Case::new(seed);
         let uid = kill_during_delete(&case, the_item);
-        let objects = case.assert_delete_pending(uid);
         runtime().block_on(async {
-            let daemon = case.restart_with_delete_unreachable(case.recording()).await;
+            let daemon = case
+                .restart_with_delete_failing(case.recording(), Fault::Unreachable)
+                .await;
             daemon.save(uid, SECOND).await;
-            tokio::time::sleep(SETTLE).await;
-            case.assert_outcome(&daemon, uid, &Outcome::Gone).await;
+            case.settle_without_deletes("after the save").await;
+            case.assert_outcome(&daemon, uid, &at(TARGET, SECOND)).await;
         });
-        case.assert_delete_finished(uid, &objects);
-        case.assert_only_deletes();
+        assert_eq!(placed(&case.log), [SECOND], "{seed}");
     }
 }
 
-/// FR-8: a save into a file of a marked folder neither recreates nor uploads.
+/// FR-7: an NFS write after recovery dropped a delete is uploaded, not dropped.
 #[test]
-fn overlap_save_into_the_marked_subtree_before_the_delete_retry() {
+fn overlap_a_write_after_recovery_dropped_a_delete_is_uploaded() {
+    for seed in SEEDS {
+        let case = Case::new(seed);
+        let uid = kill_during_delete(&case, the_item);
+        runtime().block_on(async {
+            let daemon = case
+                .restart_with_delete_failing(case.recording(), Fault::Unreachable)
+                .await;
+            daemon.write(uid, 0, b"L").await;
+            case.settle_without_deletes("after the write").await;
+            case.assert_outcome(&daemon, uid, &at(TARGET, EDIT_WRITTEN))
+                .await;
+        });
+        assert_eq!(placed(&case.log), [EDIT_WRITTEN], "{seed}");
+    }
+}
+
+/// FR-7: a save into a file of a folder whose delete recovery dropped is
+/// uploaded into the kept folder.
+#[test]
+fn overlap_a_save_into_the_subtree_of_a_folder_delete_recovery_dropped_is_uploaded() {
     for seed in SEEDS {
         let case = Case::new(seed);
         let uid = kill_during_delete(&case, its_folder);
         runtime().block_on(async {
-            let daemon = case.restart_with_delete_unreachable(case.recording()).await;
+            let daemon = case
+                .restart_with_delete_failing(case.recording(), Fault::Unreachable)
+                .await;
             let folder = daemon.folder_uid(uid);
-            assert_eq!(daemon.db.replica_deletes().unwrap(), [folder], "{seed}");
             daemon.save(uid, SECOND).await;
-            tokio::time::sleep(SETTLE).await;
-            assert!(
-                case.share.metadata(Path::new(FOLDER)).await.is_err(),
-                "{seed}: the deleted folder was recreated"
-            );
-            assert!(daemon.dirty_objects().is_empty(), "{seed}");
-            assert!(daemon.item(uid).is_none(), "{seed}: file kept");
-            assert!(daemon.item(folder).is_none(), "{seed}: folder kept");
-            assert!(daemon.db.replica_deletes().unwrap().is_empty(), "{seed}");
+            case.settle_without_deletes("after the save").await;
+            assert!(daemon.item(folder).is_some(), "{seed}: folder dropped");
+            case.assert_outcome(&daemon, uid, &at(TARGET, SECOND)).await;
         });
-        case.assert_only_deletes();
+        assert_eq!(placed(&case.log), [SECOND], "{seed}");
     }
+}
+
+/// Kills after the backend applied the delete of a dirty item and makes the
+/// first metadata call of the restart, recovery's, fail unreachable.
+fn kill_after_an_applied_delete(case: &Case) -> u64 {
+    let uid = runtime().block_on(async {
+        let killed = Recording::freezing_after(&case.share, &case.log, MockOp::Delete);
+        let (daemon, uid) = case.start(Arc::clone(&killed)).await;
+        daemon.save(uid, EDIT).await;
+        let _deleting = daemon.spawn_delete(uid);
+        killed.frozen().await;
+        uid
+    });
+    assert_eq!(case.share.content(Path::new(TARGET)), None, "{}", case.seed);
+    case.share.inject(MockOp::Metadata, Fault::Unreachable);
+    uid
+}
+
+/// FR-8: a file the backend deleted before the kill, whose delete recovery
+/// could not finish, is recreated by the upload of its dirty object.
+#[test]
+fn case_an_applied_delete_recovery_cannot_finish_is_undone_by_the_upload_of_the_edit() {
+    for seed in SEEDS {
+        let case = Case::new(seed);
+        let uid = kill_after_an_applied_delete(&case);
+        runtime().block_on(async {
+            let daemon = case.disk.start(case.recording()).await.unwrap();
+            assert!(
+                daemon.db.replica_deletes().unwrap().is_empty(),
+                "{seed}: recovery kept the mark"
+            );
+            case.settle_without_deletes("after recovery").await;
+            case.assert_outcome(&daemon, uid, &at(TARGET, EDIT)).await;
+        });
+        assert_eq!(placed(&case.log), [EDIT], "{seed}");
+    }
+}
+
+/// FR-8: the same item deleted again by the caller ends deleted.
+#[test]
+fn case_an_applied_delete_recovery_cannot_finish_ends_deleted_when_deleted_again() {
+    for seed in SEEDS {
+        let case = Case::new(seed);
+        let uid = kill_after_an_applied_delete(&case);
+        runtime().block_on(async {
+            let daemon = case.disk.start(case.recording()).await.unwrap();
+            assert!(
+                daemon.db.replica_deletes().unwrap().is_empty(),
+                "{seed}: recovery kept the mark"
+            );
+            let deleted = daemon.cache.delete(uid).await;
+            assert!(deleted.is_ok(), "{seed}: {deleted:?}");
+            tokio::time::sleep(SETTLE).await;
+            case.assert_outcome(&daemon, uid, &Outcome::Gone).await;
+        });
+        assert!(placed(&case.log).is_empty(), "{seed}");
+    }
+}
+
+fn recorded_temp(daemon: &Daemon, uid: u64, folder: &str) -> String {
+    let record = daemon
+        .dirty_object(uid)
+        .and_then(|object| object.upload)
+        .expect("the item has a recorded temporary upload");
+    format!("{folder}/{}", record.temp_name)
+}
+
+async fn start_recorded(case: &Case, backend: &Arc<Recording>) -> (Daemon, u64, String) {
+    let (daemon, uid) = case.start(Arc::clone(backend)).await;
+    into_recorded(case, &daemon, uid).await;
+    let temp = recorded_temp(&daemon, uid, FOLDER);
+    (daemon, uid, temp)
+}
+
+async fn assert_delete_undone(case: &Case, daemon: &Daemon, uid: u64, what: &str) {
+    assert!(
+        daemon.db.replica_deletes().unwrap().is_empty(),
+        "{what}: mark kept"
+    );
+    assert_eq!(
+        case.share.content(Path::new(TARGET)).as_deref(),
+        Some(ORIGINAL),
+        "{what}: the target left the backend"
+    );
+    assert_eq!(
+        daemon.list_folder_of(uid).await,
+        [name_of(TARGET)],
+        "{what}: listing"
+    );
+    assert!(
+        daemon.dirty_object(uid).is_some(),
+        "{what}: dirty object lost"
+    );
+    assert_reads(daemon, uid, EDIT, what).await;
+}
+
+impl Case {
+    /// Durable state at a kill of a recorded item holding [`EDIT`] whose
+    /// delete did not reach the target: the `marks`, the record naming
+    /// `temp`, the temporary file holding `temp_data`, the target, the
+    /// replica row and the dirty object.
+    fn assert_recorded_at_kill(
+        &self,
+        uid: u64,
+        temp: &str,
+        marks: &[u64],
+        temp_data: Option<&[u8]>,
+    ) {
+        let seed = self.seed;
+        let (db, store) = self.disk.replicas().unwrap();
+        assert_eq!(db.replica_deletes().unwrap(), marks, "{seed}: marks");
+        assert_eq!(
+            self.share.content(Path::new(TARGET)).as_deref(),
+            Some(ORIGINAL),
+            "{seed}: the target on the backend"
+        );
+        assert_eq!(
+            self.share.content(Path::new(temp)).as_deref(),
+            temp_data,
+            "{seed}: the temporary file on the backend"
+        );
+        assert!(store.item(uid).unwrap().is_some(), "{seed}: replica row");
+        let dirty = db
+            .content_objects_of(uid)
+            .unwrap()
+            .into_iter()
+            .find(|object| object.dirty)
+            .unwrap_or_else(|| panic!("{seed}: the dirty object is kept"));
+        assert_eq!(
+            dirty.upload.map(|record| record.temp_name),
+            Some(name_of(temp)),
+            "{seed}: upload record"
+        );
+        assert_eq!(
+            std::fs::read(self.object_file(dirty.object_id)).unwrap(),
+            EDIT,
+            "{seed}: object file"
+        );
+    }
+}
+
+fn assert_target_never_deleted(case: &Case, what: &str) {
+    assert!(
+        !case.log.deleted().contains(&TARGET.to_owned()),
+        "{what}: the daemon deleted the target: {:?}",
+        case.log.deleted()
+    );
+}
+
+/// Records [`EDIT`] and deletes the item with the removal of its temporary
+/// upload failing with `fault`: the delete fails before the target.
+async fn delete_failing_at_the_temporary_upload(
+    case: &Case,
+    fault: Fault,
+    what: &str,
+) -> (Daemon, u64, String) {
+    let backend = case.recording();
+    let (daemon, uid, temp) = start_recorded(case, &backend).await;
+    backend.fail_delete_of(&temp, fault);
+    let deleted = daemon.cache.delete(uid).await;
+    assert!(deleted.is_err(), "{what}: {deleted:?}");
+    assert_eq!(
+        case.log.deleted(),
+        Vec::<String>::new(),
+        "{what}: a delete reached the backend"
+    );
+    let mut expected = vec![name_of(&temp), name_of(TARGET)];
+    expected.sort();
+    assert_eq!(remote_names(&case.share, FOLDER).await, expected, "{what}");
+    assert_delete_undone(case, &daemon, uid, what).await;
+    (daemon, uid, temp)
+}
+
+/// Kill after a delete of a recorded item failed removing its temporary
+/// upload; the restart renames the recorded upload over the target.
+fn deleting_delete_failed_recorded(seed: u64) {
+    for fault in RECOVERY_FAULTS {
+        let case = Case::new(seed);
+        let what = format!("{seed} {fault:?}");
+        let (uid, temp) = runtime().block_on(async {
+            let (_daemon, uid, temp) =
+                delete_failing_at_the_temporary_upload(&case, fault, &what).await;
+            (uid, temp)
+        });
+        case.assert_recorded_at_kill(uid, &temp, &[], Some(EDIT));
+        runtime().block_on(async {
+            let daemon = case.disk.start(case.recording()).await.unwrap();
+            case.settle_without_deletes(&what).await;
+            case.assert_outcome(&daemon, uid, &at(TARGET, EDIT)).await;
+        });
+        assert_eq!(placed(&case.log), [EDIT], "{what}");
+        assert_target_never_deleted(&case, &what);
+    }
+}
+
+/// Kill inside the removal of a recorded item's temporary upload, after the
+/// backend removed it and before the record was cleared; the restart cannot
+/// reach the backend, drops the mark and uploads the edit afresh instead of
+/// renaming the missing temporary file.
+fn deleting_restart_recorded(seed: u64) {
+    for fault in RECOVERY_FAULTS {
+        let case = Case::new(seed);
+        let what = format!("{seed} {fault:?}");
+        let (uid, temp) =
+            kill_during_a_delete_with_a_temporary_upload(&case, KilledAfter::TemporaryRemoved);
+        case.assert_recorded_at_kill(uid, &temp, &[uid], None);
+        let uploaded = uploads(&case.log).len();
+        let replaced = calls(&case.log, MockOp::Replace);
+        restart_failing_keeps_the_edit(&case, uid, fault);
+        assert_eq!(
+            uploads(&case.log).len(),
+            uploaded + 1,
+            "{what}: uploads after the restart"
+        );
+        assert_eq!(
+            calls(&case.log, MockOp::Replace),
+            replaced + 1,
+            "{what}: rename-overs after the restart"
+        );
+        assert_target_never_deleted(&case, &what);
+    }
+}
+
+/// R4a
+#[test]
+fn case_a_delete_whose_temporary_upload_cannot_be_removed_fails_before_the_target_is_deleted() {
+    for seed in SEEDS {
+        for fault in RECOVERY_FAULTS {
+            let case = Case::new(seed);
+            let what = format!("{seed} {fault:?}");
+            runtime().block_on(async {
+                let (daemon, uid, _temp) =
+                    delete_failing_at_the_temporary_upload(&case, fault, &what).await;
+                case.settle_without_deletes(&what).await;
+                case.assert_outcome(&daemon, uid, &at(TARGET, EDIT)).await;
+            });
+            assert_eq!(placed(&case.log), [EDIT], "{what}");
+        }
+    }
+}
+
+/// R4a
+#[test]
+fn case_a_delete_reissued_after_its_temporary_upload_could_not_be_removed_completes() {
+    for seed in SEEDS {
+        for fault in RECOVERY_FAULTS {
+            let case = Case::new(seed);
+            let what = format!("{seed} {fault:?}");
+            runtime().block_on(async {
+                let backend = case.recording();
+                let (daemon, uid, temp) = start_recorded(&case, &backend).await;
+                backend.fail_delete_of(&temp, fault);
+                let deleted = daemon.cache.delete(uid).await;
+                assert!(deleted.is_err(), "{what}: {deleted:?}");
+                let deleted = daemon.cache.delete(uid).await;
+                assert!(deleted.is_ok(), "{what}: {deleted:?}");
+                assert_eq!(
+                    case.log.deleted(),
+                    [temp.clone(), TARGET.to_owned()],
+                    "{what}: deletes applied"
+                );
+                assert!(daemon.item(uid).is_none(), "{what}: replica row");
+                tokio::time::sleep(SETTLE).await;
+                case.assert_outcome(&daemon, uid, &Outcome::Gone).await;
+            });
+            assert!(placed(&case.log).is_empty(), "{what}");
+        }
+    }
+}
+
+/// R4b, R4e
+#[test]
+fn case_a_delete_whose_target_delete_fails_after_the_temporary_upload_was_removed_keeps_the_edit() {
+    for seed in SEEDS {
+        for fault in RECOVERY_FAULTS {
+            let case = Case::new(seed);
+            let what = format!("{seed} {fault:?}");
+            runtime().block_on(async {
+                let backend = case.recording();
+                let (daemon, uid, temp) = start_recorded(&case, &backend).await;
+                backend.fail_delete_of(TARGET, fault);
+                let deleted = daemon.cache.delete(uid).await;
+                assert!(deleted.is_err(), "{what}: {deleted:?}");
+                assert_eq!(case.log.deleted(), [temp], "{what}: deletes applied");
+                assert_eq!(
+                    remote_names(&case.share, FOLDER).await,
+                    [name_of(TARGET)],
+                    "{what}: a temporary name is left"
+                );
+                assert_delete_undone(&case, &daemon, uid, &what).await;
+                assert!(
+                    daemon
+                        .dirty_object(uid)
+                        .and_then(|object| object.upload)
+                        .is_none(),
+                    "{what}: the record points at the removed temporary upload"
+                );
+                let uploaded = uploads(&case.log).len();
+                case.settle_without_deletes(&what).await;
+                assert_eq!(
+                    uploads(&case.log).len(),
+                    uploaded + 1,
+                    "{what}: the edit was not uploaded again"
+                );
+                case.assert_outcome(&daemon, uid, &at(TARGET, EDIT)).await;
+            });
+            assert_eq!(placed(&case.log), [EDIT], "{what}");
+        }
+    }
+}
+
+/// R4c
+#[test]
+fn case_a_delete_removes_the_temporary_upload_before_the_target() {
+    for seed in SEEDS {
+        let case = Case::new(seed);
+        runtime().block_on(async {
+            let backend = case.recording();
+            let (daemon, uid, temp) = start_recorded(&case, &backend).await;
+            let objects: Vec<ObjectId> = daemon
+                .db
+                .content_objects_of(uid)
+                .unwrap()
+                .iter()
+                .map(|object| object.object_id)
+                .collect();
+            let deleted = daemon.cache.delete(uid).await;
+            assert!(deleted.is_ok(), "{seed}: {deleted:?}");
+            assert_eq!(
+                case.log.deleted(),
+                [temp, TARGET.to_owned()],
+                "{seed}: deletes applied"
+            );
+            assert_eq!(
+                remote_names(&case.share, FOLDER).await,
+                Vec::<String>::new(),
+                "{seed}"
+            );
+            assert!(daemon.db.replica_deletes().unwrap().is_empty(), "{seed}");
+            assert!(daemon.item(uid).is_none(), "{seed}: replica row");
+            assert!(
+                daemon.db.content_objects_of(uid).unwrap().is_empty(),
+                "{seed}: object rows"
+            );
+            for object in objects {
+                assert!(
+                    !case.object_file(object).exists(),
+                    "{seed}: object file {object} left"
+                );
+            }
+            tokio::time::sleep(SETTLE).await;
+            case.assert_outcome(&daemon, uid, &Outcome::Gone).await;
+        });
+        assert!(placed(&case.log).is_empty(), "{seed}");
+    }
+}
+
+/// R4c
+#[test]
+fn case_a_delete_in_a_never_listed_folder_removes_the_temporary_upload_before_the_target() {
+    const INBOX: &str = "docs/inbox";
+    for seed in SEEDS {
+        let case = Case::new(seed);
+        runtime().block_on(async {
+            let (daemon, uid) = case.start(case.recording()).await;
+            let inbox = daemon
+                .cache
+                .create_folder(daemon.folder_uid(uid), &name_of(INBOX))
+                .await
+                .unwrap()
+                .uid;
+            daemon
+                .cache
+                .rename(uid, inbox, &name_of(TARGET))
+                .await
+                .unwrap();
+            case.share.inject(MockOp::Replace, Fault::Busy);
+            daemon.save(uid, EDIT).await;
+            until("a busy rename-over", || {
+                calls(&case.log, MockOp::Replace) >= 1
+            })
+            .await;
+            let_run().await;
+            let temp = recorded_temp(&daemon, uid, INBOX);
+            let mut expected = vec![name_of(&temp), name_of(TARGET)];
+            expected.sort();
+            assert_eq!(
+                remote_names(&case.share, INBOX).await,
+                expected,
+                "{seed}: the temporary upload is not in the created folder"
+            );
+            let deleted = daemon.cache.delete(uid).await;
+            assert!(deleted.is_ok(), "{seed}: {deleted:?}");
+            assert!(
+                !daemon.item(inbox).unwrap().listed,
+                "{seed}: the created folder was listed"
+            );
+            assert!(
+                !daemon
+                    .db
+                    .replica_scan_folders(daemon.backend.id())
+                    .unwrap()
+                    .contains(&inbox),
+                "{seed}: the created folder is in the scan set"
+            );
+            assert_eq!(
+                case.log.deleted(),
+                [temp, format!("{INBOX}/{}", name_of(TARGET))],
+                "{seed}: deletes applied"
+            );
+            assert_eq!(
+                remote_names(&case.share, INBOX).await,
+                Vec::<String>::new(),
+                "{seed}: a name is left in the never-listed folder"
+            );
+            assert!(daemon.item(uid).is_none(), "{seed}: replica row");
+            assert!(daemon.db.replica_deletes().unwrap().is_empty(), "{seed}");
+            tokio::time::sleep(SETTLE).await;
+            assert_eq!(
+                remote_names(&case.share, INBOX).await,
+                Vec::<String>::new(),
+                "{seed}: a name came back in the never-listed folder"
+            );
+            assert!(daemon.item(inbox).is_some(), "{seed}: folder lost");
+        });
+        assert!(placed(&case.log).is_empty(), "{seed}");
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum KilledAfter {
+    TemporaryRemoved,
+    TargetDeleted,
+}
+
+fn kill_during_a_delete_with_a_temporary_upload(
+    case: &Case,
+    killed_after: KilledAfter,
+) -> (u64, String) {
+    let seed = case.seed;
+    runtime().block_on(async {
+        let backend = case.recording();
+        let (daemon, uid, temp) = start_recorded(case, &backend).await;
+        match killed_after {
+            KilledAfter::TemporaryRemoved => backend.freeze_after_delete_of(&temp),
+            KilledAfter::TargetDeleted => backend.freeze_after_delete_of(TARGET),
+        }
+        let _deleting = daemon.spawn_delete(uid);
+        backend.frozen().await;
+        match killed_after {
+            KilledAfter::TemporaryRemoved => {
+                assert_eq!(
+                    case.log.deleted(),
+                    std::slice::from_ref(&temp),
+                    "{seed}: deletes at the kill"
+                );
+                assert_eq!(
+                    remote_names(&case.share, FOLDER).await,
+                    [name_of(TARGET)],
+                    "{seed}: backend at the kill"
+                );
+            }
+            KilledAfter::TargetDeleted => {
+                assert_eq!(
+                    case.log.deleted(),
+                    [temp.clone(), TARGET.to_owned()],
+                    "{seed}: deletes at the kill"
+                );
+                assert_eq!(
+                    remote_names(&case.share, FOLDER).await,
+                    Vec::<String>::new(),
+                    "{seed}: backend at the kill"
+                );
+            }
+        }
+        (uid, temp)
+    })
+}
+
+/// R4d, R2
+fn restart_reachable_finishes_the_delete(killed_after: KilledAfter) {
+    for seed in SEEDS {
+        let case = Case::new(seed);
+        let (uid, _temp) = kill_during_a_delete_with_a_temporary_upload(&case, killed_after);
+        runtime().block_on(async {
+            let daemon = case.disk.start(case.recording()).await.unwrap();
+            assert!(
+                daemon.db.replica_deletes().unwrap().is_empty(),
+                "{seed}: recovery kept the mark"
+            );
+            assert!(daemon.item(uid).is_none(), "{seed}: replica row");
+            tokio::time::sleep(SETTLE).await;
+            case.assert_outcome(&daemon, uid, &Outcome::Gone).await;
+        });
+        assert!(placed(&case.log).is_empty(), "{seed}");
+    }
+}
+
+/// R4d, R3: a restart whose first backend call fails with `fault` drops the
+/// mark and uploads the edit.
+fn restart_failing_keeps_the_edit(case: &Case, uid: u64, fault: Fault) {
+    let what = format!("{} {fault:?}", case.seed);
+    case.share.inject(MockOp::Metadata, fault);
+    runtime().block_on(async {
+        let daemon = case.disk.start(case.recording()).await.unwrap();
+        assert!(
+            daemon.db.replica_deletes().unwrap().is_empty(),
+            "{what}: recovery kept the mark"
+        );
+        assert!(daemon.dirty_object(uid).is_some(), "{what}: edit lost");
+        case.settle_without_deletes(&what).await;
+        case.assert_outcome(&daemon, uid, &at(TARGET, EDIT)).await;
+    });
+    assert_eq!(placed(&case.log), [EDIT], "{what}");
+}
+
+fn restart_unreachable_keeps_the_edit(killed_after: KilledAfter) {
+    for seed in SEEDS {
+        let case = Case::new(seed);
+        let (uid, _temp) = kill_during_a_delete_with_a_temporary_upload(&case, killed_after);
+        restart_failing_keeps_the_edit(&case, uid, Fault::Unreachable);
+    }
+}
+
+#[test]
+fn case_a_delete_killed_after_its_temporary_upload_was_removed_is_finished_by_recovery() {
+    restart_reachable_finishes_the_delete(KilledAfter::TemporaryRemoved);
+}
+
+#[test]
+fn case_a_delete_killed_after_its_temporary_upload_was_removed_unreachable_at_restart_keeps_the_edit()
+ {
+    restart_unreachable_keeps_the_edit(KilledAfter::TemporaryRemoved);
+}
+
+#[test]
+fn case_a_delete_killed_after_both_backend_deletes_is_finished_by_recovery() {
+    restart_reachable_finishes_the_delete(KilledAfter::TargetDeleted);
+}
+
+#[test]
+fn case_a_delete_killed_after_both_backend_deletes_unreachable_at_restart_keeps_the_edit() {
+    restart_unreachable_keeps_the_edit(KilledAfter::TargetDeleted);
 }

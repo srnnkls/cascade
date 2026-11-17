@@ -401,16 +401,20 @@ async fn ac21_a_file_deleted_on_the_nas_after_open_is_recreated_with_the_local_e
     }
 }
 
+/// AD-20, FR-7: a delete marked before a kill that recovery cannot finish is
+/// dropped; the file stays on the NAS, no delete follows once it returns, and
+/// a delete issued again completes.
 #[test]
-fn d008_a_marked_delete_unreachable_at_recovery_completes_once_the_nas_returns() {
+fn d016_a_marked_delete_unreachable_at_recovery_is_dropped_until_deleted_again() {
     for seed in SEEDS {
         let share = Arc::new(MockBackend::new(seed));
         share.add_file(TARGET, b"original");
         share.add_file("docs/other.txt", b"other");
         let (_root, disk) = disk();
+        let log = BackendLog::default();
 
         let uid = runtime().block_on(async {
-            let daemon = start(&disk, recording(&share)).await;
+            let daemon = start(&disk, RecordingBackend::new(&share, &log)).await;
             let uid = uid_of(&daemon, TARGET).await;
             let held = share.stop_at(MockOp::Delete);
             let cache = daemon.cache.clone();
@@ -424,29 +428,47 @@ fn d008_a_marked_delete_unreachable_at_recovery_completes_once_the_nas_returns()
             [uid],
             "{seed}: the kill left no marked delete"
         );
-        assert!(share.content(Path::new(TARGET)).is_some(), "{seed}");
 
-        let restarted = recording(&share);
         runtime().block_on(async {
             share.inject(MockOp::Delete, Fault::Unreachable);
-            let daemon = start(&disk, restarted.clone()).await;
-            assert!(
-                share.content(Path::new(TARGET)).is_some(),
+            let daemon = start(&disk, RecordingBackend::new(&share, &log)).await;
+            assert_eq!(
+                log.calls(MockOp::Delete),
+                2,
                 "{seed}: the injected fault was not taken at recovery"
+            );
+            assert!(
+                daemon.db.replica_deletes().unwrap().is_empty(),
+                "{seed}: recovery kept the mark of a delete it could not finish"
             );
             tokio::time::sleep(SETTLE).await;
 
             assert_eq!(
-                share.content(Path::new(TARGET)),
-                None,
-                "{seed}: the marked delete was not completed once the NAS returned"
+                log.calls(MockOp::Delete),
+                2,
+                "{seed}: a delete no caller issued reached the NAS"
             );
+            assert_eq!(
+                share.content(Path::new(TARGET)).as_deref(),
+                Some(b"original".as_slice()),
+                "{seed}"
+            );
+            assert_eq!(
+                remote_names(&share, "docs").await,
+                ["other.txt", "report.txt"],
+                "{seed}"
+            );
+            assert_eq!(
+                daemon.resolve(TARGET).await.unwrap(),
+                Some(uid),
+                "{seed}: the item is not listed under its uid"
+            );
+
+            let deleted = daemon.cache.delete(uid).await;
+            assert!(deleted.is_ok(), "{seed}: {deleted:?}");
             assert_eq!(remote_names(&share, "docs").await, ["other.txt"], "{seed}");
-            assert!(
-                daemon.db.replica_deletes().unwrap().is_empty(),
-                "{seed}: the delete mark was not cleared"
-            );
             assert_eq!(daemon.store.item(uid).unwrap(), None, "{seed}");
+            assert!(daemon.db.replica_deletes().unwrap().is_empty(), "{seed}");
         });
     }
 }
