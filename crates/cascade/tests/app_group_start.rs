@@ -296,3 +296,48 @@ fn two_smb_backends_from_init_and_backend_add_are_both_served() {
         "two SMB backends share one id; the domain root lists {mounts:?}"
     );
 }
+
+fn nas_names_with_mount_point_cascade(cascade: &str) -> Vec<String> {
+    let setup = Setup::new();
+    std::fs::create_dir(setup.share.path().join("Mutagen")).unwrap();
+    std::fs::write(
+        setup.share.path().join("Mutagen").join("inside.txt"),
+        b"left to Mutagen",
+    )
+    .unwrap();
+    std::fs::write(setup.mount.path().join(".cascade"), cascade).unwrap();
+    let group = setup.app_group.path();
+    let socket = group.join("fp.sock");
+    let mut daemon = setup.spawn(Some(group), &["start", "--no-mount"]);
+    await_socket(&mut daemon, &socket);
+
+    let root = rpc(&socket, "list", json!({"uid": "root"}));
+    let nas = root["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["name"] == "nas")
+        .unwrap_or_else(|| panic!("the domain root lists no nas: {root}"))["uid"]
+        .clone();
+    let listed = rpc(&socket, "list", json!({"uid": nas}));
+    daemon.terminate();
+    let mut listed = names(&listed["result"]["items"]);
+    listed.sort();
+    listed
+}
+
+#[test]
+fn a_folder_ignored_by_the_mount_point_cascade_is_absent_from_the_domain() {
+    assert_eq!(
+        nas_names_with_mount_point_cascade("Mutagen/\n"),
+        ["hello.txt"]
+    );
+}
+
+#[test]
+fn a_mount_point_cascade_without_ignore_rules_leaves_the_listing_unchanged() {
+    assert_eq!(
+        nas_names_with_mount_point_cascade("# no ignore rules\n"),
+        ["Mutagen", "hello.txt"]
+    );
+}

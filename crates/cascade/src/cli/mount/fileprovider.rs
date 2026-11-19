@@ -262,6 +262,10 @@ impl AppGroupDaemon {
         ))?);
         engine.wire_manage_dispatch().await;
         let cache = engine.content_cache().context("open the content cache")?;
+        engine
+            .apply_ignore_rules(&root)
+            .await
+            .context("apply the ignore rules of the root .cascade config")?;
         apply_root_pins(&engine, &root).await?;
         cache.recover().await.context("recover the content cache")?;
 

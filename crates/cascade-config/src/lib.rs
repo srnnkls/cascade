@@ -13,10 +13,12 @@
 //! All deserialise to [`CascadeConfig`]. Directory walk produces
 //! [`ResolvedConfig`] with child-overrides-parent precedence.
 
+pub mod matcher;
 pub mod merge;
 pub mod parse;
 pub mod types;
 
+pub use matcher::IgnoreMatcher;
 pub use types::{
     CacheConfig, CacheStatePosture, CascadeConfig, DeviceConfig, GrantConfig, IgnoreRule, MaxAge,
     MaxSize, ResolvedConfig, ScopeConfig,

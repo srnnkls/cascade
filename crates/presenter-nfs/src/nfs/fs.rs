@@ -650,11 +650,19 @@ impl NfsFileSystem for CascadeFs {
     async fn symlink<'a>(
         &self,
         dirid: &Handle,
-        _linkname: &filename3<'a>,
+        linkname: &filename3<'a>,
         _symlink: &nfspath3<'a>,
         _attr: &sattr3,
     ) -> Result<(Handle, fattr3), nfsstat3> {
-        self.path_of(dirid)?;
+        let parent = self.path_of(dirid)?;
+        if let Ok(name) = name_of(linkname)
+            && let Some(cached) = self.ctx.cached(&join_child(&parent, name))
+        {
+            cached
+                .cache
+                .check_path(&cached.backend_id, &cached.relative, false)
+                .map_err(|e| status(WriteError::from_name(&e)))?;
+        }
         Err(nfsstat3::NFS3ERR_NOTSUPP)
     }
 

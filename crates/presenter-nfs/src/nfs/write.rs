@@ -55,8 +55,8 @@ impl WriteError {
     /// falling back to a generic I/O failure.
     #[must_use]
     pub fn from_backend(err: &anyhow::Error) -> Self {
-        if err.downcast_ref::<NameError>().is_some() {
-            return Self::Invalid;
+        if let Some(name_err) = err.downcast_ref::<NameError>() {
+            return Self::from_name(name_err);
         }
         if matches!(
             err.downcast_ref::<DomainError>(),
@@ -79,6 +79,19 @@ impl WriteError {
             }
         }
         Self::Io
+    }
+}
+
+impl WriteError {
+    /// Categorise a refused name: one the backend cannot store is
+    /// [`WriteError::Invalid`], one an ignore rule matches
+    /// [`WriteError::Forbidden`].
+    #[must_use]
+    pub const fn from_name(err: &NameError) -> Self {
+        match err {
+            NameError::Rejected(_) => Self::Invalid,
+            NameError::Ignored(_) => Self::Forbidden,
+        }
     }
 }
 

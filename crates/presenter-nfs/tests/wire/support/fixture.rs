@@ -12,7 +12,9 @@ use cascade_engine::backend::{Backend, MountedBackend, NullBackend};
 use cascade_engine::content::store::ObjectStore;
 use cascade_engine::content::transfer::TransferConfig;
 use cascade_engine::content::writeback::WRITE_BACK_DELAY;
-use cascade_engine::testing::{BackendLog, Daemon, Disk, MockBackend, MockOp, RecordingBackend};
+use cascade_engine::testing::{
+    BackendLog, Daemon, Disk, MockBackend, MockOp, RecordingBackend, mount_point_config,
+};
 use cascade_engine::vfs::{NEUTRAL_ROOT_ID, VfsTree};
 use cascade_presenter_nfs::NfsPresenter;
 use cascade_presenter_nfs::nfs::context::NfsContext;
@@ -235,6 +237,25 @@ impl Fixture {
         self.daemon = self.disk.start(Arc::clone(&self.backend)).await?;
         self.register_mounted()?;
         self.server = Some(serve(self.context(), self.mode, port).await?);
+        Ok(())
+    }
+
+    /// Applies a mount-point `.cascade` holding `rules` to the content cache,
+    /// with the backend at the prefix its layout mounts it at.
+    pub async fn ignore(&self, rules: &str) -> Result<()> {
+        let prefix = match self.layout {
+            Layout::Root | Layout::Mounting(_) => PathBuf::new(),
+            Layout::Named { .. } => {
+                MountedBackend::at_default(Arc::clone(&self.backend)).resolve_prefix()
+            }
+        };
+        self.daemon
+            .cache
+            .apply_ignore_rules(
+                &mount_point_config(rules),
+                &[(self.backend.id().to_owned(), prefix)],
+            )
+            .await?;
         Ok(())
     }
 

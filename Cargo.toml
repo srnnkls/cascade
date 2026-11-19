@@ -80,6 +80,9 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Gitignore matching of `.cascade` ignore rules (ripgrep's matcher)
+ignore = "0.4"
+
 # Expression parser
 pest = "2"
 pest_derive = "2"

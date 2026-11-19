@@ -6,9 +6,10 @@
 
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use anyhow::{Result, anyhow};
+use cascade_config::IgnoreMatcher;
 use chrono::Utc;
 
 use super::anchor::SyncAnchor;
@@ -25,6 +26,29 @@ pub const TEMP_UPLOAD_PREFIX: &str = ".cascade-tmp-";
 #[must_use]
 pub fn is_temp_upload(name: &str) -> bool {
     name.starts_with(TEMP_UPLOAD_PREFIX)
+}
+
+/// The `.cascade` ignore rules as they apply to one backend: paths relative
+/// to the backend root are matched under its mount prefix. Temporary upload
+/// names are never ignored.
+#[derive(Debug, Clone)]
+pub(crate) struct Ignore {
+    pub(crate) matcher: Arc<IgnoreMatcher>,
+    pub(crate) prefix: PathBuf,
+}
+
+impl Ignore {
+    /// Whether the item at `path`, relative to the backend root, is ignored.
+    pub(crate) fn ignores(&self, path: &Path, is_dir: bool) -> bool {
+        if path
+            .file_name()
+            .is_some_and(|name| is_temp_upload(&name.to_string_lossy()))
+        {
+            return false;
+        }
+        self.matcher
+            .is_ignored(&self.prefix.join(path).to_string_lossy(), is_dir)
+    }
 }
 
 /// Path of the item `uid` relative to its backend root, given the parent
@@ -100,6 +124,7 @@ impl ReplicaStore {
             db: Arc::clone(&self.db),
             backend,
             root_uid,
+            ignore: RwLock::default(),
         })
     }
 
@@ -170,6 +195,7 @@ pub struct Replica {
     db: Arc<StateDb>,
     backend: Arc<dyn Backend>,
     root_uid: u64,
+    ignore: RwLock<Option<Ignore>>,
 }
 
 impl std::fmt::Debug for Replica {
@@ -200,15 +226,40 @@ impl Replica {
         &self.backend
     }
 
+    /// The ignore rules listings and scans leave items out by.
+    pub(crate) fn ignore(&self) -> Option<Ignore> {
+        self.ignore
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn set_ignore(&self, ignore: Option<Ignore>) {
+        *self.ignore.write().unwrap_or_else(PoisonError::into_inner) = ignore;
+    }
+
+    /// Path of the item `uid` relative to the backend root.
+    pub(crate) fn item_path(&self, uid: u64) -> Result<Option<PathBuf>> {
+        item_path(uid, |uid| {
+            Ok(self
+                .db
+                .replica_item(uid)?
+                .map(|item| (item.parent_uid, item.name)))
+        })
+    }
+
     /// Return the uid of the item at `path`, relative to the backend root,
     /// listing and registering folders along the way whose child is missing.
-    /// Returns `None` when no such item exists.
+    /// Returns `None` when no such item exists or an ignore rule leaves it
+    /// out.
     ///
     /// # Errors
     ///
     /// Fails when a listing or the state database fails.
     pub async fn resolve(&self, path: &Path) -> Result<Option<u64>> {
+        let ignore = self.ignore();
         let mut current = self.root_uid;
+        let mut walked = PathBuf::new();
         for component in path.components() {
             let name = match component {
                 Component::Normal(name) => match name.to_str() {
@@ -218,7 +269,13 @@ impl Replica {
                 Component::RootDir | Component::CurDir => continue,
                 Component::ParentDir | Component::Prefix(_) => return Ok(None),
             };
+            walked.push(name);
             if self.db.replica_child(current, name)?.is_none() {
+                if ignore.as_ref().is_some_and(|ignore| {
+                    ignore.ignores(&walked, false) && ignore.ignores(&walked, true)
+                }) {
+                    return Ok(None);
+                }
                 self.refresh(current).await?;
             }
             let Some(child) = self.db.replica_child(current, name)? else {
@@ -242,7 +299,7 @@ impl Replica {
     }
 
     /// Fetch the children of a folder with their revisions, leaving out
-    /// temporary upload names.
+    /// temporary upload names and the items the ignore rules match.
     pub(crate) async fn fetch_children(
         &self,
         folder: &ReplicaItem,
@@ -255,6 +312,12 @@ impl Replica {
             .list_children_with_revisions(&folder.native_id)
             .await?;
         children.retain(|(entry, _)| !is_temp_upload(&entry.name));
+        if let Some(ignore) = self.ignore()
+            && let Some(folder_path) = self.item_path(folder.uid)?
+        {
+            children
+                .retain(|(entry, _)| !ignore.ignores(&folder_path.join(&entry.name), entry.is_dir));
+        }
         Ok(children)
     }
 

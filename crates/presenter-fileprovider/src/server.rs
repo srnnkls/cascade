@@ -915,6 +915,7 @@ impl Domain {
 
     async fn fetch(&self, params: FetchParams) -> CallResult<serde_json::Value> {
         let uid = item_uid(&params.uid)?;
+        self.known(uid)?;
         let handoff = self
             .cache
             .fetch(uid, params.requested_version.as_deref())
@@ -927,6 +928,7 @@ impl Domain {
 
     async fn fetch_range(&self, params: FetchRangeParams) -> CallResult<serde_json::Value> {
         let uid = item_uid(&params.uid)?;
+        self.known(uid)?;
         let handoff = self
             .cache
             .fetch_range(&RangeRequest {

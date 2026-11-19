@@ -7,7 +7,7 @@ use std::ops::Range;
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use data_encoding::HEXLOWER;
-use rusqlite::{OptionalExtension, Row, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use sha2::{Digest, Sha256};
 
 use super::StateDb;
@@ -275,8 +275,8 @@ fn has_dirty_object(tx: &Transaction<'_>, uid: u64) -> Result<bool> {
 }
 
 /// Uids of the items with a dirty object and of every folder above them.
-fn dirty_items_with_ancestors(tx: &Transaction<'_>) -> Result<HashSet<u64>> {
-    let mut statement = tx.prepare(
+fn dirty_items_with_ancestors(conn: &Connection) -> Result<HashSet<u64>> {
+    let mut statement = conn.prepare(
         "WITH RECURSIVE kept(uid) AS (
              SELECT i.uid FROM replica_items i
                  JOIN content_objects o ON o.uid = i.uid WHERE o.dirty
@@ -666,6 +666,13 @@ fn resize_edit_in(
 }
 
 impl StateDb {
+    /// Return the uids of the items with a dirty object and of every folder
+    /// above them: the items that stay while their upload is pending.
+    pub fn dirty_items_with_ancestors(&self) -> Result<HashSet<u64>> {
+        let conn = self.lock_conn()?;
+        dirty_items_with_ancestors(&conn)
+    }
+
     /// Accept a local save held by `object_id`: the object becomes the
     /// item's only, dirty and complete object, and the item takes a new
     /// content version, the saved size and last-write time and

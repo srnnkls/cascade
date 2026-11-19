@@ -175,7 +175,8 @@ impl ContentCache {
     /// # Errors
     ///
     /// Fails with [`NameError`](super::names::NameError) for a name rejected
-    /// by TR-10 before anything is applied, with [`BackendError::Conflict`]
+    /// by TR-10 or one an ignore rule matches before anything is applied,
+    /// with [`BackendError::Conflict`]
     /// when the parent holds the name, when the parent is unknown, and when
     /// the backend or the save fails.
     pub async fn create_file(
@@ -187,6 +188,7 @@ impl ContentCache {
         check_name(name)?;
         let parent = self.folder(parent_uid)?;
         let replica = self.replica(parent_uid)?;
+        self.check_child(&replica, &parent, name, false)?;
         self.ensure_absent(&parent, name).await?;
         let path = self
             .item_path(parent.uid)?

@@ -437,7 +437,9 @@ mod protocol_v2 {
     use cascade_engine::content::transfer::TransferConfig;
     use cascade_engine::db::StateDb;
     use cascade_engine::protocol::{Request, encode_message};
-    use cascade_engine::testing::{BackendLog, Disk, Fault, MockBackend, MockOp, RecordingBackend};
+    use cascade_engine::testing::{
+        BackendLog, Disk, Fault, MockBackend, MockOp, RecordingBackend, mount_point_config,
+    };
     use cascade_presenter_fileprovider::server::ContentServer;
     use cascade_presenter_fileprovider::wire::FileProviderErrorCode;
     use serde_json::{Value, json};
@@ -657,6 +659,33 @@ mod protocol_v2 {
             self.share.metadata(Path::new(path)).await.is_ok()
         }
 
+        /// Every path on the share, folders included, sorted.
+        async fn share_tree(&self) -> Vec<String> {
+            let mut found = Vec::new();
+            let mut pending = vec![String::new()];
+            while let Some(dir) = pending.pop() {
+                let entry = self.share.metadata(Path::new(&dir)).await.unwrap();
+                for child in self
+                    .share
+                    .list_children(entry.id.native_id())
+                    .await
+                    .unwrap()
+                {
+                    let path = if dir.is_empty() {
+                        child.name.clone()
+                    } else {
+                        format!("{dir}/{}", child.name)
+                    };
+                    if child.is_dir {
+                        pending.push(path.clone());
+                    }
+                    found.push(path);
+                }
+            }
+            found.sort();
+            found
+        }
+
         async fn share_bytes(&self, path: &str) -> Option<Vec<u8>> {
             let entry = self.share.metadata(Path::new(path)).await.ok()?;
             self.share.download(&entry).await.ok()
@@ -700,6 +729,19 @@ mod protocol_v2 {
 
         async fn hello_root(&self) -> Value {
             self.ok("hello", json!({"version": 2})).await["root_uid"].clone()
+        }
+
+        /// Applies a mount-point `.cascade` holding `rules`, with the backend
+        /// mounted under its id as the domain root presents it.
+        async fn ignore(&self, rules: &str) {
+            let id = self.backend.id().to_owned();
+            self.cache
+                .apply_ignore_rules(
+                    &mount_point_config(rules),
+                    &[(id.clone(), PathBuf::from(id))],
+                )
+                .await
+                .unwrap();
         }
 
         async fn modify_contents(&self, op_id: &str, uid: u64, data: &[u8]) -> Value {
@@ -1928,5 +1970,324 @@ mod protocol_v2 {
         assert!(share.metadata(Path::new("final.txt")).await.is_ok());
         assert!(share.metadata(Path::new("report.txt")).await.is_err());
         expect_signal(&mut signals, &json!({"signal": "errorResolved"})).await;
+    }
+
+    fn names_of(items: &Value) -> Vec<String> {
+        items
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_ignored_item_is_not_listed_not_in_the_working_set_and_not_served() {
+        let domain = Domain::start().await;
+        let kept = domain.add("keep.txt", b"kept").await;
+        let inside = domain.add("Mutagen/inside.bin", &pattern(10_000, 4)).await;
+        let mutagen = domain.resolve("Mutagen").await;
+        domain.ok("list", json!({"uid": uid(domain.root)})).await;
+        domain
+            .ok("fetch", json!({"op_id": "op-1", "uid": uid(inside)}))
+            .await;
+        domain
+            .ok("materializedSet", json!({"uids": [uid(inside), uid(kept)]}))
+            .await;
+        let anchor = domain.ok("currentAnchor", json!({})).await["anchor"].clone();
+
+        domain.ignore("Mutagen/\n").await;
+
+        let listed = domain.ok("list", json!({"uid": uid(domain.root)})).await;
+        assert_eq!(names_of(&listed["items"]), ["keep.txt"]);
+        let working = uids_of(&domain.all_pages("workingSet", json!({})).await);
+        assert_eq!(working, [kept.to_string()]);
+        for gone in [mutagen, inside] {
+            assert_eq!(
+                domain.error_code("item", json!({"uid": uid(gone)})).await,
+                "noSuchItem",
+                "item {gone}"
+            );
+        }
+        assert_eq!(
+            domain
+                .error_code("fetch", json!({"op_id": "op-2", "uid": uid(inside)}))
+                .await,
+            "noSuchItem"
+        );
+        let changes = domain.ok("changes", json!({"anchor": anchor})).await;
+        assert!(
+            changes["deleted"]
+                .as_array()
+                .unwrap()
+                .contains(&uid(mutagen)),
+            "no deletion of the ignored folder: {changes}"
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_is_created_renamed_moved_or_deleted_at_an_ignored_path() {
+        let domain = Domain::start().await;
+        let file = domain.add("report.txt", b"report").await;
+        domain.add("sub/inner.txt", b"inner").await;
+        let sub = domain.resolve("sub").await;
+        domain.share.add_file("only/cache.tmp", b"left to Mutagen");
+        domain.share.add_file("mixed/keep.txt", b"keep");
+        domain.share.add_file("mixed/cache.tmp", b"left to Mutagen");
+        let only = domain.resolve("only").await;
+        let mixed = domain.resolve("mixed").await;
+        domain.ok("list", json!({"uid": uid(domain.root)})).await;
+
+        domain.ignore("*.tmp\n/mock/build\n").await;
+
+        let renamed = domain
+            .ok(
+                "modify",
+                json!({
+                    "op_id": "op-1", "uid": uid(file), "changed_fields": ["name"],
+                    "name": "report.tmp", "parent_uid": uid(domain.root), "attributes": {},
+                }),
+            )
+            .await;
+        assert_eq!(renamed["item"]["name"], "report.txt");
+        assert!(domain.on_share("report.txt").await);
+        assert!(!domain.on_share("report.tmp").await);
+        let moved = domain
+            .ok(
+                "modify",
+                json!({
+                    "op_id": "op-2", "uid": uid(file), "changed_fields": ["name", "parent_uid"],
+                    "name": "moved.tmp", "parent_uid": uid(sub), "attributes": {},
+                }),
+            )
+            .await;
+        assert_eq!(moved["item"]["name"], "report.txt");
+        assert_eq!(moved["item"]["parent_uid"], uid(domain.root));
+        assert!(!domain.on_share("sub/moved.tmp").await);
+        let anchored = domain
+            .ok(
+                "modify",
+                json!({
+                    "op_id": "op-3", "uid": uid(sub), "changed_fields": ["name"],
+                    "name": "build", "parent_uid": uid(domain.root), "attributes": {},
+                }),
+            )
+            .await;
+        assert_eq!(anchored["item"]["name"], "sub");
+        assert!(!domain.on_share("build").await);
+
+        for (op_id, name) in [("op-4", "scratch.tmp"), ("op-5", "build")] {
+            let create = json!({
+                "op_id": op_id, "parent_uid": uid(domain.root), "name": name,
+                "kind": "folder", "attributes": {}, "may_already_exist": false,
+            });
+            assert_eq!(
+                domain.error_code("create", create).await,
+                "excludedFromSync",
+                "create {name}"
+            );
+            assert!(!domain.on_share(name).await, "{name} reached the share");
+        }
+        domain
+            .ok(
+                "create",
+                json!({
+                    "op_id": "op-6", "parent_uid": uid(sub), "name": "build",
+                    "kind": "folder", "attributes": {}, "may_already_exist": false,
+                }),
+            )
+            .await;
+        assert!(
+            domain.on_share("sub/build").await,
+            "an anchored rule refused the name below the root"
+        );
+
+        let listed = domain.ok("list", json!({"uid": uid(only)})).await;
+        assert_eq!(names_of(&listed["items"]), Vec::<String>::new());
+        for (op_id, recursive) in [("op-7", false), ("op-8", true)] {
+            assert_eq!(
+                domain
+                    .error_code(
+                        "delete",
+                        json!({"op_id": op_id, "uid": uid(only), "recursive": recursive}),
+                    )
+                    .await,
+                "directoryNotEmpty",
+                "delete of a folder holding only ignored entries, recursive {recursive}"
+            );
+        }
+        assert!(domain.on_share("only/cache.tmp").await);
+        assert_eq!(
+            domain
+                .error_code(
+                    "delete",
+                    json!({"op_id": "op-9", "uid": uid(mixed), "recursive": true}),
+                )
+                .await,
+            "directoryNotEmpty"
+        );
+        assert!(domain.on_share("mixed/keep.txt").await);
+        assert!(domain.on_share("mixed/cache.tmp").await);
+    }
+
+    #[tokio::test]
+    async fn a_folder_move_carrying_or_landing_an_ignored_entry_answers_the_item_unmoved() {
+        let domain = Domain::start().await;
+        for path in [
+            "only/cache.tmp",
+            "deep/scratch/inner.txt",
+            "deep/kept.txt",
+            "proj/mirror/m.txt",
+            "proj/src.txt",
+            "b/keep.txt",
+            "mover/x.log",
+            "staging/build/out.txt",
+            "plain/a.txt",
+            "plain/sub/b.txt",
+        ] {
+            domain.share.add_file(path, path.as_bytes());
+        }
+        domain.ok("list", json!({"uid": uid(domain.root)})).await;
+
+        domain
+            .ignore("*.tmp\nscratch\n/mock/proj/mirror/\nmock/b/**/*.log\n/mock/a/build/\n")
+            .await;
+
+        let mut failures = Vec::new();
+        for (op_id, case, folder, parent, name) in [
+            (
+                "op-1",
+                "(a) only/cache.tmp under *.tmp",
+                "only",
+                "",
+                "only2",
+            ),
+            (
+                "op-2",
+                "(a) deep/scratch under scratch",
+                "deep",
+                "",
+                "deep2",
+            ),
+            (
+                "op-3",
+                "(b) proj/mirror under /mock/proj/mirror/",
+                "proj",
+                "",
+                "proj2",
+            ),
+            (
+                "op-4",
+                "(c) x.log lands under mock/b/**/*.log",
+                "mover",
+                "b",
+                "mover",
+            ),
+            (
+                "op-5",
+                "(c) build/ lands on /mock/a/build/",
+                "staging",
+                "",
+                "a",
+            ),
+        ] {
+            let tree = domain.share_tree().await;
+            let moves = domain.log.calls(MockOp::Move);
+            let item = domain.resolve(folder).await;
+            let parent_uid = if parent.is_empty() {
+                domain.root
+            } else {
+                domain.resolve(parent).await
+            };
+            let reply = domain
+                .ok(
+                    "modify",
+                    json!({
+                        "op_id": op_id, "uid": uid(item), "changed_fields": ["name", "parent_uid"],
+                        "name": name, "parent_uid": uid(parent_uid), "attributes": {},
+                    }),
+                )
+                .await;
+            if reply["item"]["name"] != folder || reply["item"]["parent_uid"] != uid(domain.root) {
+                failures.push(format!(
+                    "{case}: answered {} in {}",
+                    reply["item"]["name"], reply["item"]["parent_uid"]
+                ));
+            }
+            if domain.log.calls(MockOp::Move) != moves {
+                failures.push(format!("{case}: the backend took a Move"));
+            }
+            let after = domain.share_tree().await;
+            if after != tree {
+                failures.push(format!("{case}: the share changed to {after:?}"));
+            }
+        }
+
+        let moves = domain.log.calls(MockOp::Move);
+        let plain = domain.resolve("plain").await;
+        let reply = domain
+            .ok(
+                "modify",
+                json!({
+                    "op_id": "op-6", "uid": uid(plain), "changed_fields": ["name"],
+                    "name": "plain2", "parent_uid": uid(domain.root), "attributes": {},
+                }),
+            )
+            .await;
+        if reply["item"]["name"] != "plain2" {
+            failures.push(format!("(d) guard: answered {}", reply["item"]["name"]));
+        }
+        let tree = domain.share_tree().await;
+        if domain.log.calls(MockOp::Move) != moves + 1
+            || !tree.contains(&"plain2/sub/b.txt".to_owned())
+            || tree.iter().any(|path| path.starts_with("plain/"))
+        {
+            failures.push(format!("(d) guard: the share holds {tree:?}"));
+        }
+
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    #[tokio::test]
+    async fn create_of_an_ignored_name_in_another_case_is_excluded_from_sync() {
+        let domain = Domain::start().await;
+
+        domain.ignore("Mutagen/\n").await;
+
+        let create = json!({
+            "op_id": "op-1", "parent_uid": uid(domain.root), "name": "mutagen",
+            "kind": "folder", "attributes": {}, "may_already_exist": false,
+        });
+        assert_eq!(
+            domain.error_code("create", create).await,
+            "excludedFromSync"
+        );
+        assert!(
+            !domain.on_share("mutagen").await,
+            "mutagen reached the share"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_config_without_ignore_rules_leaves_listings_and_mutations_unchanged() {
+        let domain = Domain::start().await;
+        domain.add("Mutagen/inside.bin", b"inside").await;
+        domain.add("scratch.tmp", b"scratch").await;
+        let before = domain.ok("list", json!({"uid": uid(domain.root)})).await;
+
+        domain.ignore("# no ignore rules\n").await;
+
+        let after = domain.ok("list", json!({"uid": uid(domain.root)})).await;
+        assert_eq!(after["items"], before["items"]);
+        domain
+            .ok(
+                "create",
+                json!({
+                    "op_id": "op-1", "parent_uid": uid(domain.root), "name": "build.tmp",
+                    "kind": "folder", "attributes": {}, "may_already_exist": false,
+                }),
+            )
+            .await;
+        assert!(domain.on_share("build.tmp").await);
     }
 }

@@ -9,9 +9,9 @@ use anyhow::{Context as _, Result, bail};
 use nfs3_client::nfs3_types::nfs3::{
     ACCESS3args, COMMIT3args, CREATE3args, FSINFO3args, FSINFO3resok, FSSTAT3args, GETATTR3args,
     LOOKUP3args, MKDIR3args, Nfs3Option, Nfs3Result, PATHCONF3args, READ3args, READDIR3args,
-    READDIRPLUS3args, REMOVE3args, RENAME3args, RMDIR3args, SETATTR3args, WRITE3args, WRITE3resok,
-    cookieverf3, createhow3, diropargs3, fattr3, filename3, ftype3, nfs_fh3, nfsstat3, sattr3,
-    stable_how, writeverf3,
+    READDIRPLUS3args, REMOVE3args, RENAME3args, RMDIR3args, SETATTR3args, SYMLINK3args, WRITE3args,
+    WRITE3resok, cookieverf3, createhow3, diropargs3, fattr3, filename3, ftype3, nfs_fh3, nfspath3,
+    nfsstat3, sattr3, stable_how, symlinkdata3, writeverf3,
 };
 use nfs3_client::nfs3_types::xdr_codec::{Opaque, Pack, Unpack};
 use nfs3_client::tokio::{TokioConnector, TokioIo};
@@ -266,6 +266,18 @@ impl Client {
             attributes: sattr3::default(),
         };
         let reply = bounded("MKDIR", self.conn.mkdir(&args)).await?;
+        Ok(code(&status(reply)))
+    }
+
+    pub async fn symlink(&mut self, dir: &nfs_fh3, entry: &str, target: &str) -> Result<nfsstat3> {
+        let args = SYMLINK3args {
+            where_: dirop(dir, entry),
+            symlink: symlinkdata3 {
+                symlink_attributes: sattr3::default(),
+                symlink_data: nfspath3::from(target.as_bytes().to_vec()),
+            },
+        };
+        let reply = bounded("SYMLINK", self.conn.symlink(&args)).await?;
         Ok(code(&status(reply)))
     }
 

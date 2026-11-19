@@ -15,7 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::PoisonError;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -25,7 +25,7 @@ use tokio::time::Instant;
 
 use super::ObjectId;
 use super::cache::{ContentCache, Slot, Source};
-use super::replica::{ItemKind, ReplicaItem, item_path};
+use super::replica::{ItemKind, ReplicaItem};
 use super::transfer::{CacheSignal, Failure};
 use crate::backend::BackendError;
 use crate::db::content::ContentObject;
@@ -219,26 +219,6 @@ enum Removal {
     Busy,
 }
 
-/// The files of `items` with their paths relative to the backend root, in
-/// path order.
-fn file_paths(items: Vec<ReplicaItem>) -> Result<Vec<(PathBuf, ReplicaItem)>> {
-    let parents: HashMap<u64, (Option<u64>, String)> = items
-        .iter()
-        .map(|item| (item.uid, (item.parent_uid, item.name.clone())))
-        .collect();
-    let mut files = Vec::new();
-    for item in items {
-        if item.kind != ItemKind::File {
-            continue;
-        }
-        if let Some(path) = item_path(item.uid, |uid| Ok(parents.get(&uid).cloned()))? {
-            files.push((path, item));
-        }
-    }
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(files)
-}
-
 impl ContentCache {
     /// Sets `cache.max_size`, the bound of the sweep and of pinned bytes.
     pub fn set_max_size(&self, bytes: u64) {
@@ -323,7 +303,8 @@ impl ContentCache {
     }
 
     /// Makes the files `matches` accepts, given a backend id and a path
-    /// relative to its root, the items pinned by rules: rule pins of other
+    /// relative to its root, and no ignore rule matches the items pinned by
+    /// rules: rule pins of other
     /// items are cleared, and new matches are pinned in path order until
     /// pinned bytes reach the cache maximum and downloaded in the
     /// background; the remaining matches are logged and refused. Explicit
@@ -336,8 +317,16 @@ impl ContentCache {
         let mut wanted = Vec::new();
         for replica in self.replicas() {
             let backend_id = replica.backend_id();
-            for (path, item) in file_paths(self.db().replica_items_of(backend_id)?)? {
-                if matches(backend_id, &path) {
+            let ignore = replica.ignore();
+            let mut files = self.item_paths(backend_id)?;
+            files.retain(|(_, item)| item.kind == ItemKind::File);
+            files.sort_by(|a, b| a.0.cmp(&b.0));
+            for (path, item) in files {
+                if matches(backend_id, &path)
+                    && !ignore
+                        .as_ref()
+                        .is_some_and(|ignore| ignore.ignores(&path, false))
+                {
                     wanted.push(item.uid);
                 }
             }

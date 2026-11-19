@@ -360,21 +360,55 @@ impl Engine<TokioRuntimeHandle, NativeClock> {
                 cache
             }
         };
-        let backends: Vec<_> = self
-            .vfs
+        for (_, backend) in self.mounted_backends() {
+            cache.register(backend)?;
+        }
+        self.cache
+            .attach_content(cache.clone(), self.content_mounts());
+        Ok(cache)
+    }
+
+    /// The mounted backends with their mount prefixes.
+    #[cfg(unix)]
+    fn mounted_backends(&self) -> Vec<(PathBuf, Arc<dyn Backend>)> {
+        self.vfs
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .children()
             .iter()
             .map(|(prefix, backend)| (prefix.clone(), Arc::clone(backend)))
-            .collect();
-        let mut mounts = Vec::with_capacity(backends.len());
-        for (prefix, backend) in backends {
-            mounts.push((backend.id().to_owned(), prefix));
-            cache.register(backend)?;
+            .collect()
+    }
+
+    /// The id and mount prefix of every mounted backend.
+    #[cfg(unix)]
+    fn content_mounts(&self) -> Vec<(String, PathBuf)> {
+        self.mounted_backends()
+            .into_iter()
+            .map(|(prefix, backend)| (backend.id().to_owned(), prefix))
+            .collect()
+    }
+
+    /// Applies the ignore rules of `resolved` to the content cache, matched
+    /// at each backend's mount prefix; see
+    /// [`ContentCache::apply_ignore_rules`]. Does nothing when no content
+    /// cache is configured.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the content cache cannot be opened or the state database
+    /// fails.
+    #[cfg(unix)]
+    pub async fn apply_ignore_rules(
+        &self,
+        resolved: &cascade_config::types::ResolvedConfig,
+    ) -> Result<()> {
+        if self.content_dirs.is_none() {
+            return Ok(());
         }
-        self.cache.attach_content(cache.clone(), mounts);
-        Ok(cache)
+        self.content_cache()?
+            .apply_ignore_rules(resolved, &self.content_mounts())
+            .await
     }
 
     /// Pins the content cache's items that the stored pin rules or the

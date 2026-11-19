@@ -593,6 +593,9 @@ impl ContentCache {
             tracing::warn!(uid, error = %format!("{error:#}"), "upload failed; retrying later");
         }
         if matches!(outcome, Ok(Uploaded::Clean)) {
+            if let Err(error) = self.remove_if_ignored(uid).await {
+                tracing::warn!(uid, error = %format!("{error:#}"), "ignored item not removed");
+            }
             self.shared().working_set.raise();
         }
         self.shared().writeback.finish(uid, &outcome);

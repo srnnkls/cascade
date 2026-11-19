@@ -19,9 +19,10 @@ use std::sync::{Arc, PoisonError};
 use anyhow::{Result, anyhow};
 use tokio::sync::broadcast;
 
-use super::domain::WorkingSetSignal;
+use super::domain::{DomainError, WorkingSetSignal};
 use super::evict::{Eviction, ReadGuard};
-use super::names::check_name;
+use super::ignore::IgnoreRules;
+use super::names::{NameError, check_name};
 use super::range_map::{RangeMap, align};
 use super::replica::{ItemKind, Replica, ReplicaItem, ReplicaStore};
 use super::store::ObjectStore;
@@ -107,6 +108,7 @@ pub(super) struct Shared {
     pub(super) writeback: WriteBack,
     pub(super) eviction: Eviction,
     pub(super) working_set: WorkingSetSignal,
+    pub(super) ignore: std::sync::RwLock<IgnoreRules>,
 }
 
 /// Cache of the replica store's content: one sparse object per cached item
@@ -158,6 +160,7 @@ impl ContentCache {
                 writeback: WriteBack::new(config.upload_transfers),
                 eviction: Eviction::default(),
                 working_set: WorkingSetSignal::default(),
+                ignore: std::sync::RwLock::default(),
             }),
         })
     }
@@ -181,6 +184,7 @@ impl ContentCache {
         }
         let id = backend.id().to_owned();
         let replica = Arc::new(self.shared.replicas.replica(backend)?);
+        replica.set_ignore(self.ignore_of(&id));
         self.shared
             .backends
             .write()
@@ -536,6 +540,26 @@ impl ContentCache {
         super::replica::item_path(uid, |uid| {
             Ok(self.item(uid)?.map(|item| (item.parent_uid, item.name)))
         })
+    }
+
+    /// Every item of the backend `backend_id` with its path relative to the
+    /// backend root, in uid order; an item whose ancestor the replica no
+    /// longer holds is left out.
+    pub(super) fn item_paths(&self, backend_id: &str) -> Result<Vec<(PathBuf, ReplicaItem)>> {
+        let items = self.db().replica_items_of(backend_id)?;
+        let parents: HashMap<u64, (Option<u64>, String)> = items
+            .iter()
+            .map(|item| (item.uid, (item.parent_uid, item.name.clone())))
+            .collect();
+        let mut paths = Vec::new();
+        for item in items {
+            if let Some(path) =
+                super::replica::item_path(item.uid, |uid| Ok(parents.get(&uid).cloned()))?
+            {
+                paths.push((path, item));
+            }
+        }
+        Ok(paths)
     }
 
     /// The entry and revision at the item's current path, or `None` when the
@@ -898,23 +922,35 @@ impl ContentCache {
     ///
     /// # Errors
     ///
-    /// Fails with [`NameError`](super::names::NameError) for a name rejected by TR-10 before anything
-    /// is applied, when either item is unknown, and when the backend fails.
+    /// Fails with [`NameError`] for a name rejected by TR-10, a target an
+    /// ignore rule matches and a folder whose backend subtree holds an entry
+    /// an ignore rule matches at its current path or at its path under the
+    /// target, before anything is applied; when either item is unknown, and
+    /// when the backend fails.
     pub async fn rename(&self, uid: u64, parent_uid: u64, name: &str) -> Result<ReplicaItem> {
         check_name(name)?;
         let parent = self.folder(parent_uid)?;
         let replica = self.replica(uid)?;
+        let folder = self.item(uid)?.filter(|item| item.kind == ItemKind::Folder);
+        self.check_child(&replica, &parent, name, folder.is_some())?;
         let _operation = self.shared.writeback.lock(uid).await;
         let item_path = self
             .item_path(uid)?
             .ok_or_else(|| BackendError::NotFound(format!("item {uid}")))?;
-        if self.item(uid)?.and_then(|item| item.parent_uid) != Some(parent.uid) {
-            self.remove_temp_upload(&replica, uid, &item_path).await?;
-        }
         let target = self
             .item_path(parent.uid)?
             .ok_or_else(|| BackendError::NotFound(format!("item {parent_uid}")))?
             .join(name);
+        if let Some(folder) = &folder
+            && let Some(path) = self
+                .ignored_entry(&replica, folder, &item_path, &target)
+                .await?
+        {
+            return Err(NameError::Ignored(path.display().to_string()).into());
+        }
+        if self.item(uid)?.and_then(|item| item.parent_uid) != Some(parent.uid) {
+            self.remove_temp_upload(&replica, uid, &item_path).await?;
+        }
         let remote = &self.shared.remote;
         let backend = replica.backend();
         let entry = remote.call(backend.move_entry(&item_path, &target)).await?;
@@ -922,8 +958,11 @@ impl ContentCache {
     }
 
     /// Deletes the item with its descendants on the backend and in the
-    /// replica. The item is marked as being deleted before the backend
-    /// steps, so write-back skips it and a restart finishes the delete; the
+    /// replica; a folder whose subtree on the backend holds an entry an
+    /// ignore rule matches is refused with
+    /// [`DomainError::DirectoryNotEmpty`]. The item is marked as being
+    /// deleted before the backend steps, so write-back skips it and a
+    /// restart finishes the delete; the
     /// temporary file of its dirty object is removed before the item, and its
     /// objects stay until both backend steps returned. A failure of either
     /// step clears the mark and leaves the item as it was. An unknown item is
@@ -933,10 +972,19 @@ impl ContentCache {
     ///
     /// Fails when the backend or the state database fails.
     pub async fn delete(&self, uid: u64) -> Result<()> {
-        if self.item(uid)?.is_none() {
+        let Some(item) = self.item(uid)? else {
             return Ok(());
-        }
+        };
         let replica = self.replica(uid)?;
+        if item.kind == ItemKind::Folder
+            && let Some(path) = self.item_path(uid)?
+            && self
+                .ignored_entry(&replica, &item, &path, &path)
+                .await?
+                .is_some()
+        {
+            return Err(DomainError::DirectoryNotEmpty.into());
+        }
         let _operation = self.shared.writeback.lock(uid).await;
         let Some(path) = self.item_path(uid)? else {
             return Ok(());
@@ -991,13 +1039,15 @@ impl ContentCache {
     ///
     /// # Errors
     ///
-    /// Fails with [`NameError`](super::names::NameError) for a name rejected by TR-10 before anything
-    /// is applied, with [`BackendError::Conflict`] when the parent holds the
-    /// name, when the parent is unknown, and when the backend fails.
+    /// Fails with [`NameError`] for a name rejected by TR-10 or one an
+    /// ignore rule matches before anything is applied, with
+    /// [`BackendError::Conflict`] when the parent holds the name, when the
+    /// parent is unknown, and when the backend fails.
     pub async fn create_folder(&self, parent_uid: u64, name: &str) -> Result<ReplicaItem> {
         check_name(name)?;
         let parent = self.folder(parent_uid)?;
         let replica = self.replica(parent_uid)?;
+        self.check_child(&replica, &parent, name, true)?;
         self.ensure_absent(&parent, name).await?;
         let path = self
             .item_path(parent.uid)?

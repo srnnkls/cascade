@@ -453,8 +453,8 @@ impl Backend for NullBackend {
         Ok((vec![], Cursor("null".to_string())))
     }
 
-    async fn metadata(&self, _path: &Path) -> anyhow::Result<FileEntry> {
-        anyhow::bail!("null backend has no files")
+    async fn metadata(&self, path: &Path) -> anyhow::Result<FileEntry> {
+        Err(BackendError::NotFound(format!("null backend has no file {}", path.display())).into())
     }
 
     async fn download(&self, _file: &FileEntry) -> anyhow::Result<Vec<u8>> {

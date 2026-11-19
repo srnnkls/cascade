@@ -1099,6 +1099,35 @@ Keep Downloaded and `.cascade` pin rules set `replica_items.pinned`, reported to
 
 `cache.max_size` and the pin rules are read at daemon start from the `.cascade` files in the mount-point directory, before the NFS volume is mounted over it, and from the stored pin rules.
 
+### Ignore rules
+
+The ignore rules of the `.cascade` files in the mount-point directory apply to the content cache and to every backend it serves. They are read at daemon start, with the pin rules and `cache.max_size`, and applied before recovery; a change takes effect at the next start. `.cascade` files on the share are not read under `--app-group`, and an ignore rule with conditions has no effect there: the content cache compiles only the rules without conditions.
+
+Matching follows gitignore, against the item's path relative to the mount root with the backend's mount prefix included, so a backend mounted at `nas` holds `nas/Mutagen/x.bin`. It ignores case, as SMB shares and APFS do: `Mutagen/` also matches `mutagen` and `MUTAGEN`, and `Über/` matches `über`. The `ignore` crate's case-insensitive mode folds ASCII; non-ASCII characters of rules and paths are lower-cased before matching. `IgnoreMatcher` in `cascade-config` owns the matching, with the gitignore matcher of the `ignore` crate. The content cache builds one from the rules without conditions in `ContentCache::apply_ignore_rules`; the sync runner matches every rule through `ResolvedConfig::is_ignored`.
+
+| Rule | Matches |
+|------|---------|
+| `Mutagen` | the name at any depth |
+| `/nas/build`, `nas/docs/tmp` | the path from the mount root; a leading or inner slash anchors |
+| `cache/` | folders only, at any depth |
+| `*.tmp`, `nas/*.tmp` | `*` within one path segment |
+| `nas/**/scratch` | `**` across segments, zero included |
+| `!keep.log` | re-includes; the last matching rule wins |
+
+A path beneath an ignored folder is ignored, and no rule re-includes it. Temporary upload names (`.cascade-tmp-*`) are never ignored.
+
+An ignored item is not in the replica. Listings and scans leave it out and never list an ignored folder's children; path resolution answers that it does not exist. At start, the items the rules match are removed with their cached objects and leave tombstones, so File Provider sees deletions. An item with a dirty or edited object below it stays until its upload finished, and is removed after it. Pin rules and Keep Downloaded reach no ignored item.
+
+Cascade creates, writes, renames, moves and deletes nothing at an ignored path:
+
+| Request | File Provider | NFS |
+|---------|---------------|-----|
+| Create of an ignored name | `excludedFromSync`; the item stays on the Mac | CREATE, MKDIR, SYMLINK: `NFS3ERR_ACCES` |
+| Rename or move onto an ignored path | the item under its current name, nothing applied | RENAME: `NFS3ERR_ACCES` |
+| Rename or move of a folder whose subtree on the server holds an ignored entry, or would place an entry on an ignored path | the item under its current name, nothing moved | RENAME: `NFS3ERR_ACCES` |
+| `item`, `fetch`, LOOKUP of an ignored item | `noSuchItem` | `NFS3ERR_NOENT` |
+| Delete of a folder holding an ignored entry on the server, recursive or not | `directoryNotEmpty`, nothing deleted | RMDIR: `NFS3ERR_NOTEMPTY` |
+
 ### App Group container and the daemon process
 
 The host app `CascadeFileProviderHost` is an unsandboxed menu-bar agent registered as a login item through `SMAppService`. It embeds the extension and the `cascade` binary, which the build phase `swift/CascadeFileProvider/Scripts/embed-cascade.sh` compiles with cargo and signs with the team identity and the hardened runtime. On launch it registers the domain `io.cascade.fileprovider.default`, starts `cascade start --app-group <container>` with its output appended to `daemon.log` in the container, adopts a daemon already serving the socket, restarts the daemon five seconds after it exits, and sends it `SIGTERM` on Quit. It subscribes to the daemon's signal stream and relays `workingSet`, `errorResolved`, `evict` and `requestDownload` to `NSFileProviderManager`; only a process whose main bundle embeds the extension can signal the domain.

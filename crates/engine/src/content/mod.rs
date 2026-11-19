@@ -14,6 +14,8 @@ pub mod domain;
 mod edit;
 #[cfg(unix)]
 pub mod evict;
+#[cfg(unix)]
+mod ignore;
 #[cfg(all(test, cascade_loom, unix))]
 mod loom_model;
 pub mod names;

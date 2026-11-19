@@ -6,6 +6,8 @@ use std::time::Duration;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::matcher::IgnoreMatcher;
+
 /// Parsed contents of a `.cascade` file.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -336,82 +338,20 @@ pub struct ResolvedConfig {
 }
 
 impl ResolvedConfig {
-    /// Check if a given path should be ignored.
+    /// Whether `path`, the full VFS path relative to the mount root, is
+    /// ignored under gitignore semantics; see [`IgnoreMatcher::is_ignored`].
     #[must_use]
     pub fn is_ignored(&self, path: &str, is_dir: bool) -> bool {
-        let mut ignored = false;
-        for rule in &self.ignores {
-            if (!is_dir || !rule.dir_only) && glob_match(&rule.pattern, path) {
-                ignored = !rule.negated;
-            }
-        }
-        ignored
+        self.ignore_matcher().is_ignored(path, is_dir)
+    }
+
+    /// The ignore rules compiled for matching many paths.
+    #[must_use]
+    pub fn ignore_matcher(&self) -> IgnoreMatcher {
+        IgnoreMatcher::new(&self.ignores)
     }
 }
 
-/// Simple glob matching. Supports `*` (any non-slash) and `**` (any including slashes).
-/// Full production matching uses the `ignore` crate from ripgrep; this covers
-/// the basic cases needed for Phase 1.
-fn glob_match(pattern: &str, path: &str) -> bool {
-    if pattern.contains("**") {
-        let parts: Vec<&str> = pattern.split("**").collect();
-        if let [prefix, suffix] = parts.as_slice() {
-            let prefix_ok = prefix.is_empty() || path.starts_with(*prefix);
-            let suffix_ok = suffix.is_empty() || path.ends_with(*suffix);
-            return prefix_ok && suffix_ok;
-        }
-    }
-    // Single `*` matches any sequence of non-separator characters
-    if pattern.contains('*') {
-        return star_match(pattern, path);
-    }
-    pattern == path || path.ends_with(&format!("/{pattern}"))
-}
-
-/// Match a pattern with `*` wildcards (no `**`) against a path.
-fn star_match(pattern: &str, path: &str) -> bool {
-    let segments: Vec<&str> = pattern.split('*').collect();
-    if segments.len() == 1 {
-        return pattern == path;
-    }
-    // Must match start and end
-    let first = segments.first().copied().unwrap_or("");
-    let last = segments.last().copied().unwrap_or("");
-
-    // Strip the fixed prefix from the front of path
-    let after_prefix = if first.is_empty() {
-        path
-    } else if let Some(rest) = path.strip_prefix(first) {
-        rest
-    } else {
-        return false;
-    };
-
-    // Strip the fixed suffix from the end of the remaining path
-    let middle = if last.is_empty() {
-        after_prefix
-    } else if let Some(rest) = after_prefix.strip_suffix(last) {
-        rest
-    } else {
-        return false;
-    };
-
-    // Check intermediate segments appear in order within `middle`
-    let inner_segments = segments.get(1..segments.len() - 1).unwrap_or(&[]);
-    let mut remaining = middle;
-    for seg in inner_segments {
-        if seg.is_empty() {
-            continue;
-        }
-        // Split on the first occurrence of `seg`; advance past it.
-        if let Some((_before, after)) = remaining.split_once(seg) {
-            remaining = after;
-        } else {
-            return false;
-        }
-    }
-    true
-}
 #[cfg(test)]
 mod tests {
     use super::*;
