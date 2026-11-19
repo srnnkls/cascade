@@ -16,6 +16,16 @@ impl ContentCache {
             .any(|replica| replica.backend_id() == backend_id)
     }
 
+    /// The id of the backend holding the item `uid`; `None` for a
+    /// tombstoned item and an unknown uid.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the state database fails.
+    pub fn item_backend(&self, uid: u64) -> Result<Option<String>> {
+        self.db().replica_item_backend(uid)
+    }
+
     /// The uid of the item at `path`, relative to the root of the registered
     /// backend `backend_id`, listing and registering folders along the way
     /// whose child is missing. Returns `None` when no such item exists.

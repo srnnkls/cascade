@@ -6,7 +6,7 @@
 //! against the manifest to detect new, modified, and deleted files.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Component, Path};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -221,19 +221,30 @@ pub async fn walk_tree(root: &Path) -> anyhow::Result<Vec<FileState>> {
     Ok(states)
 }
 
+/// Name of the backend's own directory under its root, holding the manifest.
+pub const MANIFEST_DIR: &str = ".cascade-cache";
+
+/// Whether the root-relative `relative` path is the manifest directory or
+/// lies inside it.
+#[must_use]
+pub fn is_manifest_path(relative: &Path) -> bool {
+    relative
+        .components()
+        .find(|c| !matches!(c, Component::RootDir | Component::CurDir))
+        .is_some_and(|first| first.as_os_str() == MANIFEST_DIR)
+}
+
 /// Whether a path should be skipped during directory walking.
 #[must_use]
 pub fn should_skip_entry(path: &Path, root: &Path) -> bool {
     let relative = path.strip_prefix(root).unwrap_or(path);
+    if is_manifest_path(relative) {
+        return true;
+    }
     let components: Vec<&str> = relative
         .components()
         .filter_map(|c| c.as_os_str().to_str())
         .collect();
-
-    // Skip the manifest cache directory.
-    if components.first() == Some(&".cascade-cache") {
-        return true;
-    }
 
     // Skip .cascade config files (they are not content).
     if components

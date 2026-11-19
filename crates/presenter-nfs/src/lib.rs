@@ -7,7 +7,7 @@
         clippy::string_slice
     )
 )]
-//! NFS presenter — `NFSv3` server on loopback.
+//! NFS presenter — `NFSv3` server on loopback through `nfs3_server`.
 //!
 //! Implements the engine's `VfsPresenter` trait, serving files via `NFSv3`
 //! to the OS NFS client.
@@ -21,7 +21,6 @@ use async_trait::async_trait;
 use cascade_engine::presenter::VfsPresenter;
 use cascade_engine::types::{CacheState, ItemId, VfsItem};
 use nfs::context::NfsContext;
-use nfs::xdr::NfsFh3;
 
 /// Directory used for cached file contents.
 const CACHE_DIR_NAME: &str = "cascade/cache";
@@ -144,9 +143,7 @@ impl VfsPresenter for NfsPresenter {
         // find it. Build a VFS path from the item's display name.
         let vfs_path = format_vfs_path(&item);
         let fh_key = self.context.register_path(&vfs_path);
-        let fh = NfsFh3::from_item_id(&fh_key.to_string());
         tracing::trace!(path = %vfs_path, fh_key, "registered NFS file handle");
-        let _ = fh; // fh is used implicitly through the context's fh_map
         Ok(())
     }
 

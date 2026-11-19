@@ -199,13 +199,12 @@ async fn a_file_fetched_through_the_socket_is_read_through_nfs_without_a_second_
     );
     let fetched_before = log.fetched();
 
-    let nfs = Arc::clone(daemon.nfs());
     let len = u32::try_from(data.len()).unwrap();
-    let (bytes, eof) =
-        tokio::task::spawn_blocking(move || nfs.read_range_blocking("/nas/song.bin", 0, len))
-            .await
-            .unwrap()
-            .unwrap();
+    let (bytes, eof) = daemon
+        .nfs()
+        .read_range("/nas/song.bin", 0, len)
+        .await
+        .unwrap();
 
     assert_eq!(bytes, data);
     assert!(eof);

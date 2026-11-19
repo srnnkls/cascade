@@ -158,47 +158,79 @@ fn is_windows_process_not_found_matches_taskkill_messages() {
     ));
 }
 
-// -- Permission escalation (macOS only) ---
+// --- macOS NFS mount as the current user ---
 
+/// The `mount_nfs` command `nfs::mount_nfs` runs for the server on `port`,
+/// built without running it.
 #[cfg(target_os = "macos")]
-#[test]
-fn is_permission_error_detects_operation_not_permitted() {
-    assert!(is_permission_error(
-        "mount_nfs: can't mount / from 127.0.0.1 onto /tmp/cloud: Operation not permitted"
-    ));
+fn macos_mount_args(mount_point: &Path, port: u16) -> (String, Vec<String>) {
+    let cmd = nfs::macos_nfs_mount_command(mount_point, port);
+    let args = cmd
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    (cmd.get_program().to_string_lossy().into_owned(), args)
 }
 
 #[cfg(target_os = "macos")]
 #[test]
-fn is_permission_error_rejects_other_errors() {
-    assert!(!is_permission_error("mount_nfs: No such file or directory"));
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn osascript_mount_command_constructs_correctly() {
+fn macos_nfs_mount_is_mount_nfs_v3_over_tcp_on_the_server_port_without_resvport() {
     let dir = TempDir::new().unwrap();
     let mount_point = dir.path().join("Cloud");
-    let cmd = osascript_mount_command(&mount_point, 12345);
 
-    assert_eq!(cmd.get_program(), "osascript");
-    let args: Vec<String> = cmd
-        .get_args()
-        .map(std::ffi::OsStr::to_string_lossy)
-        .map(std::borrow::Cow::into_owned)
-        .collect();
-    assert_eq!(args[0], "-e");
-    assert!(args[1].contains("with administrator privileges"));
-    assert!(args[1].contains("port=12345"));
-    assert!(args[1].contains(mount_point.to_str().unwrap()));
+    let (program, args) = macos_mount_args(&mount_point, 12345);
+
+    assert_eq!(program, "/sbin/mount_nfs");
+    assert_eq!(
+        args,
+        [
+            "-o",
+            "vers=3,tcp,port=12345,mountport=12345,locallocks,rsize=1048576,wsize=1048576",
+            "127.0.0.1:/",
+            mount_point.to_str().unwrap(),
+        ]
+    );
 }
 
 #[cfg(target_os = "macos")]
 #[test]
-fn mount_nfs_on_unreachable_port_errors_without_privilege_escalation() {
-    assert!(!is_permission_error("Connection refused"));
-    assert!(!is_permission_error("No such file or directory"));
-    assert!(is_permission_error("Operation not permitted"));
+fn macos_nfs_mount_runs_neither_osascript_nor_sudo() {
+    let dir = TempDir::new().unwrap();
+    let mount_point = dir.path().join("Cloud");
+
+    let (program, args) = macos_mount_args(&mount_point, 2049);
+
+    for word in std::iter::once(&program).chain(&args) {
+        assert!(
+            !word.contains("osascript") && !word.contains("sudo"),
+            "{program} {args:?}"
+        );
+        assert!(!word.contains("administrator privileges"), "{args:?}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_nfs_mount_on_a_port_nobody_listens_on_errors_and_leaves_the_mount_point_unmounted() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let dir = TempDir::new().unwrap();
+    let mount_point = dir.path().join("Cloud");
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+
+    let result = nfs::mount_nfs(&mount_point, port);
+
+    assert!(result.is_err(), "mount on port {port} nobody listens on");
+    assert_eq!(
+        std::fs::metadata(&mount_point).unwrap().dev(),
+        std::fs::metadata(dir.path()).unwrap().dev(),
+        "a file system is mounted at {}",
+        mount_point.display()
+    );
 }
 
 // --- WebDAV mount command construction ---

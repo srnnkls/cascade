@@ -80,6 +80,32 @@ impl ContentCache {
         Ok(item)
     }
 
+    /// Syncs the data of the item's current object to disk: its object
+    /// awaiting upload, or else the object of its content version. An item
+    /// without an object has nothing to sync. Records nothing.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the item is unknown or the object cannot be synced.
+    pub async fn sync(&self, uid: u64) -> Result<()> {
+        let _operation = self.shared().writeback.lock(uid).await;
+        let item = self
+            .item(uid)?
+            .ok_or_else(|| BackendError::NotFound(format!("item {uid}")))?;
+        let current = match self.dirty_object(uid)? {
+            Some(object) => Some(object),
+            None => self
+                .db()
+                .content_objects_of(uid)?
+                .into_iter()
+                .find(|object| object.content_version == item.content_version),
+        };
+        if let Some(object) = current {
+            self.shared().store.sync(object.object_id)?;
+        }
+        Ok(())
+    }
+
     /// The item's edited object, if any.
     pub(super) fn edit_of(&self, uid: u64) -> Result<Option<ContentObject>> {
         Ok(self

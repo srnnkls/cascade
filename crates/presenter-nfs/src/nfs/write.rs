@@ -1,11 +1,10 @@
-//! Shared write-path helpers for the NFS presenters (v3 and v4).
+//! Write rules of the NFS file system.
 //!
-//! These funnel every NFS write into the exact engine operations the other
+//! These funnel every NFS write into the engine operations the other
 //! presenters use — `Backend::upload`, `Backend::update`, `Backend::create_dir`,
-//! `Backend::delete`, and `VfsTree::rename` — resolved through `VfsTree::resolve`
-//! just as the `WebDAV` presenter does. There is no parallel write path in the
-//! engine; the NFS layer only translates RFC 1813 / RFC 5661 procedure arguments
-//! into those calls and maps the resulting errors back to NFS status codes.
+//! `Backend::delete`, and `VfsTree::rename` — resolved through the VFS tree
+//! just as the `WebDAV` presenter does, and map the resulting errors to a
+//! [`WriteError`] the file system answers as an `NFS3ERR_*` status.
 //!
 //! When the context has a content cache serving the path's backend, paths
 //! resolve to item uids through its replica instead: WRITE and SETATTR size
@@ -27,13 +26,11 @@ use cascade_engine::content::names::{NameError, check_name};
 use cascade_engine::content::replica::ItemKind;
 use cascade_engine::types::FileId;
 
-use super::context::{CachedPath, NfsContext};
+use super::context::{CachedPath, Child, NfsContext};
+use super::sidecar::is_appledouble_item;
 
 /// A write rejected before it reached a backend, or a categorised backend error.
-///
-/// Presenters translate each variant into the protocol-appropriate status code
-/// (`NFS3ERR_*` / `NFS4ERR_*`).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteError {
     /// The path attempted to escape the export root (`..`, absolute escape).
     Traversal,
@@ -56,7 +53,8 @@ impl WriteError {
     /// [`BackendError`] where the backend tagged the failure, otherwise
     /// inspecting the error chain for a disk-full `io::Error`, and finally
     /// falling back to a generic I/O failure.
-    fn from_backend(err: &anyhow::Error) -> Self {
+    #[must_use]
+    pub fn from_backend(err: &anyhow::Error) -> Self {
         if err.downcast_ref::<NameError>().is_some() {
             return Self::Invalid;
         }
@@ -147,22 +145,17 @@ pub fn check_cached_name(ctx: &NfsContext, name: &str) -> Result<(), WriteError>
 
 /// The uid of the item at `cached`, failing with [`WriteError::NotFound`]
 /// when it does not exist.
-fn existing_uid(cached: &CachedPath<'_>) -> Result<u64, WriteError> {
+async fn existing_uid(cached: &CachedPath<'_>) -> Result<u64, WriteError> {
     cached
         .resolve()
+        .await
         .map_err(|e| WriteError::from_backend(&e))?
         .ok_or(WriteError::NotFound)
 }
 
-/// Create an empty file at `cached` through the content cache and return its
-/// uid.
-fn create_cached(cached: &CachedPath<'_>) -> Result<u64, WriteError> {
-    let name = cached
-        .relative
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or(WriteError::Invalid)?;
-    let parent = CachedPath {
+/// The folder holding `cached`, in the same backend.
+fn parent_of<'a>(cached: &CachedPath<'a>) -> CachedPath<'a> {
+    CachedPath {
         cache: cached.cache,
         backend_id: cached.backend_id.clone(),
         relative: cached
@@ -170,52 +163,77 @@ fn create_cached(cached: &CachedPath<'_>) -> Result<u64, WriteError> {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_default(),
-    };
-    let parent_uid = existing_uid(&parent)?;
-    block_on(cached.cache.create_file(parent_uid, name, None))
+    }
+}
+
+/// Create an empty file at `cached` through the content cache and return its
+/// uid.
+async fn create_cached(cached: &CachedPath<'_>) -> Result<u64, WriteError> {
+    let name = cached
+        .relative
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(WriteError::Invalid)?;
+    let parent_uid = existing_uid(&parent_of(cached)).await?;
+    cached
+        .cache
+        .create_file(parent_uid, name, None)
+        .await
         .map(|item| item.uid)
         .map_err(|e| WriteError::from_backend(&e))
 }
 
-/// Delete the item at `cached` through the content cache. A kind other than
-/// `expect_dir` is [`WriteError::Invalid`] and a folder with children
-/// [`WriteError::Conflict`].
-fn remove_cached(cached: &CachedPath<'_>, expect_dir: Option<bool>) -> Result<(), WriteError> {
+/// Delete the item at `cached` through the content cache; a folder whose
+/// children are all `AppleDouble` companions goes with them, a folder with
+/// any other child is [`WriteError::Conflict`] and nothing is deleted.
+async fn remove_cached(cached: &CachedPath<'_>) -> Result<(), WriteError> {
     let item = cached
         .existing()
+        .await
         .map_err(|e| WriteError::from_backend(&e))?;
-    let is_dir = item.kind == ItemKind::Folder;
-    if expect_dir.is_some_and(|expect_dir| expect_dir != is_dir) {
-        return Err(WriteError::Invalid);
-    }
     let cache = cached.cache;
-    let deleted = if is_dir {
-        block_on(cache.delete_item(item.uid, false))
+    let deleted = if item.kind == ItemKind::Folder {
+        let children = cache
+            .list(item.uid)
+            .await
+            .map_err(|e| WriteError::from_backend(&e))?;
+        if children.iter().all(is_appledouble_item) {
+            for child in children {
+                cache
+                    .delete(child.uid)
+                    .await
+                    .map_err(|e| WriteError::from_backend(&e))?;
+            }
+        }
+        cache.delete_item(item.uid, false).await
     } else {
-        block_on(cache.delete(item.uid))
+        cache.delete(item.uid).await
     };
     deleted.map_err(|e| WriteError::from_backend(&e))
 }
 
+/// The folder and the name of the item at the server-absolute `path`.
+fn split_path(path: &str) -> (&str, &str) {
+    match path.rsplit_once('/') {
+        Some(("", name)) => ("/", name),
+        Some((parent, name)) => (parent, name),
+        None => ("/", path),
+    }
+}
+
+/// [`NfsContext::child`] with its failure as a [`WriteError`].
+fn child_of<'a>(ctx: &'a NfsContext, parent: &str, name: &str) -> Result<Child<'a>, WriteError> {
+    ctx.child(parent, name).map_err(|_| WriteError::Invalid)
+}
+
 /// Join a validated parent path and child name into a server-absolute VFS path.
-fn join_child(parent: &str, name: &str) -> String {
+#[must_use]
+pub fn join_child(parent: &str, name: &str) -> String {
     if parent == "/" {
         format!("/{name}")
     } else {
         format!("{parent}/{name}")
     }
-}
-
-/// Run an async backend operation to completion on the current Tokio runtime.
-///
-/// All NFS procedure handlers are synchronous (they return `Vec<u8>`), so —
-/// exactly as the read path does — the write path bridges into async via
-/// `block_on` on the ambient runtime handle.
-fn block_on<F, T>(future: F) -> T
-where
-    F: std::future::Future<Output = T>,
-{
-    tokio::runtime::Handle::current().block_on(future)
 }
 
 /// Write `data` at `offset` into the file at `path`, returning the file's new
@@ -233,72 +251,78 @@ where
 ///
 /// Returns a [`WriteError`] if the path escapes the export, the parent cannot be
 /// resolved, or the backend rejects the write.
-pub fn write_file(
+pub async fn write_at(
     ctx: &NfsContext,
     path: &str,
     offset: u64,
     data: &[u8],
 ) -> Result<u64, WriteError> {
     validate_vfs_path(path)?;
-    if let Some(cached) = ctx.cached(path) {
-        let resolved = cached.resolve().map_err(|e| WriteError::from_backend(&e))?;
+    let (parent, name) = split_path(path);
+    let child = child_of(ctx, parent, name)?;
+    if matches!(child, Child::Mount) {
+        return Err(WriteError::Invalid);
+    }
+    if let Child::Cached(cached) = child {
+        let resolved = cached
+            .resolve()
+            .await
+            .map_err(|e| WriteError::from_backend(&e))?;
         let uid = if let Some(uid) = resolved {
             uid
         } else {
-            let name = path.rsplit('/').next().unwrap_or_default();
             check_cached_name(ctx, name)?;
-            create_cached(&cached)?
+            create_cached(&cached).await?
         };
-        let item = block_on(cached.cache.write_at(uid, offset, data))
+        let item = cached
+            .cache
+            .write_at(uid, offset, data)
+            .await
             .map_err(|e| WriteError::from_backend(&e))?;
         return Ok(item.size.unwrap_or(0));
     }
     let (backend, relative) = ctx.route(path);
     let off = usize::try_from(offset).map_err(|_| WriteError::Invalid)?;
 
-    block_on(async move {
-        let existing = lookup_existing(backend.as_ref(), &relative).await?;
+    let existing = lookup_existing(backend.as_ref(), &relative).await?;
 
-        let mut buf = if let Some(entry) = &existing {
-            backend
-                .download(entry)
-                .await
-                .map_err(|e| WriteError::from_backend(&e))?
-        } else {
-            Vec::new()
-        };
+    let mut buf = if let Some(entry) = &existing {
+        backend
+            .download(entry)
+            .await
+            .map_err(|e| WriteError::from_backend(&e))?
+    } else {
+        Vec::new()
+    };
 
-        if buf.len() < off {
-            buf.resize(off, 0);
-        }
-        let end = off.saturating_add(data.len());
-        if buf.len() < end {
-            buf.resize(end, 0);
-        }
-        if let Some(slot) = buf.get_mut(off..end) {
-            slot.copy_from_slice(data);
-        } else {
-            return Err(WriteError::Io);
-        }
+    if buf.len() < off {
+        buf.resize(off, 0);
+    }
+    let end = off.saturating_add(data.len());
+    if buf.len() < end {
+        buf.resize(end, 0);
+    }
+    buf.get_mut(off..end)
+        .ok_or(WriteError::Io)?
+        .copy_from_slice(data);
 
-        let new_size = u64::try_from(buf.len()).map_err(|_| WriteError::Io)?;
+    let new_size = u64::try_from(buf.len()).map_err(|_| WriteError::Io)?;
 
-        if let Some(entry) = existing {
-            let file_id = FileId(entry.id.0.clone());
-            backend
-                .update(&file_id, &buf)
-                .await
-                .map_err(|e| WriteError::from_backend(&e))?;
-        } else {
-            let parent_id = parent_file_id(backend.as_ref(), &relative).await;
-            backend
-                .upload(&relative, &buf, &parent_id)
-                .await
-                .map_err(|e| WriteError::from_backend(&e))?;
-        }
+    if let Some(entry) = existing {
+        let file_id = FileId(entry.id.0.clone());
+        backend
+            .update(&file_id, &buf)
+            .await
+            .map_err(|e| WriteError::from_backend(&e))?;
+    } else {
+        let parent_id = parent_file_id(backend.as_ref(), &relative).await;
+        backend
+            .upload(&relative, &buf, &parent_id)
+            .await
+            .map_err(|e| WriteError::from_backend(&e))?;
+    }
 
-        Ok(new_size)
-    })
+    Ok(new_size)
 }
 
 /// The RFC 1813 §3.3.8 `createmode3` discriminant governing how `CREATE`
@@ -321,18 +345,17 @@ pub enum CreateMode {
 /// honouring the `createmode3` semantics, and return the new file's
 /// server-absolute VFS path.
 ///
-/// `GUARDED`/`EXCLUSIVE` refuse an existing name with [`WriteError::Conflict`]
-/// (which the v3 handler maps to `NFS3ERR_EXIST`). `UNCHECKED` on an existing
-/// name is a no-op that preserves the existing content — it must never call
-/// `Backend::upload`, which writes a zero-length buffer and truncates. A fresh
-/// create uploads empty content.
+/// `GUARDED`/`EXCLUSIVE` refuse an existing name with [`WriteError::Conflict`].
+/// `UNCHECKED` on an existing name is a no-op that preserves the existing
+/// content — it must never call `Backend::upload`, which writes a zero-length
+/// buffer and truncates. A fresh create uploads empty content.
 ///
 /// # Errors
 ///
 /// Returns a [`WriteError`] if the parent path escapes the export, the name is
 /// invalid, the mode forbids an existing target, or the backend rejects the
 /// upload.
-pub fn create_file(
+pub async fn create_file(
     ctx: &NfsContext,
     parent_path: &str,
     name: &str,
@@ -342,40 +365,65 @@ pub fn create_file(
     validate_name(name)?;
     check_cached_name(ctx, name)?;
     let child_path = join_child(parent_path, name);
-    if let Some(cached) = ctx.cached(&child_path) {
-        let existing = cached.resolve().map_err(|e| WriteError::from_backend(&e))?;
+    let child = child_of(ctx, parent_path, name)?;
+    if matches!(child, Child::Mount) {
+        return Err(WriteError::Conflict);
+    }
+    if let Child::Cached(cached) = child {
+        let existing = cached
+            .resolve()
+            .await
+            .map_err(|e| WriteError::from_backend(&e))?;
         match (mode, existing) {
             (CreateMode::Guarded | CreateMode::Exclusive, Some(_)) => {
                 return Err(WriteError::Conflict);
             }
             (CreateMode::Unchecked, Some(_)) => {}
             (_, None) => {
-                create_cached(&cached)?;
+                create_cached(&cached).await?;
             }
         }
         return Ok(child_path);
     }
     let (backend, relative) = ctx.route(&child_path);
 
-    block_on(async move {
-        let existing = lookup_existing(backend.as_ref(), &relative).await?;
-        match (mode, existing) {
-            // GUARDED/EXCLUSIVE over an existing name: refuse, do not touch it.
-            (CreateMode::Guarded | CreateMode::Exclusive, Some(_)) => {
-                return Err(WriteError::Conflict);
-            }
-            // UNCHECKED over an existing name: no-op, preserve content.
-            (CreateMode::Unchecked, Some(_)) => return Ok(child_path),
-            // Absent for any mode: create empty.
-            (_, None) => {}
+    let existing = lookup_existing(backend.as_ref(), &relative).await?;
+    match (mode, existing) {
+        (CreateMode::Guarded | CreateMode::Exclusive, Some(_)) => {
+            return Err(WriteError::Conflict);
         }
-        let parent_id = parent_file_id(backend.as_ref(), &relative).await;
-        backend
-            .upload(&relative, &[], &parent_id)
-            .await
-            .map_err(|e| WriteError::from_backend(&e))?;
-        Ok(child_path)
-    })
+        (CreateMode::Unchecked, Some(_)) => return Ok(child_path),
+        (_, None) => {}
+    }
+    let parent_id = parent_file_id(backend.as_ref(), &relative).await;
+    backend
+        .upload(&relative, &[], &parent_id)
+        .await
+        .map_err(|e| WriteError::from_backend(&e))?;
+    Ok(child_path)
+}
+
+/// Make the written data of the file at `path` durable.
+///
+/// Through the content cache its object is synced to disk; on the VFS path
+/// every write has already replaced the whole file on the backend, so there
+/// is nothing left to sync.
+///
+/// # Errors
+///
+/// Returns a [`WriteError`] if the path escapes the export, the item is
+/// unknown, or the cache cannot sync its object.
+pub async fn sync_file(ctx: &NfsContext, path: &str) -> Result<(), WriteError> {
+    validate_vfs_path(path)?;
+    let Some(cached) = ctx.cached(path) else {
+        return Ok(());
+    };
+    let uid = existing_uid(&cached).await?;
+    cached
+        .cache
+        .sync(uid)
+        .await
+        .map_err(|e| WriteError::from_backend(&e))
 }
 
 /// Truncate or extend the file at `path` to exactly `size` bytes.
@@ -384,35 +432,36 @@ pub fn create_file(
 ///
 /// Returns a [`WriteError`] if the path escapes the export, the file does not
 /// exist, or the backend rejects the write.
-pub fn truncate_file(ctx: &NfsContext, path: &str, size: u64) -> Result<(), WriteError> {
+pub async fn truncate_file(ctx: &NfsContext, path: &str, size: u64) -> Result<(), WriteError> {
     validate_vfs_path(path)?;
     if let Some(cached) = ctx.cached(path) {
-        let uid = existing_uid(&cached)?;
-        block_on(cached.cache.set_size(uid, size)).map_err(|e| WriteError::from_backend(&e))?;
+        let uid = existing_uid(&cached).await?;
+        cached
+            .cache
+            .set_size(uid, size)
+            .await
+            .map_err(|e| WriteError::from_backend(&e))?;
         return Ok(());
     }
     let (backend, relative) = ctx.route(path);
     let target = usize::try_from(size).map_err(|_| WriteError::Invalid)?;
 
-    block_on(async move {
-        let entry = backend
-            .metadata(&relative)
-            .await
-            .map_err(|e| WriteError::from_backend(&e))?;
+    let entry = backend
+        .metadata(&relative)
+        .await
+        .map_err(|e| WriteError::from_backend(&e))?;
+    let mut buf = backend
+        .download(&entry)
+        .await
+        .map_err(|e| WriteError::from_backend(&e))?;
+    buf.resize(target, 0);
 
-        let mut buf = backend
-            .download(&entry)
-            .await
-            .map_err(|e| WriteError::from_backend(&e))?;
-        buf.resize(target, 0);
-
-        let file_id = FileId(entry.id.0.clone());
-        backend
-            .update(&file_id, &buf)
-            .await
-            .map_err(|e| WriteError::from_backend(&e))?;
-        Ok(())
-    })
+    let file_id = FileId(entry.id.0.clone());
+    backend
+        .update(&file_id, &buf)
+        .await
+        .map_err(|e| WriteError::from_backend(&e))?;
+    Ok(())
 }
 
 /// Create a directory named `name` under `parent_path`, returning the new
@@ -422,102 +471,70 @@ pub fn truncate_file(ctx: &NfsContext, path: &str, size: u64) -> Result<(), Writ
 ///
 /// Returns a [`WriteError`] if the parent path escapes the export, the name is
 /// invalid, or the backend rejects the operation.
-pub fn make_dir(ctx: &NfsContext, parent_path: &str, name: &str) -> Result<String, WriteError> {
+pub async fn make_dir(
+    ctx: &NfsContext,
+    parent_path: &str,
+    name: &str,
+) -> Result<String, WriteError> {
     validate_vfs_path(parent_path)?;
     validate_name(name)?;
     check_cached_name(ctx, name)?;
     let child_path = join_child(parent_path, name);
-    if let Some(parent) = ctx.cached(parent_path)
-        && ctx
-            .cached(&child_path)
-            .is_some_and(|child| child.backend_id == parent.backend_id)
-    {
-        let parent_uid = existing_uid(&parent)?;
-        block_on(parent.cache.create_folder(parent_uid, name))
+    let child = child_of(ctx, parent_path, name)?;
+    if matches!(child, Child::Mount) {
+        return Err(WriteError::Conflict);
+    }
+    if let Child::Cached(cached) = child {
+        let parent_uid = existing_uid(&parent_of(&cached)).await?;
+        cached
+            .cache
+            .create_folder(parent_uid, name)
+            .await
             .map_err(|e| WriteError::from_backend(&e))?;
         return Ok(child_path);
     }
     let (backend, relative) = ctx.route(&child_path);
-
-    block_on(async move {
-        backend
-            .create_dir(&relative)
-            .await
-            .map_err(|e| WriteError::from_backend(&e))?;
-        Ok(child_path)
-    })
+    backend
+        .create_dir(&relative)
+        .await
+        .map_err(|e| WriteError::from_backend(&e))?;
+    Ok(child_path)
 }
 
-/// Remove the file or directory named `name` under `parent_path`.
-///
-/// `expect_dir` selects the kind being removed (`REMOVE` vs `RMDIR`): a
-/// mismatch between the request and the on-disk kind is reported as
-/// [`WriteError::Invalid`] so the caller can map it to the correct status.
-///
-/// # Errors
-///
-/// Returns a [`WriteError`] if the path escapes the export, the entry does not
-/// exist, the kind does not match, or the backend rejects the delete.
-pub fn remove_entry(
-    ctx: &NfsContext,
-    parent_path: &str,
-    name: &str,
-    expect_dir: bool,
-) -> Result<String, WriteError> {
-    validate_vfs_path(parent_path)?;
-    validate_name(name)?;
-    let child_path = join_child(parent_path, name);
-    if let Some(cached) = ctx.cached(&child_path) {
-        remove_cached(&cached, Some(expect_dir))?;
-        return Ok(child_path);
-    }
-    let (backend, relative) = ctx.route(&child_path);
-
-    block_on(async move {
-        let entry = backend
-            .metadata(&relative)
-            .await
-            .map_err(|e| WriteError::from_backend(&e))?;
-        if entry.is_dir != expect_dir {
-            return Err(WriteError::Invalid);
-        }
-        backend
-            .delete(&entry)
-            .await
-            .map_err(|e| WriteError::from_backend(&e))?;
-        Ok(child_path)
-    })
-}
-
-/// Remove the file or directory named `name` under `parent_path` regardless of
-/// kind. Used by `NFSv4` REMOVE, which does not distinguish files from
-/// directories at the protocol level.
+/// Remove the file or directory named `name` under `parent_path`; a
+/// directory with children is refused with [`WriteError::Conflict`], a
+/// backend's mount point with [`WriteError::Forbidden`].
 ///
 /// # Errors
 ///
 /// Returns a [`WriteError`] if the path escapes the export, the entry does not
 /// exist, or the backend rejects the delete.
-pub fn remove_any(ctx: &NfsContext, parent_path: &str, name: &str) -> Result<String, WriteError> {
+pub async fn remove_entry(
+    ctx: &NfsContext,
+    parent_path: &str,
+    name: &str,
+) -> Result<String, WriteError> {
     validate_vfs_path(parent_path)?;
     validate_name(name)?;
     let child_path = join_child(parent_path, name);
-    if let Some(cached) = ctx.cached(&child_path) {
-        remove_cached(&cached, None)?;
+    let child = child_of(ctx, parent_path, name)?;
+    if matches!(child, Child::Mount) {
+        return Err(WriteError::Forbidden);
+    }
+    if let Child::Cached(cached) = child {
+        remove_cached(&cached).await?;
         return Ok(child_path);
     }
     let (backend, relative) = ctx.route(&child_path);
-
-    block_on(async move {
-        let entry = backend
-            .metadata(&relative)
-            .await
-            .map_err(|e| WriteError::from_backend(&e))?;
-        backend
-            .delete(&entry)
-            .await
-            .map_err(|e| WriteError::from_backend(&e))?;
-        Ok(child_path)
-    })
+    let entry = backend
+        .metadata(&relative)
+        .await
+        .map_err(|e| WriteError::from_backend(&e))?;
+    backend
+        .delete(&entry)
+        .await
+        .map_err(|e| WriteError::from_backend(&e))?;
+    Ok(child_path)
 }
 
 /// Rename `from_name` under `from_parent` to `to_name` under `to_parent`.
@@ -529,7 +546,7 @@ pub fn remove_any(ctx: &NfsContext, parent_path: &str, name: &str) -> Result<Str
 ///
 /// Returns a [`WriteError`] if either path escapes the export, a name is
 /// invalid, or the backend rejects the move.
-pub fn rename_entry(
+pub async fn rename_entry(
     ctx: &NfsContext,
     from_parent: &str,
     from_name: &str,
@@ -543,24 +560,28 @@ pub fn rename_entry(
     check_cached_name(ctx, to_name)?;
     let src_path = join_child(from_parent, from_name);
     let dst_path = join_child(to_parent, to_name);
-    if let (Some(src), Some(parent)) = (ctx.cached(&src_path), ctx.cached(to_parent))
-        && src.backend_id == parent.backend_id
-        && ctx
-            .cached(&dst_path)
-            .is_some_and(|dst| dst.backend_id == src.backend_id)
-    {
-        let uid = existing_uid(&src)?;
-        let parent_uid = existing_uid(&parent)?;
-        block_on(src.cache.rename(uid, parent_uid, to_name))
-            .map_err(|e| WriteError::from_backend(&e))?;
-        return Ok((src_path, dst_path));
+    let (src, dst) = (
+        child_of(ctx, from_parent, from_name)?,
+        child_of(ctx, to_parent, to_name)?,
+    );
+    match (src, dst) {
+        (Child::Mount, _) => return Err(WriteError::Forbidden),
+        (_, Child::Mount) => return Err(WriteError::Conflict),
+        (Child::Cached(src), Child::Cached(dst)) if src.backend_id == dst.backend_id => {
+            let uid = existing_uid(&src).await?;
+            let parent_uid = existing_uid(&parent_of(&dst)).await?;
+            src.cache
+                .rename(uid, parent_uid, to_name)
+                .await
+                .map_err(|e| WriteError::from_backend(&e))?;
+            return Ok((src_path, dst_path));
+        }
+        _ => {}
     }
 
-    block_on(async {
-        ctx.rename(&src_path, &dst_path)
-            .await
-            .map_err(|e| WriteError::from_backend(&e))
-    })?;
+    ctx.rename(&src_path, &dst_path)
+        .await
+        .map_err(|e| WriteError::from_backend(&e))?;
     Ok((src_path, dst_path))
 }
 
@@ -654,7 +675,7 @@ mod tests {
     }
 }
 
-/// Tests for the metadata-error discrimination in [`write_file`], using a stub
+/// Tests for the metadata-error discrimination in [`write_at`], using a stub
 /// backend whose `metadata` fails with a category other than `NotFound`.
 #[cfg(test)]
 mod discrimination_tests {
@@ -732,14 +753,14 @@ mod discrimination_tests {
         let vfs = Arc::new(RwLock::new(VfsTree::new(backend)));
         let ctx = NfsContext::new(vfs);
 
-        let result = tokio::task::block_in_place(|| write_file(&ctx, "/data.bin", 0, b"fragment"));
+        let result = write_at(&ctx, "/data.bin", 0, b"fragment").await;
 
         // The transient error must surface (here as Forbidden), and crucially the
         // truncating upload/update must never have been attempted.
         assert!(matches!(result, Err(WriteError::Forbidden)));
         assert!(
             !wrote.load(Ordering::SeqCst),
-            "write_file truncated through a non-NotFound metadata error"
+            "write_at truncated through a non-NotFound metadata error"
         );
     }
 }

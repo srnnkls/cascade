@@ -158,10 +158,11 @@ cascade/
 │   │       ├── lib.rs
 │   │       ├── nfs/
 │   │       │   ├── mod.rs
-│   │       │   ├── server.rs     # NFSv3 server (RFC 1813)
-│   │       │   ├── mount.rs      # Mount protocol (RFC 1814)
-│   │       │   ├── xdr.rs        # XDR codec
-│   │       │   └── procedures.rs # NFS procedure handlers
+│   │       │   ├── server.rs     # NFSv3 and MOUNT v3 on one loopback port (nfs3_server)
+│   │       │   ├── fs.rs         # nfs3_server file system traits over the context
+│   │       │   ├── context.rs    # Path routing to the VFS tree and the content cache
+│   │       │   ├── write.rs      # Write rules and their error categories
+│   │       │   └── sidecar.rs    # AppleDouble companions held in memory
 │   │       └── fuse/
 │   │           └── presenter.rs  # fuser-based FUSE presenter (Linux)
 │   ├── presenter-fileprovider/   # macOS File Provider bridge (Rust side)
@@ -571,34 +572,22 @@ fn create_presenter(engine: EngineHandle) -> Box<dyn VfsPresenter> {
 
 ### NFS presenter
 
-The NFS presenter spins up an NFSv3 server on loopback and mounts it using the OS's native NFS client. Works on all platforms without kernel extensions.
+The NFS presenter serves NFSv3 (RFC 1813) and MOUNT v3 on one loopback TCP port through the [`nfs3_server`](https://crates.io/crates/nfs3_server) crate, which owns RPC record marking, XDR and procedure dispatch. NFSv4 is not served. `CascadeFs` implements the crate's `NfsReadFileSystem` and `NfsFileSystem` traits over `NfsContext`, which routes paths to the VFS tree and, for the backends it serves, to the content cache.
 
-NFSv3 server implementation covers these procedures:
+On macOS the daemon mounts the volume as the current user:
 
-**Required for anything to work:**
-- `GETATTR` — return file/directory metadata
-- `LOOKUP` — resolve a name in a directory
-- `READDIR` / `READDIR3` — list directory contents
-- `READ` — read file data
-- `FSSTAT` — return filesystem statistics
+```
+/sbin/mount_nfs -o vers=3,tcp,port=<p>,mountport=<p>,locallocks,rsize=1048576,wsize=1048576 127.0.0.1:/ <mount point>
+```
 
-**For writes:**
-- `CREATE` — create a file
-- `WRITE` — write data to a file
-- `REMOVE` — delete a file
-- `RENAME` — rename/move a file
-- `MKDIR` — create a directory
-- `RMDIR` — remove a directory
-- `SETATTR` — set file attributes (modification time, etc.)
-- `COMMIT` — flush cached writes
+MOUNT runs on the NFS port, so no portmapper and no reserved source port is needed, and the daemon never asks for administrator rights. A failed mount is logged and fails the start.
 
-The mount protocol (RFC 1814) has three procedures: `MOUNT`, `DUMP`, `UNMOUNT`.
-
-All NFS data structures use XDR encoding (defined in RFC 1813). The XDR codec handles:
-- `uint32`, `uint64`, `int32`, `int64`
-- `bool`, `opaque<>`, `string<>`
-- Fixed and variable-length arrays
-- File handles (`nfs_fh3` — opaque 64-byte handles, internally the ItemId)
+- File handles. The crate prefixes every handle with an 8-byte generation. An item the content cache serves is named by its uid (8 bytes, big-endian), which is also its `fileid`; the generation is derived from the replica store's id, so handles stay valid across daemon restarts on one state database, and a restart under a live mount needs no remount. Paths outside the content cache are named by a key the context registers in memory and do not survive a restart. A well-formed handle of this generation naming no item answers `NFS3ERR_STALE`; the crate answers `NFS3ERR_BADHANDLE` or `NFS3ERR_STALE` for a handle of another generation.
+- Listing. READDIR and READDIRPLUS list a folder in `fileid` order, and a cookie is the `fileid` of the last entry returned, so a cookie stays valid while entries are added or removed between pages.
+- Procedures answered by the crate. `nfs3_server` answers ACCESS with the access asked for, limited to read, lookup and execute on a read-only export, and FSSTAT and PATHCONF with fixed values; for each it calls GETATTR for the object's attributes and leaves them out of the reply when GETATTR fails; FSINFO advertises 1 MiB reads and writes. REMOVE and RMDIR reach one trait method, which removes a file or an empty folder; a folder whose only children on the backend are `._*` names is removed with them. REMOVE and RMDIR of a backend's mount point answer an error, and CREATE of its name answers `NFS3ERR_EXIST` in every mode.
+- Writes. A WRITE is in the content cache (object data written, range and dirty state recorded) before its reply and is answered with the stability the client asked for; COMMIT succeeds. Each request runs in its own task, so a slow backend call for one item does not delay another.
+- AppleDouble. The macOS client keeps extended attributes in `._<name>` files and fails a copy whose companion it cannot create, so the presenter holds `._*` files in memory for its lifetime; they never reach a backend or the replica and are not listed. Removing a file drops its companion, and removing a folder drops its companion and every companion in it; the macOS client itself renames a companion after renaming its file. Under the content cache a folder's file id is its item uid and survives a rename, so the extended attributes of its children do too; under the earlier VFS mode without the content cache a folder's file id follows its path, so they are lost when the folder is renamed.
+- Shutdown. Connections are relayed from the public port to the crate's listener, so stopping the server closes the listener and every connection and no later request is served.
 
 **VFS cache modes for NFS:**
 
@@ -613,26 +602,24 @@ deserialised straight from the export config:
 
 `minimal` is the default — on-demand reads, write-capable, minimal disk usage.
 Write support keys off the mode rather than a separate flag: an `off` export
-refuses every write procedure with `NFS3ERR_ROFS` / `NFS4ERR_ROFS`. A
-write-capable export (`minimal` or `full`) implements the full write procedure
-set for both NFSv3 and NFSv4:
+refuses every write procedure with `NFS3ERR_ROFS`. A write-capable export
+(`minimal` or `full`) implements the NFSv3 write procedures:
 
-| Procedure | NFSv3 | NFSv4 op |
-|-----------|-------|----------|
-| Write data at offset | `WRITE` | `WRITE` |
-| Create a regular file | `CREATE` | `OPEN` with `CREATE` flag |
-| Create a directory | `MKDIR` | `CREATE` (type NF4DIR) |
-| Set file attributes (size, mtime) | `SETATTR` | `SETATTR` |
-| Remove a file | `REMOVE` | `REMOVE` |
-| Remove a directory | `RMDIR` | `REMOVE` |
-| Rename / move | `RENAME` | `RENAME` |
-| Flush pending writes | `COMMIT` | `COMMIT` |
+| Procedure | NFSv3 |
+|-----------|-------|
+| Write data at offset | `WRITE` |
+| Create a regular file | `CREATE` |
+| Create a directory | `MKDIR` |
+| Set the size | `SETATTR` |
+| Remove a file or an empty directory | `REMOVE`, `RMDIR` |
+| Rename / move | `RENAME` |
+| Flush pending writes | `COMMIT` |
 
 All write procedures route through the shared `write` helper module, which
 translates them into the same backend operations (`upload`, `update`,
 `create_dir`, `delete`, `rename`) as the WebDAV presenter uses. The mode
-threads from `NfsServerConfig` through dispatch into both the NFSv3 and NFSv4
-procedure handlers.
+threads from `NfsServerConfig` into `CascadeFs`, which reports a read-only
+file system to `nfs3_server` for `off`.
 
 ### FUSE presenter (Linux)
 
@@ -642,7 +629,7 @@ No file badges or native placeholder support — CLI provides visibility instead
 
 ### macOS File Provider presenter
 
-See [macOS File Provider extension](#macos-file-provider-extension) below. Under `cascade start --app-group` the NFS presenter and the File Provider presenter both read and write through the [content cache](#content-cache): NFS `LOOKUP`, `READDIR` and `CREATE` resolve paths through the replica, `READ` is a ranged read of the cache, and `WRITE` edits the cached object in place. An NFS `CREATE` or `RENAME` to a name SMB cannot hold is refused with `NFS3ERR_INVAL` or `NFS4ERR_INVAL`.
+See [macOS File Provider extension](#macos-file-provider-extension) below. Under `cascade start --app-group` the NFS presenter and the File Provider presenter both read and write through the [content cache](#content-cache): NFS `LOOKUP`, `READDIR` and `CREATE` resolve paths through the replica, `READ` is a ranged read of the cache, and `WRITE` edits the cached object in place. An NFS `CREATE`, `MKDIR` or `RENAME` to a name SMB cannot hold is refused with `NFS3ERR_INVAL`.
 
 ### Platform context providers
 
@@ -1160,7 +1147,7 @@ Based on [Syncthing's BEP v1](https://docs.syncthing.net/specs/bep-v1.html). Mes
 | `Response` | Send the block data |
 | `Ping` / `Close` | Keepalive and teardown |
 
-All messages are XDR-encoded (re-use the XDR codec from the NFS presenter).
+All messages are XDR-encoded, each framed by a 4-byte big-endian length; the codec lives in `crates/p2p/src/protocol.rs`.
 
 ### Block store
 
@@ -1927,5 +1914,5 @@ The announce Worker and relay server that enable WAN peer discovery and NAT trav
 
 - **rclone** — NFS server, VFS caching, Google Drive backend, mount management. Go. [GitHub](https://github.com/rclone/rclone)
 - **Syncthing** — BEP protocol, peer discovery, NAT traversal, block-level delta sync, conflict resolution. Go. [GitHub](https://github.com/syncthing/syncthing)
-- **go-nfs** — NFSv3 server in Go. Reference for XDR codec and procedure handlers. [GitHub](https://github.com/willscott/go-nfs)
+- **go-nfs** — NFSv3 server in Go. Reference for NFSv3 procedure semantics; the NFS presenter serves the protocol through the `nfs3_server` crate. [GitHub](https://github.com/willscott/go-nfs)
 - **Projected File System (ProjFS)** — Windows native virtualisation API, used directly through the `windows` crate's `Win32_Storage_ProjectedFileSystem` module. [Win32 docs](https://learn.microsoft.com/en-us/windows/win32/projfs/projected-file-system)

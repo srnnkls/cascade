@@ -30,8 +30,6 @@ use helpers::{
 use nfs::try_nfs;
 #[cfg(all(test, target_os = "linux"))]
 use nfs::{is_linux_permission_error, linux_nfs_mount_command};
-#[cfg(all(test, target_os = "macos"))]
-use nfs::{is_permission_error, osascript_mount_command};
 
 // ---------------------------------------------------------------------------
 // HTTP API (PWA) wiring
@@ -586,8 +584,7 @@ pub async fn start(
     }
 
     // On macOS: FSKit first (native, kext-free, POSIX), then WebDAV (no
-    // root needed), then NFSv4/v3 fallback.  NFS already has the v4 → v3 →
-    // escalation chain inside mount_nfs().
+    // root needed), then NFSv3 as the current user.
     //
     // FSKit self-mounts via the Swift extension and cannot be used without
     // mounting, so it is skipped when --no-mount is set.
@@ -626,7 +623,7 @@ pub async fn start(
             }
         }
 
-        // Attempt 3: NFS (v4 → v3 escalation inside mount_nfs).
+        // Attempt 3: NFS.
         let backends = rebuild_backends(&main_config, &ctx.config_dir, shared_http.clone())?;
         try_nfs(
             ctx,

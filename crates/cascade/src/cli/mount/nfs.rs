@@ -4,10 +4,12 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 use cascade_engine::engine::NativeEngine;
 use cascade_presenter_nfs::nfs::context::NfsContext;
+#[cfg(target_os = "macos")]
+use cascade_presenter_nfs::nfs::server::macos_mount_options;
 use cascade_presenter_nfs::nfs::server::{NfsCacheMode, NfsServer, NfsServerConfig};
 
 use super::helpers::{
-    apply_root_pins, engine_config, ensure_directory, is_mounted, root_config, write_pid_file,
+    apply_root_pins, engine_config, ensure_directory, root_config, write_pid_file,
 };
 use super::{
     CliContext, PresenterResources, ResolvedP2pConfig, WebOptions, finish_shutdown, mark_web_ready,
@@ -32,6 +34,7 @@ pub(super) async fn start_nfs_volume(
     let nfs_port = server.local_addr.port();
     tracing::info!(port = nfs_port, "NFS server started");
     if !no_mount && let Err(error) = mount_nfs(mount_path, nfs_port) {
+        tracing::error!(error = %format!("{error:#}"), "NFS mount failed");
         if let Err(stop_error) = server.stop() {
             tracing::warn!(error = %stop_error, "NFS server stop returned an error");
         }
@@ -142,98 +145,36 @@ pub(super) async fn try_nfs(
     .await
 }
 
-/// Mount NFS filesystem using the OS mount command (macOS).
+/// Mount the cascade NFS server at `mount_point` as the current user (macOS).
 ///
-/// On macOS 26+, `NFSv3` mounts fail with permission errors. `NFSv4` works
-/// without admin escalation (matching FUSE-T's approach). We try v4 first,
-/// then fall back to v3 with osascript escalation.
+/// # Errors
+///
+/// Fails when the mount point cannot be created or `mount_nfs` fails.
 #[cfg(target_os = "macos")]
 pub(super) fn mount_nfs(mount_point: &Path, port: u16) -> Result<()> {
     ensure_directory(mount_point, "NFS mount point")?;
-
-    let nfs_spec = "127.0.0.1:/".to_string();
-    tracing::info!(spec = %nfs_spec, port, mount = %mount_point.display(), "mounting NFS");
-
-    // Try `NFSv4` first — works on macOS 26+ without admin privileges.
-    let v4_output = std::process::Command::new("/sbin/mount_nfs")
-        .arg("-o")
-        .arg(format!("vers=4,resvport,port={port}"))
-        .arg(&nfs_spec)
-        .arg(mount_point)
-        .output();
-
-    match v4_output {
-        Ok(output) if output.status.success() => {
-            tracing::info!(path = %mount_point.display(), "`NFSv4` mounted");
-            return Ok(());
-        }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            tracing::debug!(
-                path = %mount_point.display(),
-                error = %stderr,
-                "`NFSv4` mount failed, falling back to v3"
-            );
-        }
-        Err(e) => {
-            tracing::debug!(
-                path = %mount_point.display(),
-                error = %e,
-                "mount_nfs command failed for v4, falling back to v3"
-            );
-        }
-    }
-
-    // Fall back to `NFSv3`.
-    let output = std::process::Command::new("/sbin/mount_nfs")
-        .arg("-o")
-        .arg(format!("rw,resvport,port={port}"))
-        .arg(&nfs_spec)
-        .arg(mount_point)
-        .output()?;
-
+    let mut cmd = macos_nfs_mount_command(mount_point, port);
+    tracing::info!(mount = %mount_point.display(), port, "mounting NFS");
+    let output = cmd.output().context("failed to invoke /sbin/mount_nfs")?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if is_mounted(mount_point) {
-            tracing::warn!(path = %mount_point.display(), "already mounted");
-            return Ok(());
-        }
-
-        // Retry with administrator privileges on permission errors.
-        if is_permission_error(&stderr) {
-            tracing::info!(path = %mount_point.display(), "retrying mount with administrator privileges");
-            let escalated = osascript_mount_command(mount_point, port).output()?;
-            if escalated.status.success() {
-                tracing::info!(path = %mount_point.display(), "NFS mounted (via administrator privileges)");
-                return Ok(());
-            }
-            let esc_stderr = String::from_utf8_lossy(&escalated.stderr);
-            anyhow::bail!("mount_nfs failed even with administrator privileges: {esc_stderr}");
-        }
-
-        anyhow::bail!("mount_nfs failed: {stderr}");
+        anyhow::bail!(
+            "mount_nfs -o {} failed: {}",
+            macos_mount_options(port),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
-
-    tracing::info!(path = %mount_point.display(), "`NFSv3` mounted");
+    tracing::info!(path = %mount_point.display(), "NFS mounted");
     Ok(())
 }
 
-/// Check if a `mount_nfs` stderr indicates a permission error.
+/// The `mount_nfs` command for the cascade server on `port`.
 #[cfg(target_os = "macos")]
-pub(super) fn is_permission_error(stderr: &str) -> bool {
-    stderr.contains("Operation not permitted")
-}
-
-/// Build an osascript command that mounts NFS with administrator privileges.
-#[cfg(target_os = "macos")]
-pub(super) fn osascript_mount_command(mount_point: &Path, port: u16) -> std::process::Command {
-    let mount_cmd = format!(
-        "/sbin/mount_nfs -o rw,resvport,port={port} 127.0.0.1:/ {mp}",
-        mp = mount_point.display()
-    );
-    let script = format!("do shell script \"{mount_cmd}\" with administrator privileges");
-    let mut cmd = std::process::Command::new("osascript");
-    cmd.arg("-e").arg(&script);
+pub(super) fn macos_nfs_mount_command(mount_point: &Path, port: u16) -> std::process::Command {
+    let mut cmd = std::process::Command::new("/sbin/mount_nfs");
+    cmd.arg("-o")
+        .arg(macos_mount_options(port))
+        .arg("127.0.0.1:/")
+        .arg(mount_point);
     cmd
 }
 

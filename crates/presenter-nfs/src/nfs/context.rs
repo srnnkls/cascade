@@ -1,30 +1,28 @@
-//! NFS context — bridges NFS procedure handlers to the VFS tree.
-//!
-//! Provides the state needed by NFS procedures to answer queries about
-//! files and directories in the virtual filesystem.
+//! NFS context: routes NFS paths to the VFS tree and, for the backends it
+//! serves, to the content cache.
 
 use cascade_engine::backend::{Backend, BackendError};
 use cascade_engine::content::cache::ContentCache;
-use cascade_engine::content::replica::{ItemKind, ReplicaItem};
+use cascade_engine::content::replica::ReplicaItem;
 use cascade_engine::types::DirEntry;
 use cascade_engine::vfs::VfsTree;
-use cascade_engine::vfs::tree::{merge_listing, merge_mount_names, resolve_listing_native_id};
+use cascade_engine::vfs::tree::{merge_listing, resolve_listing_native_id};
 use std::collections::HashMap;
-use std::path::PathBuf;
+
+use super::write::join_child;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock;
 
-/// Context shared between NFS procedure handlers and the VFS tree.
+/// Context shared by the NFS file system and the VFS tree.
 ///
-/// Maintains a file handle → VFS path mapping so NFS clients can
-/// navigate the tree with opaque file handles.
+/// Maps file handle keys to the VFS paths of the backends the content cache
+/// does not serve; items the cache serves are named by their uid.
 pub struct NfsContext {
     /// The VFS tree to query for file metadata.
     vfs: Arc<RwLock<VfsTree>>,
     /// Map from file handle key (hash) to VFS path.
     fh_map: RwLock<HashMap<u64, String>>,
-    /// Root file handle key — always maps to "/".
-    root_fh_key: u64,
     /// Cache serving the content of the backends registered in it.
     content_cache: Option<ContentCache>,
 }
@@ -45,8 +43,8 @@ impl CachedPath<'_> {
     /// # Errors
     ///
     /// Fails when a listing or the state database fails.
-    pub fn resolve(&self) -> anyhow::Result<Option<u64>> {
-        block_on(self.cache.resolve(&self.backend_id, &self.relative))
+    pub async fn resolve(&self) -> anyhow::Result<Option<u64>> {
+        self.cache.resolve(&self.backend_id, &self.relative).await
     }
 
     /// The item at the path, through the replica; `None` when no such item
@@ -55,8 +53,10 @@ impl CachedPath<'_> {
     /// # Errors
     ///
     /// Fails when a listing or the state database fails.
-    pub fn item(&self) -> anyhow::Result<Option<ReplicaItem>> {
-        self.resolve()?.map_or(Ok(None), |uid| self.cache.item(uid))
+    pub async fn item(&self) -> anyhow::Result<Option<ReplicaItem>> {
+        self.resolve()
+            .await?
+            .map_or(Ok(None), |uid| self.cache.item(uid))
     }
 
     /// The item at the path, failing with [`BackendError::NotFound`] when
@@ -66,30 +66,31 @@ impl CachedPath<'_> {
     ///
     /// Fails when the item does not exist, a listing or the state database
     /// fails.
-    pub fn existing(&self) -> anyhow::Result<ReplicaItem> {
-        self.item()?
+    pub async fn existing(&self) -> anyhow::Result<ReplicaItem> {
+        self.item()
+            .await?
             .ok_or_else(|| BackendError::NotFound(self.relative.display().to_string()).into())
     }
 }
 
-/// Run a future to completion on the current Tokio runtime from a synchronous
-/// procedure handler.
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    tokio::runtime::Handle::current().block_on(future)
+/// How the child of a folder is served, as [`NfsContext::child`] decides.
+#[derive(Debug)]
+pub enum Child<'a> {
+    /// An item of the parent's own cache-served backend.
+    Cached(CachedPath<'a>),
+    /// The root of a backend mounted at the child's name.
+    Mount,
+    /// A path of a backend the content cache does not serve.
+    Routed,
 }
 
 impl std::fmt::Debug for NfsContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NfsContext")
-            .field("root_fh_key", &self.root_fh_key)
-            .finish_non_exhaustive()
+        f.debug_struct("NfsContext").finish_non_exhaustive()
     }
 }
 
 impl NfsContext {
-    /// # Panics
-    ///
-    /// Panics if the internal `RwLock` is poisoned.
     pub fn new(vfs: Arc<RwLock<VfsTree>>) -> Self {
         let root_fh_key = Self::path_to_key("/");
         let mut fh_map = HashMap::new();
@@ -98,7 +99,6 @@ impl NfsContext {
         Self {
             vfs,
             fh_map: RwLock::new(fh_map),
-            root_fh_key,
             content_cache: None,
         }
     }
@@ -131,17 +131,6 @@ impl NfsContext {
         })
     }
 
-    /// Size of the file at `path`: the item's presented size when the content
-    /// cache serves it, otherwise the backend's; 0 when absent or unknown.
-    pub fn file_size_blocking(&self, path: &str) -> u64 {
-        self.cached(path)
-            .map_or_else(
-                || self.metadata_sync(path).ok().and_then(|entry| entry.size),
-                |cached| cached.item().ok().flatten().and_then(|item| item.size),
-            )
-            .unwrap_or(0)
-    }
-
     /// The backend owning the NFS path `path` and the path relative to it.
     ///
     /// NFS paths carry a leading root and mount prefixes may not, so every
@@ -149,12 +138,70 @@ impl NfsContext {
     /// here; the relative path never carries a leading root, which keeps a
     /// path-based backend's `Path::join` inside its configured root.
     pub fn route(&self, path: &str) -> (Arc<dyn Backend>, PathBuf) {
-        let vfs = self
-            .vfs
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (backend, relative) = vfs.resolve_rooted(std::path::Path::new(path));
+        let vfs = self.tree();
+        let (backend, relative) = vfs.resolve_rooted(Path::new(path));
         (Arc::clone(backend), relative)
+    }
+
+    fn tree(&self) -> std::sync::RwLockReadGuard<'_, VfsTree> {
+        self.vfs
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The NFS path of the content-cache item `uid`: its path in its backend
+    /// under the prefix the VFS tree mounts that backend at; `None` when the
+    /// item, an ancestor or the backend's mount is unknown.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the state database fails.
+    pub fn item_path(&self, uid: u64) -> anyhow::Result<Option<String>> {
+        let Some(cache) = &self.content_cache else {
+            return Ok(None);
+        };
+        let Some(backend_id) = cache.item_backend(uid)? else {
+            return Ok(None);
+        };
+        let (Some(relative), Some(prefix)) =
+            (cache.item_path(uid)?, self.mount_prefix(&backend_id))
+        else {
+            return Ok(None);
+        };
+        Ok(Some(relative.iter().fold(prefix, |path, name| {
+            join_child(&path, &name.to_string_lossy())
+        })))
+    }
+
+    /// How the child `name` of the folder at `parent` is served: an item of
+    /// the parent's own cache-served backend, the root of a backend mounted
+    /// at that name, or a path routed to a backend the cache does not serve.
+    ///
+    /// # Errors
+    ///
+    /// Fails for a parent path that is not UTF-8.
+    pub fn child(&self, parent: &str, name: &str) -> anyhow::Result<Child<'_>> {
+        if self.mount_names(parent)?.iter().any(|mount| mount == name) {
+            return Ok(Child::Mount);
+        }
+        Ok(self
+            .cached(&join_child(parent, name))
+            .map_or(Child::Routed, Child::Cached))
+    }
+
+    /// The NFS path the VFS tree mounts the backend `backend_id` at.
+    fn mount_prefix(&self, backend_id: &str) -> Option<String> {
+        let vfs = self.tree();
+        if vfs.root().id() == backend_id {
+            return Some("/".to_owned());
+        }
+        vfs.children()
+            .iter()
+            .find(|(_, backend)| backend.id() == backend_id)
+            .map(|(prefix, _)| {
+                let prefix = prefix.to_string_lossy();
+                format!("/{}", prefix.trim_matches('/'))
+            })
     }
 
     /// Convert a VFS path to a file handle key.
@@ -210,36 +257,28 @@ impl NfsContext {
     /// # Errors
     ///
     /// Returns an error if the backend cannot resolve or read the file.
-    pub fn read_range_blocking(
+    pub async fn read_range(
         &self,
         path: &str,
         offset: u64,
         count: u32,
     ) -> anyhow::Result<(Vec<u8>, bool)> {
         if let Some(cached) = self.cached(path) {
-            let item = cached.existing()?;
-            let data = block_on(cached.cache.read(item.uid, offset, count))?;
+            let item = cached.existing().await?;
+            let data = cached.cache.read(item.uid, offset, count).await?;
             let read = u64::try_from(data.len()).unwrap_or(u64::MAX);
             let eof = offset.saturating_add(read) >= item.size.unwrap_or(0);
             return Ok((data, eof));
         }
         let (backend, relative) = self.route(path);
-        tokio::runtime::Handle::current().block_on(async {
-            let entry = backend.metadata(&relative).await?;
-            let data = backend.read_range(&entry, offset, count).await?;
-            let read = u64::try_from(data.len()).unwrap_or(u64::MAX);
-            let eof = entry.size.map_or_else(
-                || read < u64::from(count),
-                |size| offset.saturating_add(read) >= size,
-            );
-            Ok((data, eof))
-        })
-    }
-
-    /// Get the root file handle key.
-    #[must_use]
-    pub const fn root_key(&self) -> u64 {
-        self.root_fh_key
+        let entry = backend.metadata(&relative).await?;
+        let data = backend.read_range(&entry, offset, count).await?;
+        let read = u64::try_from(data.len()).unwrap_or(u64::MAX);
+        let eof = entry.size.map_or_else(
+            || read < u64::from(count),
+            |size| offset.saturating_add(read) >= size,
+        );
+        Ok((data, eof))
     }
 
     /// List directory contents at a VFS path, as `VfsTree::read_dir` lists
@@ -258,31 +297,36 @@ impl NfsContext {
     /// The backend owning the folder at `path`, its backend-relative path and
     /// the names of the child mounts directly under it.
     fn listing(&self, path: &str) -> anyhow::Result<(Arc<dyn Backend>, String, Vec<String>)> {
-        self.vfs
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .resolve_listing_rooted(std::path::Path::new(path))
+        self.tree().resolve_listing_rooted(Path::new(path))
     }
 
-    /// Rename a VFS path, routing through [`VfsTree::rename`] (which handles
-    /// same-backend moves and cross-backend download/upload/delete).
+    /// Names of the child mounts directly under `path`.
+    ///
+    /// # Errors
+    ///
+    /// Fails for a path that is not UTF-8.
+    pub fn mount_names(&self, path: &str) -> anyhow::Result<Vec<String>> {
+        let (_, _, mounts) = self.listing(path)?;
+        Ok(mounts)
+    }
+
+    /// Rename a VFS path through [`VfsTree::rename_rooted`], which handles
+    /// same-backend moves and cross-backend download, upload and delete, on
+    /// a copy of the tree so no lock is held across the move.
     ///
     /// # Errors
     ///
     /// Returns an error if the backend rejects the move.
-    ///
-    /// Note: the `RwLockReadGuard` is intentionally held across the `.await`
-    /// here because `VfsTree::rename` needs `&self` for the duration of the
-    /// call, exactly as [`Self::list_dir`] does. The future is therefore not
-    /// `Send`; all callers invoke it via `block_on` from a sync context.
-    #[allow(clippy::await_holding_lock, clippy::future_not_send)]
     pub async fn rename(&self, src: &str, dst: &str) -> anyhow::Result<()> {
-        let vfs = self
-            .vfs
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        vfs.rename_rooted(std::path::Path::new(src), std::path::Path::new(dst))
-            .await
+        let tree = {
+            let vfs = self.tree();
+            let mut tree = VfsTree::new(Arc::clone(vfs.root()));
+            for (prefix, backend) in vfs.children() {
+                tree.mount(prefix.clone(), Arc::clone(backend));
+            }
+            tree
+        };
+        tree.rename_rooted(Path::new(src), Path::new(dst)).await
     }
 
     /// Get file metadata at a VFS path.
@@ -293,50 +337,6 @@ impl NfsContext {
     pub async fn metadata(&self, path: &str) -> anyhow::Result<cascade_engine::types::FileEntry> {
         let (backend, relative) = self.route(path);
         backend.metadata(&relative).await
-    }
-
-    /// Synchronous wrapper around `list_dir` for use in NFS procedure
-    /// handlers which must return `Vec<u8>` synchronously. A folder the
-    /// content cache serves is listed through its replica.
-    ///
-    /// Uses `tokio::runtime::Handle::block_on` to run the async VFS query
-    /// on the current tokio runtime.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the VFS tree cannot read the directory.
-    pub fn list_dir_sync(&self, path: &str) -> anyhow::Result<Vec<DirEntry>> {
-        if let Some(cached) = self.cached(path) {
-            let folder = cached.existing()?;
-            let children = block_on(cached.cache.list(folder.uid))?;
-            let entries = children
-                .into_iter()
-                .map(|child| match child.kind {
-                    ItemKind::Folder => DirEntry::dir(child.name),
-                    ItemKind::File => DirEntry::file(child.name),
-                })
-                .collect();
-            return Ok(merge_mount_names(entries, &self.mount_names(path)?));
-        }
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(self.list_dir(path))
-    }
-
-    /// Names of the child mounts directly under `path`, listed where no
-    /// entry of its listing carries the same name.
-    fn mount_names(&self, path: &str) -> anyhow::Result<Vec<String>> {
-        let (_, _, mounts) = self.listing(path)?;
-        Ok(mounts)
-    }
-
-    /// Synchronous wrapper for fetching file metadata.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the backend cannot fetch metadata.
-    pub fn metadata_sync(&self, path: &str) -> anyhow::Result<cascade_engine::types::FileEntry> {
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(self.metadata(path))
     }
 }
 
@@ -372,7 +372,10 @@ mod tests {
             cascade_engine::backend::NullBackend::new("test"),
         ))));
         let ctx = NfsContext::new(vfs);
-        assert_eq!(ctx.lookup_path(ctx.root_key()), Some("/".to_string()));
+        assert_eq!(
+            ctx.lookup_path(NfsContext::path_to_key("/")),
+            Some("/".to_string())
+        );
     }
 
     #[derive(Debug)]
@@ -463,19 +466,17 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn read_range_blocking_fetches_only_the_range() {
+    async fn read_range_fetches_only_the_range() {
         let ctx = range_ctx();
-        let (data, eof) =
-            tokio::task::block_in_place(|| ctx.read_range_blocking("/f.bin", 6, 3)).unwrap();
+        let (data, eof) = ctx.read_range("/f.bin", 6, 3).await.unwrap();
         assert_eq!(data, b"wor");
         assert!(!eof);
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn read_range_blocking_reports_eof_on_final_chunk() {
+    async fn read_range_reports_eof_on_final_chunk() {
         let ctx = range_ctx();
-        let (data, eof) =
-            tokio::task::block_in_place(|| ctx.read_range_blocking("/f.bin", 6, 5)).unwrap();
+        let (data, eof) = ctx.read_range("/f.bin", 6, 5).await.unwrap();
         assert_eq!(data, b"world");
         assert!(eof);
     }

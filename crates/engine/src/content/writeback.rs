@@ -560,7 +560,7 @@ impl ContentCache {
     }
 
     /// The item's object awaiting upload: dirty or edited.
-    fn dirty_object(&self, uid: u64) -> Result<Option<ContentObject>> {
+    pub(super) fn dirty_object(&self, uid: u64) -> Result<Option<ContentObject>> {
         Ok(self
             .db()
             .content_objects_of(uid)?

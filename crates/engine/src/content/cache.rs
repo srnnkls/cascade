@@ -524,8 +524,15 @@ impl ContentCache {
         }
     }
 
-    /// Path of the item relative to the backend root.
-    pub(super) fn item_path(&self, uid: u64) -> Result<Option<PathBuf>> {
+    /// Path of the item `uid` relative to the root of its backend, from the
+    /// names along its parent chain: the empty path for a backend's root
+    /// item, `None` for a tombstoned item, an unknown uid and an item whose
+    /// ancestor the replica no longer holds.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the state database fails.
+    pub fn item_path(&self, uid: u64) -> Result<Option<PathBuf>> {
         super::replica::item_path(uid, |uid| {
             Ok(self.item(uid)?.map(|item| (item.parent_uid, item.name)))
         })

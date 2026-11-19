@@ -68,6 +68,15 @@ impl ObjectStore {
             .write_all_at(bytes, offset)
     }
 
+    /// Syncs the data of the object of `id` to disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error of opening or syncing the file.
+    pub fn sync(&self, id: ObjectId) -> io::Result<()> {
+        File::open(self.path(id))?.sync_data()
+    }
+
     /// Reads into `buf` from `offset` until it is full or the file ends, and
     /// returns the number of bytes read.
     ///

@@ -99,7 +99,9 @@ pub fn create_backend(config: &toml::Value) -> anyhow::Result<Box<dyn Backend>> 
             String::from,
         );
 
-    let manifest_path = root_path.join(".cascade-cache").join("manifest.jsonl");
+    let manifest_path = root_path
+        .join(manifest::MANIFEST_DIR)
+        .join("manifest.jsonl");
 
     Ok(Box::new(LocalBackend {
         id,
@@ -187,7 +189,9 @@ impl LocalBackend {
                 }
             }
         }
-        Ok((abs, components.join("/")))
+        let normalised = components.join("/");
+        reject_manifest_path(Path::new(&normalised))?;
+        Ok((abs, normalised))
     }
 
     /// Convert a `FileState` into a `FileEntry`.
@@ -409,6 +413,7 @@ impl Backend for LocalBackend {
 
     async fn download(&self, file: &FileEntry) -> anyhow::Result<Vec<u8>> {
         let relative = file.id.native_id();
+        reject_manifest_path(Path::new(relative))?;
         let abs = self.root.join(relative);
 
         if !abs.exists() {
@@ -428,6 +433,7 @@ impl Backend for LocalBackend {
         length: u32,
     ) -> anyhow::Result<Vec<u8>> {
         let relative = file.id.native_id();
+        reject_manifest_path(Path::new(relative))?;
         let abs = self.root.join(relative);
 
         if !abs.exists() {
@@ -512,6 +518,7 @@ impl Backend for LocalBackend {
 
     async fn update(&self, file_id: &FileId, data: &[u8]) -> anyhow::Result<FileEntry> {
         let relative = file_id.native_id();
+        reject_manifest_path(Path::new(relative))?;
         let full_path = self.root.join(relative);
 
         if let Some(parent) = full_path.parent() {
@@ -576,6 +583,7 @@ impl Backend for LocalBackend {
         }
 
         let relative = file.id.native_id();
+        reject_manifest_path(Path::new(relative))?;
         let abs = self.root.join(relative);
 
         if abs.is_dir() {
@@ -667,6 +675,15 @@ impl Backend for LocalBackend {
     async fn poll_interval(&self) -> Option<Duration> {
         Some(Duration::from_secs(5))
     }
+}
+
+/// Refuses the backend's own manifest directory as missing, as listing hides
+/// it.
+fn reject_manifest_path(relative: &Path) -> anyhow::Result<()> {
+    if manifest::is_manifest_path(relative) {
+        return Err(BackendError::NotFound(relative.display().to_string()).into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

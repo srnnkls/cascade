@@ -113,6 +113,11 @@ js-sys = "0.3"
 wasm-bindgen-futures = "0.4"
 web-sys = "0.3"
 
+# NFSv3 server, its protocol types, and the client the NFS presenter tests use
+nfs3_server = "=0.11.1"
+nfs3_types = "=0.5.3"
+nfs3_client = { version = "=0.9.1", features = ["tokio"] }
+
 # OS process management (Unix-only)
 nix = { version = "0.31", features = ["signal", "process"] }
 
