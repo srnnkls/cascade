@@ -8,7 +8,7 @@ use cascade_engine::portable::native::{SqliteStorage, TokioRuntimeHandle};
 use std::sync::Arc;
 
 use super::CliContext;
-use super::init::{BackendConfig, CascadeConfig, SmbSettings};
+use super::init::{BackendConfig, CascadeConfig, SmbSettings, write_backend_toml};
 
 /// Open the state database.
 fn open_db(ctx: &CliContext) -> Result<StateDb> {
@@ -191,6 +191,7 @@ pub fn backend_add(
     mount_path: Option<&str>,
     cli_client_id: Option<&str>,
     cli_client_secret: Option<&str>,
+    store: &dyn cascade_backend_smb::credentials::CredentialStore,
 ) -> Result<()> {
     std::fs::create_dir_all(&ctx.config_dir)?;
 
@@ -256,7 +257,7 @@ pub fn backend_add(
                 toml::Value::String(secret_access_key),
             );
             let config_str = toml::to_string_pretty(&full_config)?;
-            std::fs::write(&config_path, &config_str)?;
+            write_backend_toml(&config_path, &config_str)?;
         }
         "p2p" => {
             println!("\nP2P configuration:");
@@ -337,7 +338,7 @@ pub fn backend_add(
                 );
             }
             let config_str = render_p2p_config(&full_config, &peers)?;
-            std::fs::write(&config_path, &config_str)?;
+            write_backend_toml(&config_path, &config_str)?;
         }
         "smb" => {
             println!("\nSMB configuration:");
@@ -350,9 +351,9 @@ pub fn backend_add(
                     toml::Value::String(mp.to_string()),
                 );
             }
-            full_config.extend(SmbSettings::prompt()?.into_table());
+            full_config.extend(SmbSettings::prompt()?.into_table(store)?);
             let config_str = toml::to_string_pretty(&full_config)?;
-            std::fs::write(&config_path, &config_str)?;
+            write_backend_toml(&config_path, &config_str)?;
         }
         "gdrive" => {
             // Use CLI flags if provided, otherwise prompt interactively.
@@ -406,7 +407,7 @@ pub fn backend_add(
                 toml::Value::String(client_secret),
             );
             let config_str = toml::to_string_pretty(&full_config)?;
-            std::fs::write(&config_path, &config_str)?;
+            write_backend_toml(&config_path, &config_str)?;
         }
         _ => {
             // Write minimal config with the backend type.
@@ -426,7 +427,7 @@ pub fn backend_add(
                 );
             }
             let config_str = toml::to_string_pretty(&config)?;
-            std::fs::write(&config_path, &config_str)?;
+            write_backend_toml(&config_path, &config_str)?;
         }
     }
 

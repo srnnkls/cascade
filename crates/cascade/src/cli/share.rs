@@ -312,7 +312,7 @@ mod tests {
 
     /// Register the P2P backend row in the state DB so `resolve_p2p_folder_id`
     /// can map the operator-facing name to its canonical BEP folder id. The
-    /// production code does this in `cascade backend add`; the share CLI
+    /// production code does this in `cascade backend-add`; the share CLI
     /// resolves the name against this row, so the test must set it up
     /// directly. The backend row's `id` is the user-facing name; the folder
     /// id the runtime gate checks is `p2p-<id>`.

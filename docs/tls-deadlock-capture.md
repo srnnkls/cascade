@@ -18,7 +18,7 @@ reproductions in `crates/presenter-webdav/tests/tls_topology_repro.rs` and
 ## Prerequisites
 
 - A Google Drive account with the Cascade backend already configured and
-  authenticated (`cascade backend add gdrive --name personal` + device-code
+  authenticated (`cascade backend-add gdrive --name personal` + device-code
   flow). On macOS the tokens live in the Keychain (`security`, service
   `com.cascade.gdrive`), not a JSON file.
 - The daemon built from source, not from Homebrew, so the diagnostic tracing

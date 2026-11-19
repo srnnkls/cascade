@@ -26,7 +26,7 @@ use super::init::CascadeConfig;
 ///
 /// The BEP folder id the runtime data-plane gate consults is always
 /// `p2p-<name>`, where `<name>` is the user-facing name the operator passed
-/// to `cascade backend add p2p --name <name>`. The data-plane gate and the
+/// to `cascade backend-add p2p --name <name>`. The data-plane gate and the
 /// `Scope::folder(...)` value a grant stores must live in the same namespace —
 /// otherwise `Scope::covers` returns `false` and the grant is a silent no-op.
 /// This function is the single path that authors a data-verb grant: it maps

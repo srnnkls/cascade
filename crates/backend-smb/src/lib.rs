@@ -29,6 +29,7 @@ use smb::{
 
 mod client;
 mod config;
+pub mod credentials;
 mod listing;
 mod names;
 mod write;
@@ -38,8 +39,7 @@ use listing::file_time_to_utc;
 
 /// A file handle and the client it was opened on.
 type OpenFile = (Arc<Client>, Arc<File>);
-pub use config::SmbConfig;
-use config::parse_smb_config;
+pub use config::{SmbConfig, parse_smb_config};
 
 /// Native id of the share root.
 const ROOT_ID: &str = "/";
@@ -68,9 +68,12 @@ impl std::fmt::Debug for SmbBackend {
 
 /// Create an SMB backend from a TOML config value.
 ///
-/// Required keys: `host`, `share`, `username`, `password`.
+/// Required keys: `host`, `share`, `username`.
 ///
 /// Optional keys:
+/// - `password` — takes precedence over the keychain; without it the password
+///   is the keychain's SMB internet password for `host` and `username` on
+///   macOS (see [`credentials`]) and the key is required elsewhere
 /// - `id` — unique backend identifier, supplied by the caller; the Cascade
 ///   CLI sets it to the name the backend is configured under. The fallback
 ///   `"smb"` applies only when the crate is used without the CLI.
@@ -81,9 +84,10 @@ impl std::fmt::Debug for SmbBackend {
 ///
 /// # Errors
 ///
-/// Returns an error if a required key is missing or the share path is invalid.
+/// Returns an error if a required key is missing, the password is not found,
+/// or the share path is invalid.
 pub fn create_backend(config: &toml::Value) -> anyhow::Result<Box<dyn Backend>> {
-    let smb_config = parse_smb_config(config)?;
+    let smb_config = parse_smb_config(config, &credentials::system_store())?;
     let backend_id = config
         .get("id")
         .and_then(|v| v.as_str())
@@ -572,6 +576,26 @@ impl Backend for SmbBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::credentials::{CredentialStore, PasswordLocation};
+
+    /// Fails every call: a TOML holding `password` needs no lookup.
+    struct UnusedStore;
+
+    impl CredentialStore for UnusedStore {
+        fn find(&self, _: &str, _: &str, _: Option<u16>) -> anyhow::Result<Option<String>> {
+            anyhow::bail!("credential store consulted")
+        }
+
+        fn store(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<u16>,
+            _: &str,
+        ) -> anyhow::Result<PasswordLocation> {
+            anyhow::bail!("credential store consulted")
+        }
+    }
 
     fn make_config(extra: &[(&str, toml::Value)]) -> toml::Value {
         let mut table = toml::map::Map::new();
@@ -597,6 +621,7 @@ mod tests {
         assert_eq!(backend.root_native_id(), "/");
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn create_backend_missing_password_errors() {
         let mut config = make_config(&[]);
@@ -609,10 +634,13 @@ mod tests {
 
     #[test]
     fn parse_port_and_prefix() {
-        let config = parse_smb_config(&make_config(&[
-            ("port", toml::Value::Integer(1445)),
-            ("prefix", toml::Value::String("/media/photos/".to_string())),
-        ]))
+        let config = parse_smb_config(
+            &make_config(&[
+                ("port", toml::Value::Integer(1445)),
+                ("prefix", toml::Value::String("/media/photos/".to_string())),
+            ]),
+            &UnusedStore,
+        )
         .unwrap();
         assert_eq!(config.port, Some(1445));
         assert_eq!(config.prefix.as_deref(), Some("media/photos"));
@@ -620,14 +648,17 @@ mod tests {
 
     #[test]
     fn parse_rejects_out_of_range_port() {
-        let err =
-            parse_smb_config(&make_config(&[("port", toml::Value::Integer(70_000))])).unwrap_err();
+        let err = parse_smb_config(
+            &make_config(&[("port", toml::Value::Integer(70_000))]),
+            &UnusedStore,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("'port'"));
     }
 
     #[test]
     fn debug_output_omits_password() {
-        let config = parse_smb_config(&make_config(&[])).unwrap();
+        let config = parse_smb_config(&make_config(&[]), &UnusedStore).unwrap();
         assert!(!format!("{config:?}").contains("secret"));
     }
 

@@ -4,6 +4,8 @@ pub mod config;
 pub mod files;
 pub mod grant;
 pub mod init;
+#[cfg(test)]
+mod memory_store;
 pub mod mount;
 pub mod paths;
 /// Engine-backed `ContentProvider` for the Windows `ProjFS` presenter.
@@ -977,6 +979,7 @@ impl Cli {
                     smb_username: args.smb_username,
                     smb_password: args.smb_password,
                 },
+                &cascade_backend_smb::credentials::system_store(),
             ),
             Commands::Start {
                 mount_point,
@@ -1056,6 +1059,7 @@ impl Cli {
                 mount_path.as_deref(),
                 client_id.as_deref(),
                 client_secret.as_deref(),
+                &cascade_backend_smb::credentials::system_store(),
             ),
             Commands::BackendRemove { name } => cache::backend_remove(ctx, &name),
             Commands::P2pIdentity { data_dir } => {

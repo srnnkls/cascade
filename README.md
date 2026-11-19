@@ -104,7 +104,7 @@ make fileprovider-smoke TEAM=<team id>     # build, then open the host app
 ### Run
 
 ```bash
-cascade backend add gdrive --name personal
+cascade backend-add gdrive --name personal
 cascade start
 cascade status
 cascade pin Documents/Accounts/
@@ -127,7 +127,7 @@ The scope is selected in this order: an explicit `--user` or `--system` flag, th
 
 If you installed via Homebrew, `brew services start cascade` works out of the box — the formula ships a `service` block that delegates to `cascade start`.
 
-The daemon exits cleanly with a log message when no backends are configured, so a freshly-installed service does not crash-loop before `cascade backend add` has been run.
+The daemon exits cleanly with a log message when no backends are configured, so a freshly-installed service does not crash-loop before `cascade backend-add` has been run.
 
 ## Build, test, and lint
 
@@ -171,7 +171,7 @@ Local edit wins: when a file changed on the server and on the Mac, the upload re
 
 Ignore rules: the ignore rules of the `.cascade` files in the mount-point directory apply to the content cache, so part of a share can be left to another tool. They are read at daemon start, like the pin rules and `cache.max_size`, apply to every backend, and are matched with gitignore semantics, case-insensitively, against the item's path relative to the mount root, the backend's mount prefix included (`/nas/build` anchors at the mount root, `Mutagen/` matches that folder at any depth, and nothing beneath an ignored folder can be re-included). An ignored item is neither listed nor served, and Cascade creates, writes, renames, moves and deletes nothing at an ignored path: through File Provider a create answers `excludedFromSync` and a rename or move onto an ignored path, and of a folder whose subtree on the server holds an ignored entry or would place one on an ignored path, is answered with the item under its current name; through NFS CREATE, MKDIR, SYMLINK and RENAME answer `NFS3ERR_ACCES` and LOOKUP answers `NFS3ERR_NOENT`; a folder holding an ignored entry on the server is not deleted (`directoryNotEmpty`, `NFS3ERR_NOTEMPTY`). Under `--app-group`, `.cascade` files on the share are not read, and an ignore rule with conditions has no effect.
 
-The SMB backend (`crates/backend-smb`, SMB2/3 with NTLM) is configured per backend in `~/.config/cascade/<name>.toml` with `type = "smb"`, `host`, `share`, `username`, `password`, and optionally `port` (default 445), `prefix` (a sub-directory of the share) and `id`; without `id` the backend takes the name it is configured under. The password is stored in the TOML file.
+The SMB backend (`crates/backend-smb`, SMB2/3 with NTLM) is configured per backend in `~/.config/cascade/<name>.toml` with `type = "smb"`, `host`, `share`, `username`, and optionally `port` (default 445), `prefix` (a sub-directory of the share) and `id`; without `id` the backend takes the name it is configured under. The CLI writes the file with mode 0600. On macOS `cascade init --backend-type smb` and `cascade backend-add smb` store the password in the login keychain as an internet password (server = `host`, account = `username`, protocol SMB, port = `port` or 445) and leave `password` out of the file; a lookup for port 445 falls back to an item without a port, so a password Finder saved for the same server and user is used too, and when the only item for that server and user is one stored for another port, that fallback returns it. A `password` key in the file still takes precedence. The first read by a differently signed `cascade` binary, such as the daemon embedded in the host app reading an item a cargo-built CLI stored, shows the keychain's access prompt once; answer it with Always Allow. On other platforms the password is the file's `password` key.
 
 Details are in the design document:
 

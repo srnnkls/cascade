@@ -135,6 +135,12 @@ EOF
 pgrep -fl 'cascade start'
 ```
 
+`password = "cascade"` keeps the share's password in the file in plain text. To keep it
+in the login keychain instead, omit the `password` line and store the password with
+`cascade backend-add smb --name nas` (answers `127.0.0.1`, `data`, `1445`, `cascade`,
+`cascade`) before writing the two files; the host app's daemon then shows the keychain's
+access prompt on its first read, answered with Always Allow.
+
 `pgrep` prints nothing. The NFS volume mounts at `~/Cloud` unless `config.toml` sets
 `[mount] point`.
 

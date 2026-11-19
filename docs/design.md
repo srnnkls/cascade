@@ -1154,10 +1154,13 @@ The container is the team-prefixed App Group `<team id>.group.io.cascade.shared`
 | `type` | `"smb"` |
 | `host` | Server host name or address |
 | `share` | Share name |
-| `username`, `password` | NTLM credentials, stored in the file |
+| `username` | NTLM user name |
+| `password` | NTLM password; optional on macOS, where it takes precedence over the keychain |
 | `port` | TCP port, default 445 |
 | `prefix` | Optional sub-directory of the share to serve |
 | `id` | Backend id; without it the backend takes the name it is configured under |
+
+The CLI writes the file with mode 0600. On macOS the password lives in the login keychain as an internet password: server = `host`, account = `username`, protocol SMB, port = `port` or 445, authentication type default, the kind of item Finder saves with "Remember this password in my keychain". `cascade init --backend-type smb` and `cascade backend-add smb` add or update the item and write no `password` key; a failed store fails the command and writes no file for the backend. A lookup matches server, account, protocol and port exactly. For port 445 it falls back to an item without a port, the kind Finder saves, so a password Finder saved for the same server and user is used too; the Security framework treats a missing port as a wildcard, so when the only item for that server and user is one stored for another port, the fallback returns it. A store for one port never changes an item of another port or Finder's item without a port. A `password` key in the file still takes precedence. The keychain's access list names the binary that stored the item, so the first read by a differently signed `cascade`, for example the daemon embedded in the host app reading an item a cargo-built CLI stored, shows the keychain's access prompt once, answered with Always Allow. Without an item the backend fails to start with an error naming host and user; a locked or refused keychain is reported with the keychain's message. Other platforms have no keychain: the `password` key is required and the CLI writes it.
 
 The client sits behind a lock that a reconnect replaces. Connecting has a 5 s deadline and each request 10 s; a timeout or a dropped connection marks the client dead, the operation gets one reconnect and retry, and it fails at the latest 15 s after it began with `TransientError::Unreachable`. Reads and writes are split into requests of at most 1 MiB, because larger concurrent reads hang without an error. SMB offers no conditional write, which is why uploads go through a temporary name and a rename.
 
@@ -1684,7 +1687,7 @@ Protocol v1 remains for `cascade start --file-provider` without `--app-group`, s
 
 OAuth2 device code flow (no browser redirect needed for headless/CLI usage):
 
-1. `cascade backend add gdrive` — initiates device code flow
+1. `cascade backend-add gdrive` — initiates device code flow
 2. Prints a URL and code: "Visit https://google.com/device and enter ABC-DEF-GHI"
 3. User authorises in browser
 4. Backend polls for token, stores refresh token in keychain (`security` on macOS, `libsecret` on Linux, Credential Manager on Windows)
@@ -1779,7 +1782,7 @@ The Homebrew formula ships a `service do` block so `brew services start cascade`
 
 ### Graceful empty start
 
-The daemon exits cleanly with a log message and exit code 0 when no backends are configured. This means a freshly-installed service does not crash-loop before `cascade backend add` has been run.
+The daemon exits cleanly with a log message and exit code 0 when no backends are configured. This means a freshly-installed service does not crash-loop before `cascade backend-add` has been run.
 
 ## Build and run
 
@@ -1814,7 +1817,7 @@ swift test --package-path swift/CascadeFileProviderKit
 
 ```bash
 # Configure a backend
-cascade backend add gdrive --name personal
+cascade backend-add gdrive --name personal
 
 # Start the daemon
 cascade start

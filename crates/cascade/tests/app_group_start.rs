@@ -1,12 +1,12 @@
 //! `cascade start --app-group` as a process: which File Provider protocol a
 //! start serves, its PID file and socket across a stop, and two SMB backends
-//! written by `init` and `backend-add`.
+//! side by side.
 #![cfg(target_os = "macos")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use std::io::{Read as _, Write as _};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
@@ -234,53 +234,30 @@ fn file_provider_without_app_group_serves_protocol_v1() {
 }
 
 #[test]
-fn two_smb_backends_from_init_and_backend_add_are_both_served() {
+fn two_smb_backends_configured_side_by_side_are_both_served() {
     let setup = Setup::new();
     let group = setup.app_group.path();
-    let mount: PathBuf = setup.mount.path().to_path_buf();
-    let init = setup
-        .cascade(
-            None,
-            &[
-                "init",
-                "--backend-type",
-                "smb",
-                "--name",
-                "office",
-                "--mount-point",
-                mount.to_str().unwrap(),
-                "--smb-host",
-                "127.0.0.1",
-                "--smb-share",
-                "office",
-                "--smb-port",
-                "1",
-                "--smb-username",
-                "alice",
-                "--smb-password",
-                "secret",
-            ],
+    let config = setup.config.path();
+    std::fs::write(
+        config.join("config.toml"),
+        format!(
+            "[backends.office]\ntype = \"smb\"\nmount = \"office\"\n\n\
+             [backends.media]\ntype = \"smb\"\nmount = \"media\"\n\n\
+             [mount]\npoint = \"{}\"\n",
+            setup.mount.path().display()
+        ),
+    )
+    .unwrap();
+    for (name, user) in [("office", "alice"), ("media", "bob")] {
+        std::fs::write(
+            config.join(format!("{name}.toml")),
+            format!(
+                "type = \"smb\"\nhost = \"127.0.0.1\"\nshare = \"{name}\"\nport = 1\n\
+                 username = \"{user}\"\npassword = \"secret\"\n"
+            ),
         )
-        .status()
         .unwrap();
-    assert!(init.success(), "cascade init exited with {init}");
-
-    let mut add = setup.cascade(None, &["backend-add", "smb", "--name", "media"]);
-    add.stdin(Stdio::piped()).stderr(Stdio::piped());
-    let mut adding = add.spawn().unwrap();
-    adding
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(b"127.0.0.1\nmedia\n1\nbob\nsecret\n")
-        .unwrap();
-    let added = adding.wait_with_output().unwrap();
-    assert!(
-        added.status.success(),
-        "cascade backend-add exited with {}: {}",
-        added.status,
-        String::from_utf8_lossy(&added.stderr)
-    );
+    }
 
     let socket = group.join("fp.sock");
     let mut daemon = setup.spawn(Some(group), &["start", "--no-mount"]);

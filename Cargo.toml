@@ -133,6 +133,9 @@ loom = "0.7"
 # Platform config / cache paths
 dirs = "6"
 
+# macOS login keychain (SMB passwords)
+security-framework = "3.7"
+
 # Network interface enumeration (used by cascade-p2p host candidate gathering)
 if-addrs = "0.15"
 

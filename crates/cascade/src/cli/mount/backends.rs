@@ -186,6 +186,7 @@ mod tests {
 
     use crate::cli::CliContext;
     use crate::cli::init::{InitFlags, run};
+    use crate::cli::memory_store::MemoryStore;
 
     fn smb_config(host: &str, share: &str) -> toml::Value {
         toml::from_str(&format!(
@@ -242,7 +243,7 @@ mod tests {
     }
 
     #[test]
-    fn smb_config_written_by_init_is_accepted_by_backend_factory() {
+    fn smb_config_written_by_init_reads_back_through_the_same_credential_store() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = CliContext {
             config_dir: dir.path().to_path_buf(),
@@ -260,7 +261,8 @@ mod tests {
             smb_password: Some("s3cret".to_string()),
             ..Default::default()
         };
-        run(&ctx, flags).unwrap();
+        let store = MemoryStore::default();
+        run(&ctx, flags, &store).unwrap();
 
         let main_config = load_main_config(dir.path()).unwrap();
         let entry: BackendConfig = main_config
@@ -271,10 +273,16 @@ mod tests {
             .try_into()
             .unwrap();
         let per_backend_config = load_backend_config(dir.path(), "nas").unwrap();
-        let backend =
-            create_backend("nas", &entry.backend_type, &per_backend_config, None).unwrap();
+        let smb = cascade_backend_smb::parse_smb_config(&per_backend_config, &store).unwrap();
 
         assert_eq!(entry.backend_type, "smb");
-        assert_eq!(backend.display_name(), "nas.local/media");
+        assert_eq!(
+            (smb.host.as_str(), smb.share.as_str(), smb.port),
+            ("nas.local", "media", Some(4445))
+        );
+        assert_eq!(
+            (smb.username.as_str(), smb.password.as_str()),
+            ("alice", "s3cret")
+        );
     }
 }
