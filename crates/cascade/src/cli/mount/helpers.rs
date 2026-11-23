@@ -10,9 +10,13 @@ use super::backends::{cli_backend_factory, load_main_config};
 use super::{CliContext, ResolvedP2pConfig};
 use crate::cli::paths::AppPaths;
 
-/// The resolved `.cascade` config of the mount root.
-pub(super) fn root_config(mount_path: &Path) -> ResolvedConfig {
-    cascade_config::merge::resolve(mount_path, mount_path)
+/// The resolved `.cascade` config of the mount root, read strictly.
+///
+/// # Errors
+///
+/// Fails when a config file of the mount root is invalid, naming the file.
+pub(super) fn root_config(mount_path: &Path) -> Result<ResolvedConfig> {
+    cascade_config::merge::resolve_root(mount_path)
 }
 
 /// The engine configuration of a daemon start serving `backends` at

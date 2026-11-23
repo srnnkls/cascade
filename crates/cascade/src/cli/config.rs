@@ -63,7 +63,7 @@ pub fn validate() -> Result<()> {
 }
 
 fn walk_and_validate(dir: &Path) -> Result<()> {
-    if let Some(config) = cascade_config::parse::load_dir(dir) {
+    if let Some(config) = cascade_config::parse::load_dir_strict(dir)? {
         for rule in &config.ignore {
             if rule.pattern.is_empty() {
                 anyhow::bail!("empty ignore pattern in {}", dir.join(".cascade").display());
@@ -81,4 +81,25 @@ fn walk_and_validate(dir: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn validate_rejects_a_child_config_the_daemon_rejects() {
+        let root = TempDir::new().unwrap();
+        let child = root.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(child.join("cascade.toml"), "[nfs]\nsoft = true\n").unwrap();
+
+        let error = walk_and_validate(root.path()).expect_err("strict loader rejects the key");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("cascade.toml"), "{message}");
+        assert!(message.contains("soft"), "{message}");
+    }
 }

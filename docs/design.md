@@ -102,9 +102,9 @@ cascade/
 │   │       ├── parse/
 │   │       │   ├── mod.rs
 │   │       │   ├── gitignore.rs  # gitignore-style .cascade parser
-│   │       │   ├── toml.rs       # .cascade.toml parser
-│   │       │   ├── yaml.rs       # .cascade.yaml parser
-│   │       │   └── json.rs       # .cascade.json parser
+│   │       │   ├── toml.rs       # cascade.toml and cascade.local.toml parser
+│   │       │   ├── yaml.rs       # YAML parser, no longer read from directories
+│   │       │   └── json.rs       # JSON parser, no longer read from directories
 │   │       ├── merge.rs          # ResolvedConfig builder, directory walk
 │   │       └── types.rs          # CascadeConfig, IgnoreRule, LifecyclePolicy, PinRule
 │   ├── expr/                     # Conditional expression parser and evaluator
@@ -577,8 +577,18 @@ The NFS presenter serves NFSv3 (RFC 1813) and MOUNT v3 on one loopback TCP port 
 On macOS the daemon mounts the volume as the current user:
 
 ```
-/sbin/mount_nfs -o vers=3,tcp,port=<p>,mountport=<p>,locallocks,rsize=1048576,wsize=1048576 127.0.0.1:/ <mount point>
+/sbin/mount_nfs -o vers=3,tcp,port=<p>,mountport=<p>,locallocks,rsize=1048576,wsize=1048576,<configured> 127.0.0.1:/ <mount point>
 ```
+
+The options up to `wsize` are fixed: the server depends on them. `<configured>` comes from the `[nfs]` section of the mount-point directory's TOML config, read at daemon start; the section is root-only, and a child directory's has no effect. The options follow in this order:
+
+| Key | Default | Option |
+|-----|---------|--------|
+| `interruptible` | `true` | `intr`, or `nointr` when `false` |
+| `dead_timeout` | absent, no option | `deadtimeout=<s>` |
+| `attribute_cache = { min, max }` | absent, no options | `acregmin=<min>,acregmax=<max>,acdirmin=<min>,acdirmax=<max>,acrootdirmin=<min>,acrootdirmax=<max>` |
+
+Durations are strings in the `"120s"` or `"2m"` form and must be whole seconds; `dead_timeout` is at least `"1s"`. An omitted `min` or `max` takes the macOS default, 5 s or 60 s, and `min` must not exceed `max`. Without an `[nfs]` section the options end in `wsize=1048576,intr`. `soft`, `timeo`, `retrans` and a raw option string are not offered.
 
 MOUNT runs on the NFS port, so no portmapper and no reserved source port is needed, and the daemon never asks for administrator rights. A failed mount is logged and fails the start.
 
@@ -684,14 +694,15 @@ A single `.cascade` file in any directory controls ignore rules, pinning, lifecy
 
 **Glob anchoring.** Ignore, pin, and max-file-length globs match against an item's full, VFS-absolute, mount-prefixed path — the same `files.path` value the item is stored under (e.g. `personal/Documents/report.txt` for a backend mounted at `personal`). This is the one canonical path the sync runner assembles on the way in, before any rule check sees the item, so the same glob anchoring holds across every backend regardless of where it is mounted. For a backend mounted at `"/"` the prefix is empty, so the matched string is byte-identical to the pre-refactor mount-relative path and existing rules behave unchanged.
 
-### Four formats, one type
+### Config files, one type
 
 | File | Parser |
 |------|--------|
 | `.cascade` (no extension) | Custom gitignore-style line parser |
-| `.cascade.toml` | serde + `toml` crate |
-| `.cascade.yaml` | serde + `serde_yaml` crate |
-| `.cascade.json` | serde + `serde_json` crate |
+| Shared: `.cascade.toml` or `cascade.toml` | serde + `toml` crate |
+| Local: `.cascade.local.toml` or `cascade.local.toml` | serde + `toml` crate |
+
+TOML is the only structured format: `.cascade.yaml` and `.cascade.json` are no longer read, and a directory holding one is an error naming the file and pointing to `cascade.toml`.
 
 All deserialise to:
 
@@ -719,6 +730,9 @@ struct CascadeConfig {
 
     #[serde(default)]
     device: Option<DeviceConfig>,
+
+    #[serde(default)]
+    nfs: Option<NfsConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -885,18 +899,21 @@ impl ResolvedConfig {
 | Pin rules | **Accumulated** — `[[pin]]` pins; `[[unpin]]` in a child removes |
 | Cache settings | **Nearest-wins** — child overrides parent's scalar values |
 | Device config | **Root only** — child configs cannot reidentify the machine |
+| NFS mount options | **Root only** — `[nfs]` of the mount root; a child's has no effect |
 | P2P settings | **Nearest-wins** for folder-level config; global settings from root |
 
 The config walk crosses backend boundaries — a `.cascade` at the mount root applies to `Work/` even though that subtree is served by a different backend.
 
 ### Coexistence in one directory
 
-If multiple `.cascade*` files exist in the same directory:
+A directory holds the gitignore-style `.cascade`, at most one shared config and at most one local config:
 
-1. All are loaded — not an error.
-2. Merged in deterministic order: gitignore-style → TOML → YAML → JSON.
-3. Scalar settings (cache, P2P) use last-writer-wins (JSON overrides TOML).
-4. Ignore/lifecycle/pin rules are accumulated from all sources.
+1. Merged in order: `.cascade` → shared (`.cascade.toml` or `cascade.toml`) → local (`.cascade.local.toml` or `cascade.local.toml`). A local config without a shared one is valid.
+2. Scalar settings (cache, P2P, NFS) use last-writer-wins (the local config overrides the shared one).
+3. Ignore/lifecycle/pin rules are accumulated from all sources.
+4. Both shared variants, both local variants, or a `.cascade.yaml` or `.cascade.json` in one directory is an error.
+
+At daemon start the mount-point directory is read strictly (`load_dir_strict`): a TOML config that fails to parse, such as an unknown key, a wrong type, an invalid duration or `min` above `max`, or one of the errors of item 4, fails `cascade start` before anything is mounted, with an error naming the file and the offending key or value. Child directories are read leniently (`load_dir`): a TOML config that fails to parse is skipped, and the errors of item 4 leave every TOML config of that directory unapplied, with a warning naming the files.
 
 ## Expression language
 
@@ -1097,7 +1114,7 @@ Every reader of an object holds a guard; an object is evictable when it is clean
 
 Keep Downloaded and `.cascade` pin rules set `replica_items.pinned`, reported to the system as `downloadEagerlyAndKeepDownloaded`; a pinned file downloads without being read and is never evicted. A pin that would raise pinned bytes above `cache.max_size` is refused with `NSFileWriteOutOfSpaceError`; a pin rule matching more pins its matches in path order until the budget is used and logs the rest. Remove Download unpins the item, asks the system to evict it, and then sends `evict`, which deletes the object, or answers busy for a dirty or open one.
 
-`cache.max_size` and the pin rules are read at daemon start from the `.cascade` files in the mount-point directory, before the NFS volume is mounted over it, and from the stored pin rules.
+`cache.max_size`, the pin rules and the `[nfs]` section are read at daemon start from the config files of the mount-point directory, before the NFS volume is mounted over it, and from the stored pin rules.
 
 ### Ignore rules
 

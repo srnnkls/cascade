@@ -6,7 +6,7 @@
 )]
 //! Integration tests: .cascade config parse → resolved → ignore filtering.
 //!
-//! Tests the full config pipeline: write temp files in multiple formats,
+//! Tests the full config pipeline: write temp config files,
 //! resolve via directory walk, and verify ignore rules are accumulated
 //! and applied correctly.
 
@@ -63,33 +63,22 @@ max_age = "7d"
 }
 
 #[test]
-fn yaml_format_parses_ignores() {
-    let dir = TempDir::new().unwrap();
-    fs::write(
-        dir.path().join(".cascade.yaml"),
-        "ignore:\n  - pattern: '*.o'\n  - pattern: '*.d'\n",
-    )
-    .unwrap();
+fn yaml_and_json_configs_are_no_longer_read() {
+    for (file, contents) in [
+        (
+            ".cascade.yaml",
+            "ignore:\n  - pattern: '*.o'\n  - pattern: '*.d'\n",
+        ),
+        (
+            ".cascade.json",
+            r#"{"ignore": [{"pattern": "node_modules/"}, {"pattern": ".env"}]}"#,
+        ),
+    ] {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join(file), contents).unwrap();
 
-    let config = parse::load_dir(dir.path()).expect("should parse YAML");
-    assert_eq!(config.ignore.len(), 2);
-    assert_eq!(config.ignore[0].pattern, "*.o");
-    assert_eq!(config.ignore[1].pattern, "*.d");
-}
-
-#[test]
-fn json_format_parses_ignores() {
-    let dir = TempDir::new().unwrap();
-    fs::write(
-        dir.path().join(".cascade.json"),
-        r#"{"ignore": [{"pattern": "node_modules/"}, {"pattern": ".env"}]}"#,
-    )
-    .unwrap();
-
-    let config = parse::load_dir(dir.path()).expect("should parse JSON");
-    assert_eq!(config.ignore.len(), 2);
-    assert_eq!(config.ignore[0].pattern, "node_modules/");
-    assert_eq!(config.ignore[1].pattern, ".env");
+        assert!(parse::load_dir(dir.path()).is_none(), "{file} was read");
+    }
 }
 
 #[test]

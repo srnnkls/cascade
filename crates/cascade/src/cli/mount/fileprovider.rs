@@ -109,7 +109,7 @@ pub(super) async fn try_fileprovider(
     }
 
     let paths = ctx.app_paths().context("resolve File Provider paths")?;
-    let root = root_config(mount_path);
+    let root = root_config(mount_path)?;
 
     let engine = Arc::new(NativeEngine::new(engine_config(
         ctx, mount_path, backends, &paths, &root, p2p,
@@ -256,7 +256,7 @@ impl AppGroupDaemon {
     ) -> Result<Self> {
         let paths = ctx.app_paths().context("resolve App Group paths")?;
         let socket_path = paths.bindable_socket_path()?.to_path_buf();
-        let root = root_config(mount_path);
+        let root = root_config(mount_path)?;
         let engine = Arc::new(NativeEngine::new(engine_config(
             ctx, mount_path, backends, &paths, &root, p2p,
         ))?);
@@ -288,15 +288,16 @@ impl AppGroupDaemon {
             .with_db(engine.db().clone())
             .with_content_cache(cache.clone());
         let nfs = Arc::clone(presenter.context());
-        let nfs_server = match start_nfs_volume(mount_path, no_mount, Arc::clone(&nfs)).await {
-            Ok(server) => server,
-            Err(error) => {
-                let _ = server_cancel.send(true);
-                server_handle.abort();
-                engine.shutdown();
-                return Err(error);
-            }
-        };
+        let nfs_server =
+            match start_nfs_volume(mount_path, no_mount, Arc::clone(&nfs), &root.nfs).await {
+                Ok(server) => server,
+                Err(error) => {
+                    let _ = server_cancel.send(true);
+                    server_handle.abort();
+                    engine.shutdown();
+                    return Err(error);
+                }
+            };
 
         let scanner_handle = tokio::spawn(run_scanner(cache, scan_interval));
         let engine_handle = engine.start()?;

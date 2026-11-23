@@ -160,11 +160,15 @@ fn is_windows_process_not_found_matches_taskkill_messages() {
 
 // --- macOS NFS mount as the current user ---
 
-/// The `mount_nfs` command `nfs::mount_nfs` runs for the server on `port`,
-/// built without running it.
+/// The `mount_nfs` command `nfs::mount_nfs` runs for the server on `port`
+/// with the root `[nfs]` section `nfs`, built without running it.
 #[cfg(target_os = "macos")]
-fn macos_mount_args(mount_point: &Path, port: u16) -> (String, Vec<String>) {
-    let cmd = nfs::macos_nfs_mount_command(mount_point, port);
+fn macos_mount_args(
+    mount_point: &Path,
+    port: u16,
+    nfs: &cascade_config::types::NfsConfig,
+) -> (String, Vec<String>) {
+    let cmd = nfs::macos_nfs_mount_command(mount_point, port, nfs);
     let args = cmd
         .get_args()
         .map(|arg| arg.to_string_lossy().into_owned())
@@ -178,14 +182,18 @@ fn macos_nfs_mount_is_mount_nfs_v3_over_tcp_on_the_server_port_without_resvport(
     let dir = TempDir::new().unwrap();
     let mount_point = dir.path().join("Cloud");
 
-    let (program, args) = macos_mount_args(&mount_point, 12345);
+    let (program, args) = macos_mount_args(
+        &mount_point,
+        12345,
+        &cascade_config::types::NfsConfig::default(),
+    );
 
     assert_eq!(program, "/sbin/mount_nfs");
     assert_eq!(
         args,
         [
             "-o",
-            "vers=3,tcp,port=12345,mountport=12345,locallocks,rsize=1048576,wsize=1048576",
+            "vers=3,tcp,port=12345,mountport=12345,locallocks,rsize=1048576,wsize=1048576,intr",
             "127.0.0.1:/",
             mount_point.to_str().unwrap(),
         ]
@@ -198,7 +206,11 @@ fn macos_nfs_mount_runs_neither_osascript_nor_sudo() {
     let dir = TempDir::new().unwrap();
     let mount_point = dir.path().join("Cloud");
 
-    let (program, args) = macos_mount_args(&mount_point, 2049);
+    let (program, args) = macos_mount_args(
+        &mount_point,
+        2049,
+        &cascade_config::types::NfsConfig::default(),
+    );
 
     for word in std::iter::once(&program).chain(&args) {
         assert!(
@@ -222,7 +234,11 @@ fn macos_nfs_mount_on_a_port_nobody_listens_on_errors_and_leaves_the_mount_point
         .unwrap()
         .port();
 
-    let result = nfs::mount_nfs(&mount_point, port);
+    let result = nfs::mount_nfs(
+        &mount_point,
+        port,
+        &cascade_config::types::NfsConfig::default(),
+    );
 
     assert!(result.is_err(), "mount on port {port} nobody listens on");
     assert_eq!(
@@ -231,6 +247,317 @@ fn macos_nfs_mount_on_a_port_nobody_listens_on_errors_and_leaves_the_mount_point
         "a file system is mounted at {}",
         mount_point.display()
     );
+}
+
+// --- Root `[nfs]` section, strict root read, `cascade.toml` ---
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_nfs_mount_options_append_the_root_nfs_section_after_the_fixed_options() {
+    let fixed = "vers=3,tcp,port=4242,mountport=4242,locallocks,rsize=1048576,wsize=1048576";
+    let attribute_cache = |min: u64, max: u64| {
+        format!(
+            "acregmin={min},acregmax={max},acdirmin={min},acdirmax={max},\
+             acrootdirmin={min},acrootdirmax={max}"
+        )
+    };
+    let cases = [
+        ("[cache]\nmax_size = \"1GB\"\n", format!("{fixed},intr")),
+        ("[nfs]\ninterruptible = true\n", format!("{fixed},intr")),
+        ("[nfs]\ninterruptible = false\n", format!("{fixed},nointr")),
+        (
+            "[nfs]\ndead_timeout = \"2m\"\n",
+            format!("{fixed},intr,deadtimeout=120"),
+        ),
+        (
+            "[nfs.attribute_cache]\nmin = \"10s\"\nmax = \"1m\"\n",
+            format!("{fixed},intr,{}", attribute_cache(10, 60)),
+        ),
+        (
+            "[nfs]\nattribute_cache = { min = \"30s\" }\n",
+            format!("{fixed},intr,{}", attribute_cache(30, 60)),
+        ),
+        (
+            "[nfs]\nattribute_cache = { max = \"2m\" }\n",
+            format!("{fixed},intr,{}", attribute_cache(5, 120)),
+        ),
+        (
+            "[nfs]\ninterruptible = false\ndead_timeout = \"45s\"\n\
+             attribute_cache = { min = \"1s\", max = \"1h\" }\n",
+            format!("{fixed},nointr,deadtimeout=45,{}", attribute_cache(1, 3600)),
+        ),
+    ];
+
+    for (root_toml, expected) in cases {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".cascade.toml"), root_toml).unwrap();
+        let mount_point = dir.path().join("Cloud");
+
+        let root = root_config(dir.path()).unwrap();
+        let (_, args) = macos_mount_args(&mount_point, 4242, &root.nfs);
+
+        assert_eq!(
+            args,
+            [
+                "-o",
+                expected.as_str(),
+                "127.0.0.1:/",
+                mount_point.to_str().unwrap()
+            ],
+            "root .cascade.toml:\n{root_toml}"
+        );
+    }
+}
+
+#[test]
+fn root_config_fails_on_a_malformed_root_config_naming_the_file_and_the_key_or_value() {
+    let cases = [
+        (".cascade.toml", "[nfs]\nsoft = true\n", "soft", "soft"),
+        (
+            ".cascade.toml",
+            "[nfs]\ninterruptible = \"yes\"\n",
+            "interruptible",
+            "yes",
+        ),
+        (
+            ".cascade.toml",
+            "[nfs]\ndead_timeout = \"1500ms\"\n",
+            "dead_timeout",
+            "1500ms",
+        ),
+        (
+            ".cascade.toml",
+            "[nfs]\ndead_timeout = \"0s\"\n",
+            "dead_timeout",
+            "0s",
+        ),
+        (
+            ".cascade.toml",
+            "[nfs]\nattribute_cache = { min = \"90s\", max = \"30s\" }\n",
+            "attribute_cache",
+            "90s",
+        ),
+        (
+            ".cascade.toml",
+            "[nfs]\nattribute_cache = { min = \"2500ms\" }\n",
+            "attribute_cache",
+            "2500ms",
+        ),
+        (
+            ".cascade.toml",
+            "[cache]\nmax_size = \"lots\"\n",
+            "max_size",
+            "lots",
+        ),
+        ("cascade.toml", "[nfs]\nretrans = 3\n", "retrans", "retrans"),
+        (
+            ".cascade.local.toml",
+            "[nfs]\ninterruptible = \"maybe\"\n",
+            "interruptible",
+            "maybe",
+        ),
+        (
+            "cascade.local.toml",
+            "[nfs]\ntimeo = 10\n",
+            "timeo",
+            "timeo",
+        ),
+    ];
+
+    for (file, contents, key, value) in cases {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(file), contents).unwrap();
+
+        let Err(error) = root_config(dir.path()) else {
+            panic!("root {file} accepted:\n{contents}");
+        };
+        let message = format!("{error:#}");
+
+        assert!(
+            names_file(&message, file),
+            "error does not name {file}: {message}"
+        );
+        assert!(
+            message.contains(key) || message.contains(value),
+            "error names neither `{key}` nor `{value}`: {message}"
+        );
+    }
+}
+
+/// Whether `message` names `file` itself, not a longer name ending in it
+/// (`cascade.toml` inside `.cascade.toml`).
+fn names_file(message: &str, file: &str) -> bool {
+    message.match_indices(file).any(|(at, _)| {
+        message
+            .get(..at)
+            .is_some_and(|before| !before.ends_with('.'))
+    })
+}
+
+fn pin_paths(config: &cascade_config::ResolvedConfig) -> Vec<String> {
+    config.pins.iter().map(|pin| pin.path.clone()).collect()
+}
+
+fn cache_max_size(config: &cascade_config::ResolvedConfig) -> Option<u64> {
+    config
+        .cache
+        .and_then(|cache| cache.max_size)
+        .map(cascade_config::MaxSize::as_bytes)
+}
+
+#[test]
+fn a_directory_applies_dot_cascade_then_its_shared_toml_then_its_local_toml() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let work = root.join("Work");
+    let solo = root.join("Solo");
+    std::fs::create_dir(&work).unwrap();
+    std::fs::create_dir(&solo).unwrap();
+    let files = [
+        (root.join(".cascade"), "*.log\n"),
+        (
+            root.join("cascade.toml"),
+            "[[ignore]]\npattern = \"keep.log\"\nnegated = true\n\
+             [[pin]]\npath = \"A\"\n[cache]\nmax_size = \"1GB\"\n",
+        ),
+        (
+            root.join(".cascade.local.toml"),
+            "[[pin]]\npath = \"B\"\n[cache]\nmax_size = \"2GB\"\n",
+        ),
+        (work.join(".cascade"), "*.tmp\n"),
+        (
+            work.join(".cascade.toml"),
+            "[[ignore]]\npattern = \"keep.tmp\"\nnegated = true\n\
+             [[pin]]\npath = \"C\"\n[cache]\nmax_size = \"4GB\"\n",
+        ),
+        (
+            work.join("cascade.local.toml"),
+            "[[pin]]\npath = \"D\"\n[cache]\nmax_size = \"8GB\"\n",
+        ),
+        (
+            solo.join("cascade.local.toml"),
+            "[[pin]]\npath = \"E\"\n[cache]\nmax_size = \"16GB\"\n",
+        ),
+    ];
+    for (path, contents) in files {
+        std::fs::write(path, contents).unwrap();
+    }
+    let local_only = TempDir::new().unwrap();
+    std::fs::write(
+        local_only.path().join(".cascade.local.toml"),
+        "[[pin]]\npath = \"L\"\n",
+    )
+    .unwrap();
+
+    let at_root = root_config(root).unwrap();
+    let at_work = cascade_config::merge::resolve(root, &work);
+    let at_solo = cascade_config::merge::resolve(root, &solo);
+
+    assert_eq!(pin_paths(&at_root), ["A", "B"]);
+    assert_eq!(cache_max_size(&at_root), Some(2_000_000_000));
+    assert!(at_root.is_ignored("notes.log", false));
+    assert!(
+        !at_root.is_ignored("keep.log", false),
+        "the shared config's negation follows the root .cascade"
+    );
+    assert_eq!(pin_paths(&at_work), ["A", "B", "C", "D"]);
+    assert_eq!(cache_max_size(&at_work), Some(8_000_000_000));
+    assert!(at_work.is_ignored("Work/notes.tmp", false));
+    assert!(
+        !at_work.is_ignored("Work/keep.tmp", false),
+        "the shared config's negation follows the child's .cascade"
+    );
+    assert_eq!(pin_paths(&at_solo), ["A", "B", "E"]);
+    assert_eq!(cache_max_size(&at_solo), Some(16_000_000_000));
+    assert_eq!(
+        pin_paths(&root_config(local_only.path()).unwrap()),
+        ["L"],
+        "a root local config without a shared one"
+    );
+}
+
+#[test]
+fn two_shared_two_local_or_a_yaml_or_json_config_fail_the_root_and_void_a_child_s_toml() {
+    let toml = "[[pin]]\npath = \"X\"\n[cache]\nmax_size = \"9GB\"\n";
+    let yaml = "pin:\n  - path: X\n";
+    let json = "{\"pin\": [{\"path\": \"X\"}]}";
+    let cases: [(&[(&str, &str)], &[&str]); 4] = [
+        (
+            &[
+                (".cascade.toml", toml),
+                ("cascade.toml", toml),
+                ("cascade.local.toml", toml),
+            ],
+            &[".cascade.toml", "cascade.toml"],
+        ),
+        (
+            &[
+                (".cascade.local.toml", toml),
+                ("cascade.local.toml", toml),
+                (".cascade.toml", toml),
+            ],
+            &[".cascade.local.toml", "cascade.local.toml"],
+        ),
+        (
+            &[
+                (".cascade.yaml", yaml),
+                ("cascade.toml", toml),
+                (".cascade.local.toml", toml),
+            ],
+            &[".cascade.yaml", "cascade.toml"],
+        ),
+        (
+            &[
+                (".cascade.json", json),
+                (".cascade.toml", toml),
+                ("cascade.local.toml", toml),
+            ],
+            &[".cascade.json", "cascade.toml"],
+        ),
+    ];
+
+    for (files, named) in cases {
+        let at_root = TempDir::new().unwrap();
+        for (file, contents) in files {
+            std::fs::write(at_root.path().join(file), contents).unwrap();
+        }
+        let Err(error) = root_config(at_root.path()) else {
+            panic!("root holding {files:?} accepted");
+        };
+        let message = format!("{error:#}");
+        for file in named {
+            assert!(
+                names_file(&message, file),
+                "root holding {files:?}: error does not name {file}: {message}"
+            );
+        }
+
+        let parent = TempDir::new().unwrap();
+        let child = parent.path().join("Work");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(
+            parent.path().join(".cascade.toml"),
+            "[[pin]]\npath = \"R\"\n[cache]\nmax_size = \"1GB\"\n",
+        )
+        .unwrap();
+        std::fs::write(child.join(".cascade"), "*.tmp\n").unwrap();
+        for (file, contents) in files {
+            std::fs::write(child.join(file), contents).unwrap();
+        }
+
+        let resolved = cascade_config::merge::resolve(parent.path(), &child);
+
+        assert_eq!(
+            pin_paths(&resolved),
+            ["R"],
+            "child holding {files:?} applied one of its configs"
+        );
+        assert_eq!(cache_max_size(&resolved), Some(1_000_000_000), "{files:?}");
+        assert!(
+            resolved.is_ignored("Work/notes.tmp", false),
+            "child holding {files:?} dropped its .cascade"
+        );
+    }
 }
 
 // --- WebDAV mount command construction ---

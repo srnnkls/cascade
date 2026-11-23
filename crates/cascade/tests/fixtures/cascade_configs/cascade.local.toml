@@ -1,0 +1,18 @@
+[[ignore]]
+pattern = "*.tmp"
+
+[[ignore]]
+pattern = "*.bak"
+
+[[ignore]]
+pattern = "*.json.bak"
+
+[[ignore]]
+pattern = "node_modules"
+dir_only = true
+
+[[pin]]
+path = "Documents/"
+
+[[pin]]
+path = "Projects/active/"

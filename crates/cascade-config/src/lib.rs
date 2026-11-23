@@ -7,10 +7,10 @@
         clippy::string_slice
     )
 )]
-//! `.cascade` config parser — four formats, merge, directory walk.
+//! `.cascade` config parser — config files, merge, directory walk.
 //!
-//! Supports gitignore-style, TOML, YAML, and JSON formats.
-//! All deserialise to [`CascadeConfig`]. Directory walk produces
+//! A directory's gitignore-style `.cascade` and its shared and local TOML
+//! configs all deserialise to [`CascadeConfig`]. Directory walk produces
 //! [`ResolvedConfig`] with child-overrides-parent precedence.
 
 pub mod matcher;
@@ -20,6 +20,6 @@ pub mod types;
 
 pub use matcher::IgnoreMatcher;
 pub use types::{
-    CacheConfig, CacheStatePosture, CascadeConfig, DeviceConfig, GrantConfig, IgnoreRule, MaxAge,
-    MaxSize, ResolvedConfig, ScopeConfig,
+    AttributeCache, CacheConfig, CacheStatePosture, CascadeConfig, DeviceConfig, GrantConfig,
+    IgnoreRule, MaxAge, MaxSize, NfsConfig, ResolvedConfig, ScopeConfig, WholeSeconds,
 };

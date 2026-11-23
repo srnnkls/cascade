@@ -537,6 +537,8 @@ pub async fn start(
     evict_stale_mount(&mount_path);
 
     ensure_directory(&mount_path, "mount point")?;
+    // An invalid root config fails the start rather than each presenter attempt.
+    root_config(&mount_path)?;
 
     // Override knob for containers and tests: CASCADE_PRESENTER=webdav
     // forces the WebDAV presenter on any platform. Useful for Linux
@@ -754,7 +756,7 @@ async fn try_fskit(
     web: &WebOptions,
 ) -> Result<()> {
     let paths = ctx.app_paths()?;
-    let root = root_config(mount_path);
+    let root = root_config(mount_path)?;
 
     let engine = Arc::new(NativeEngine::new(engine_config(
         ctx, mount_path, backends, &paths, &root, p2p,
@@ -863,7 +865,7 @@ async fn try_projfs(
 
     let paths = ctx.app_paths()?;
 
-    let root = root_config(mount_path);
+    let root = root_config(mount_path)?;
 
     let engine = Arc::new(NativeEngine::new(engine_config(
         ctx, mount_path, backends, &paths, &root, p2p,
@@ -1003,7 +1005,7 @@ async fn try_webdav(
     web: &WebOptions,
 ) -> Result<()> {
     let paths = ctx.app_paths()?;
-    let root = root_config(mount_path);
+    let root = root_config(mount_path)?;
 
     let engine = Arc::new(NativeEngine::new(engine_config(
         ctx, mount_path, backends, &paths, &root, p2p,
@@ -1141,7 +1143,7 @@ async fn try_fuse(
     web: &WebOptions,
 ) -> Result<()> {
     let paths = ctx.app_paths()?;
-    let root = root_config(mount_path);
+    let root = root_config(mount_path)?;
 
     let engine = Arc::new(NativeEngine::new(engine_config(
         ctx, mount_path, backends, &paths, &root, p2p,

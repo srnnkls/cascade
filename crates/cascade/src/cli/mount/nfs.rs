@@ -2,6 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
+use cascade_config::NfsConfig;
 use cascade_engine::engine::NativeEngine;
 use cascade_presenter_nfs::nfs::context::NfsContext;
 #[cfg(target_os = "macos")]
@@ -17,11 +18,13 @@ use super::{
 };
 
 /// Starts an NFS server for `nfs` on a loopback port and, unless
-/// `no_mount`, mounts it at `mount_path`; a failed mount stops the server.
+/// `no_mount`, mounts it at `mount_path` with the root `[nfs]` section
+/// `options`; a failed mount stops the server.
 pub(super) async fn start_nfs_volume(
     mount_path: &Path,
     no_mount: bool,
     nfs: Arc<NfsContext>,
+    options: &NfsConfig,
 ) -> Result<NfsServer> {
     let server_config = NfsServerConfig {
         bind_addr: "127.0.0.1:0".parse()?,
@@ -33,7 +36,7 @@ pub(super) async fn start_nfs_volume(
         .context("failed to start NFS server")?;
     let nfs_port = server.local_addr.port();
     tracing::info!(port = nfs_port, "NFS server started");
-    if !no_mount && let Err(error) = mount_nfs(mount_path, nfs_port) {
+    if !no_mount && let Err(error) = mount_nfs(mount_path, nfs_port, options) {
         tracing::error!(error = %format!("{error:#}"), "NFS mount failed");
         if let Err(stop_error) = server.stop() {
             tracing::warn!(error = %stop_error, "NFS server stop returned an error");
@@ -59,7 +62,7 @@ pub(super) async fn try_nfs(
     web: &WebOptions,
 ) -> Result<()> {
     let paths = ctx.app_paths()?;
-    let root = root_config(mount_path);
+    let root = root_config(mount_path)?;
 
     let engine = Arc::new(NativeEngine::new(engine_config(
         ctx, mount_path, backends, &paths, &root, p2p,
@@ -97,7 +100,7 @@ pub(super) async fn try_nfs(
         sync_handle,
     };
 
-    let server = match start_nfs_volume(mount_path, no_mount, nfs_ctx).await {
+    let server = match start_nfs_volume(mount_path, no_mount, nfs_ctx, &root.nfs).await {
         Ok(server) => server,
         Err(e) => {
             resources.shutdown();
@@ -145,21 +148,22 @@ pub(super) async fn try_nfs(
     .await
 }
 
-/// Mount the cascade NFS server at `mount_point` as the current user (macOS).
+/// Mount the cascade NFS server at `mount_point` as the current user with
+/// the root `[nfs]` section `nfs` (macOS).
 ///
 /// # Errors
 ///
 /// Fails when the mount point cannot be created or `mount_nfs` fails.
 #[cfg(target_os = "macos")]
-pub(super) fn mount_nfs(mount_point: &Path, port: u16) -> Result<()> {
+pub(super) fn mount_nfs(mount_point: &Path, port: u16, nfs: &NfsConfig) -> Result<()> {
     ensure_directory(mount_point, "NFS mount point")?;
-    let mut cmd = macos_nfs_mount_command(mount_point, port);
+    let mut cmd = macos_nfs_mount_command(mount_point, port, nfs);
     tracing::info!(mount = %mount_point.display(), port, "mounting NFS");
     let output = cmd.output().context("failed to invoke /sbin/mount_nfs")?;
     if !output.status.success() {
         anyhow::bail!(
             "mount_nfs -o {} failed: {}",
-            macos_mount_options(port),
+            macos_nfs_mount_options(port, nfs),
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
@@ -167,15 +171,41 @@ pub(super) fn mount_nfs(mount_point: &Path, port: u16) -> Result<()> {
     Ok(())
 }
 
-/// The `mount_nfs` command for the cascade server on `port`.
+/// The `mount_nfs` command for the cascade server on `port` with the root
+/// `[nfs]` section `nfs`.
 #[cfg(target_os = "macos")]
-pub(super) fn macos_nfs_mount_command(mount_point: &Path, port: u16) -> std::process::Command {
+pub(super) fn macos_nfs_mount_command(
+    mount_point: &Path,
+    port: u16,
+    nfs: &NfsConfig,
+) -> std::process::Command {
     let mut cmd = std::process::Command::new("/sbin/mount_nfs");
     cmd.arg("-o")
-        .arg(macos_mount_options(port))
+        .arg(macos_nfs_mount_options(port, nfs))
         .arg("127.0.0.1:/")
         .arg(mount_point);
     cmd
+}
+
+/// The `-o` options: the fixed options the server depends on, then the
+/// configured ones.
+#[cfg(target_os = "macos")]
+fn macos_nfs_mount_options(port: u16, nfs: &NfsConfig) -> String {
+    let mut options = vec![
+        macos_mount_options(port),
+        (if nfs.interruptible { "intr" } else { "nointr" }).to_owned(),
+    ];
+    if let Some(timeout) = nfs.dead_timeout {
+        options.push(format!("deadtimeout={}", timeout.as_secs()));
+    }
+    if let Some(cache) = nfs.attribute_cache {
+        let (min, max) = (cache.min().as_secs(), cache.max().as_secs());
+        options.push(format!(
+            "acregmin={min},acregmax={max},acdirmin={min},acdirmax={max},\
+             acrootdirmin={min},acrootdirmax={max}"
+        ));
+    }
+    options.join(",")
 }
 
 /// Mount the cascade NFS server on Linux using `mount -t nfs`.
@@ -186,7 +216,7 @@ pub(super) fn macos_nfs_mount_command(mount_point: &Path, port: u16) -> std::pro
 /// we surface a clear hint to retry with `sudo` rather than letting the
 /// raw `mount` error reach the user.
 #[cfg(target_os = "linux")]
-pub(super) fn mount_nfs(mount_point: &Path, port: u16) -> Result<()> {
+pub(super) fn mount_nfs(mount_point: &Path, port: u16, _nfs: &NfsConfig) -> Result<()> {
     ensure_directory(mount_point, "NFS mount point")?;
 
     let mut cmd = linux_nfs_mount_command(mount_point, port);
@@ -254,6 +284,6 @@ pub(super) fn is_linux_permission_error(stderr: &str, exit_code: Option<i32>) ->
 /// NFS mount stub for platforms with neither macOS nor Linux support.
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 #[allow(clippy::missing_const_for_fn, clippy::unused_self, dead_code)]
-pub(super) fn mount_nfs(_mount_point: &Path, _port: u16) -> Result<()> {
+pub(super) fn mount_nfs(_mount_point: &Path, _port: u16, _nfs: &NfsConfig) -> Result<()> {
     anyhow::bail!("NFS mounting is not supported on this platform yet");
 }

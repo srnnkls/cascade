@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::parse::load_dir;
+use crate::parse::{load_dir, load_dir_strict};
 use crate::types::{CascadeConfig, ResolvedConfig};
 
 /// Walk from mount root to target directory, layering `.cascade` configs
@@ -12,15 +12,26 @@ pub fn resolve(mount_root: &Path, target_dir: &Path) -> ResolvedConfig {
     let mut builder = ResolvedConfigBuilder::new();
 
     for dir in ancestors_between(mount_root, target_dir) {
-        if let Some(config) = load_dir(&dir) {
-            builder.apply(config);
-        }
+        builder.apply(load_dir(&dir).unwrap_or_default());
     }
 
     builder.build()
 }
 
-/// Resolve config from an explicit list of configs (for testing).
+/// The config of the mount root alone, read with [`load_dir_strict`].
+///
+/// # Errors
+///
+/// Fails when a config file of the mount root is invalid; see
+/// [`load_dir_strict`].
+pub fn resolve_root(mount_root: &Path) -> anyhow::Result<ResolvedConfig> {
+    Ok(resolve_from_configs(
+        load_dir_strict(mount_root)?.into_iter().collect(),
+    ))
+}
+
+/// Resolve config from an explicit list of configs, the first being the
+/// mount root's (for testing).
 #[must_use]
 pub fn resolve_from_configs(configs: Vec<CascadeConfig>) -> ResolvedConfig {
     let mut builder = ResolvedConfigBuilder::new();
@@ -53,12 +64,14 @@ fn ancestors_between(root: &Path, target: &Path) -> Vec<PathBuf> {
 /// Builder that applies configs in order, respecting merge semantics.
 struct ResolvedConfigBuilder {
     config: ResolvedConfig,
+    at_root: bool,
 }
 
 impl ResolvedConfigBuilder {
     fn new() -> Self {
         Self {
             config: ResolvedConfig::default(),
+            at_root: true,
         }
     }
 
@@ -87,7 +100,13 @@ impl ResolvedConfigBuilder {
             self.config.p2p = layer.p2p;
         }
 
-        // Device config is root-only — child configs are ignored
+        // NFS and device config are root-only — child configs are ignored
+        if self.at_root
+            && let Some(nfs) = layer.nfs
+        {
+            self.config.nfs = nfs;
+        }
+        self.at_root = false;
     }
 
     fn build(self) -> ResolvedConfig {
@@ -214,6 +233,30 @@ mod tests {
             resolved.p2p.and_then(|p| p.enabled),
             Some(true),
             "the child (nearest) p2p config wins"
+        );
+    }
+
+    #[test]
+    fn resolve_takes_the_nfs_section_from_the_mount_root_only() {
+        let parse = |text: &str| crate::parse::toml::parse(text).unwrap();
+        let root_nfs = "[nfs]\ndead_timeout = \"30s\"\n";
+        let child_nfs = "[nfs]\ninterruptible = false\ndead_timeout = \"90s\"\n";
+
+        let root_only = resolve_from_configs(vec![parse(root_nfs)]).nfs;
+        let child_only = resolve_from_configs(vec![parse(child_nfs)]).nfs;
+        let no_section = resolve_from_configs(vec![CascadeConfig::empty()]).nfs;
+        assert_ne!(root_only, child_only);
+        assert_ne!(child_only, no_section);
+
+        assert_eq!(
+            resolve_from_configs(vec![parse(root_nfs), parse(child_nfs)]).nfs,
+            root_only,
+            "a child's [nfs] does not override the root's"
+        );
+        assert_eq!(
+            resolve_from_configs(vec![CascadeConfig::empty(), parse(child_nfs)]).nfs,
+            no_section,
+            "a child's [nfs] has no effect when the root has none"
         );
     }
 

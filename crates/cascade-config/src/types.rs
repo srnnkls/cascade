@@ -35,6 +35,9 @@ pub struct CascadeConfig {
 
     #[serde(default)]
     pub device: Option<DeviceConfig>,
+
+    #[serde(default)]
+    pub nfs: Option<NfsConfig>,
 }
 
 impl CascadeConfig {
@@ -57,6 +60,9 @@ impl CascadeConfig {
         }
         if other.p2p.is_some() {
             self.p2p = other.p2p;
+        }
+        if other.nfs.is_some() {
+            self.nfs = other.nfs;
         }
         // Device config is root-only — ignore from children
     }
@@ -268,6 +274,172 @@ impl Serialize for MaxAge {
     }
 }
 
+/// A duration of whole seconds.
+///
+/// Deserialises from a human-readable string such as `120s` or `2m`; a
+/// fractional number of seconds is rejected at config load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct WholeSeconds(u64);
+
+impl WholeSeconds {
+    /// The duration in seconds.
+    #[must_use]
+    pub const fn as_secs(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for WholeSeconds {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            humantime::format_duration(Duration::from_secs(self.0))
+        )
+    }
+}
+
+impl<'de> Deserialize<'de> for WholeSeconds {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct WholeSecondsVisitor;
+
+        impl Visitor<'_> for WholeSecondsVisitor {
+            type Value = WholeSeconds;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a duration of whole seconds such as \"120s\" or \"2m\"")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<WholeSeconds, E>
+            where
+                E: de::Error,
+            {
+                let duration = humantime::parse_duration(value).map_err(de::Error::custom)?;
+                if duration.subsec_nanos() != 0 {
+                    return Err(de::Error::custom(format!(
+                        "\"{value}\" is not a whole number of seconds"
+                    )));
+                }
+                Ok(WholeSeconds(duration.as_secs()))
+            }
+        }
+
+        deserializer.deserialize_str(WholeSecondsVisitor)
+    }
+}
+
+impl Serialize for WholeSeconds {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+/// The `[nfs]` section: the configurable options of the macOS NFS mount
+/// (root-only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NfsConfig {
+    /// Whether a blocked NFS call can be interrupted by a signal (`intr`,
+    /// otherwise `nointr`).
+    #[serde(default = "interruptible_by_default")]
+    pub interruptible: bool,
+    /// How long the server may be unresponsive before the mount is
+    /// unmounted (`deadtimeout`). Absent means the client's default.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_dead_timeout",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub dead_timeout: Option<WholeSeconds>,
+    /// Attribute cache bounds for files, directories and the root directory.
+    /// Absent means the client's defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribute_cache: Option<AttributeCache>,
+}
+
+impl Default for NfsConfig {
+    fn default() -> Self {
+        Self {
+            interruptible: interruptible_by_default(),
+            dead_timeout: None,
+            attribute_cache: None,
+        }
+    }
+}
+
+const fn interruptible_by_default() -> bool {
+    true
+}
+
+fn deserialize_dead_timeout<'de, D>(deserializer: D) -> Result<Option<WholeSeconds>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let timeout = WholeSeconds::deserialize(deserializer)?;
+    if timeout.as_secs() == 0 {
+        return Err(de::Error::custom(format!(
+            "dead_timeout \"{timeout}\" must be at least 1s"
+        )));
+    }
+    Ok(Some(timeout))
+}
+
+/// The attribute cache bounds of the NFS mount, with `min <= max`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "AttributeCacheBounds")]
+pub struct AttributeCache {
+    min: WholeSeconds,
+    max: WholeSeconds,
+}
+
+impl AttributeCache {
+    /// The macOS client's minimum attribute cache time.
+    pub const DEFAULT_MIN: WholeSeconds = WholeSeconds(5);
+    /// The macOS client's maximum attribute cache time.
+    pub const DEFAULT_MAX: WholeSeconds = WholeSeconds(60);
+
+    /// The minimum time an attribute is cached.
+    #[must_use]
+    pub const fn min(self) -> WholeSeconds {
+        self.min
+    }
+
+    /// The maximum time an attribute is cached.
+    #[must_use]
+    pub const fn max(self) -> WholeSeconds {
+        self.max
+    }
+}
+
+/// The `attribute_cache` table as written, each bound optional.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AttributeCacheBounds {
+    min: Option<WholeSeconds>,
+    max: Option<WholeSeconds>,
+}
+
+impl TryFrom<AttributeCacheBounds> for AttributeCache {
+    type Error = String;
+
+    fn try_from(bounds: AttributeCacheBounds) -> Result<Self, Self::Error> {
+        let min = bounds.min.unwrap_or(Self::DEFAULT_MIN);
+        let max = bounds.max.unwrap_or(Self::DEFAULT_MAX);
+        if min > max {
+            return Err(format!(
+                "attribute_cache min \"{min}\" is greater than max \"{max}\""
+            ));
+        }
+        Ok(Self { min, max })
+    }
+}
+
 /// P2P configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct P2PConfig {
@@ -335,6 +507,8 @@ pub struct ResolvedConfig {
     pub max_file_length: Vec<MaxFileLengthRule>,
     pub cache: Option<CacheConfig>,
     pub p2p: Option<P2PConfig>,
+    /// The mount root's `[nfs]` section.
+    pub nfs: NfsConfig,
 }
 
 impl ResolvedConfig {

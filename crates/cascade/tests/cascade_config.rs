@@ -40,7 +40,7 @@ fn test_load_toml_fixture() {
 }
 
 #[test]
-fn test_load_yaml_fixture() {
+fn test_load_local_toml_fixture_pins() {
     let config = parse::load_dir(&fixtures_dir());
     assert!(config.is_some());
     let config = config.unwrap();
@@ -49,7 +49,7 @@ fn test_load_yaml_fixture() {
 }
 
 #[test]
-fn test_load_json_fixture() {
+fn test_load_local_toml_fixture_ignores() {
     let config = parse::load_dir(&fixtures_dir());
     assert!(config.is_some());
     let config = config.unwrap();
@@ -68,6 +68,6 @@ fn test_merge_order_deterministic() {
     let pattern_count = config.ignore.len();
     assert!(
         pattern_count >= 4,
-        "should have patterns from all formats, got {pattern_count}"
+        "should have patterns from all config files, got {pattern_count}"
     );
 }
