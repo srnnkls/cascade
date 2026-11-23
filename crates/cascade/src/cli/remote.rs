@@ -364,22 +364,17 @@ fn scope_from_arg(raw: &str) -> ManageScope {
 /// Derive the [`ManageConfigFormat`] of a `.cascade` fragment from its source
 /// file's extension.
 ///
-/// A `.toml`, `.yaml`/`.yml`, or `.json` extension selects the matching
-/// structured format; anything else — including a bare `.cascade` file with no
-/// extension — is treated as the gitignore-style format, matching the parser's
-/// own default for an extensionless `.cascade` file.
-#[must_use]
-fn config_format_from_path(path: &Path) -> ManageConfigFormat {
-    match path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("toml") => ManageConfigFormat::Toml,
-        Some("yaml" | "yml") => ManageConfigFormat::Yaml,
-        Some("json") => ManageConfigFormat::Json,
-        _ => ManageConfigFormat::Gitignore,
+/// A `.toml` extension, in any case, selects TOML; a file without an
+/// extension, such as `.cascade`, is gitignore-style. Any other extension is an
+/// error.
+fn config_format_from_path(path: &Path) -> Result<ManageConfigFormat> {
+    match path.extension().map(std::ffi::OsStr::to_ascii_lowercase) {
+        None => Ok(ManageConfigFormat::Gitignore),
+        Some(ext) if ext == "toml" => Ok(ManageConfigFormat::Toml),
+        Some(_) => anyhow::bail!(
+            "config fragment {} must be a .toml file or an extensionless gitignore-style file",
+            path.display()
+        ),
     }
 }
 
@@ -389,9 +384,10 @@ fn config_format_from_path(path: &Path) -> ManageConfigFormat {
 /// The file must exist and be readable; a missing or unreadable file fails
 /// loudly rather than pushing an empty fragment.
 fn read_config_fragment(path: &Path) -> Result<(ManageConfigFormat, String)> {
+    let format = config_format_from_path(path)?;
     let body = std::fs::read_to_string(path)
         .with_context(|| format!("reading config fragment {}", path.display()))?;
-    Ok((config_format_from_path(path), body))
+    Ok((format, body))
 }
 
 /// Build a [`RemoteCommand::ConfigPush`] from a local fragment file.
@@ -402,7 +398,8 @@ fn read_config_fragment(path: &Path) -> Result<(ManageConfigFormat, String)> {
 ///
 /// # Errors
 ///
-/// Returns an error when the fragment file cannot be read.
+/// Returns an error when the fragment file has an extension other than `.toml`
+/// or cannot be read.
 pub fn config_push(file: &Path, scope: Option<&str>) -> Result<RemoteCommand> {
     let (format, body) = read_config_fragment(file)?;
     let folder = scope.unwrap_or(ROOT_SCOPE).to_owned();
@@ -882,53 +879,59 @@ mod tests {
     }
 
     #[test]
-    fn config_format_from_path_infers_by_extension() {
-        assert_eq!(
-            config_format_from_path(Path::new("rules.toml")),
-            ManageConfigFormat::Toml
-        );
-        assert_eq!(
-            config_format_from_path(Path::new("rules.yaml")),
-            ManageConfigFormat::Yaml
-        );
-        assert_eq!(
-            config_format_from_path(Path::new("rules.yml")),
-            ManageConfigFormat::Yaml
-        );
-        assert_eq!(
-            config_format_from_path(Path::new("rules.json")),
-            ManageConfigFormat::Json
-        );
-        // Case-insensitive.
-        assert_eq!(
-            config_format_from_path(Path::new("RULES.TOML")),
-            ManageConfigFormat::Toml
-        );
-        // An extensionless `.cascade` file — and anything unrecognised — is the
-        // gitignore-style default.
-        assert_eq!(
-            config_format_from_path(Path::new(".cascade")),
-            ManageConfigFormat::Gitignore
-        );
-        assert_eq!(
-            config_format_from_path(Path::new("rules.txt")),
-            ManageConfigFormat::Gitignore
-        );
+    fn config_push_infers_toml_or_gitignore_and_rejects_other_extensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = "ignore = []\n";
+        for (name, format) in [
+            ("x.toml", ManageConfigFormat::Toml),
+            ("X.TOML", ManageConfigFormat::Toml),
+            (".cascade", ManageConfigFormat::Gitignore),
+            ("rules", ManageConfigFormat::Gitignore),
+        ] {
+            let file = dir.path().join(name);
+            std::fs::write(&file, body).unwrap();
+            assert_eq!(
+                config_push(&file, Some("/work")).unwrap(),
+                RemoteCommand::ConfigPush {
+                    folder: "/work".to_owned(),
+                    format,
+                    body: body.to_owned(),
+                },
+                "{name}"
+            );
+        }
+
+        for name in ["rules.yaml", "rules.yml", "rules.json", "rules.txt"] {
+            let file = dir.path().join(name);
+            std::fs::write(&file, body).unwrap();
+            let Err(err) = config_push(&file, Some("/work")) else {
+                panic!("{name} must be rejected before a push is built");
+            };
+            let message = format!("{err:#}");
+            assert!(
+                message.contains(name),
+                "the error must name {name}: {message}"
+            );
+            assert!(
+                message.contains(".toml") && message.contains("gitignore"),
+                "the error must name the accepted forms: {message}"
+            );
+        }
     }
 
     #[test]
     fn config_push_reads_body_and_defaults_scope_to_root() {
         let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("rules.yaml");
-        std::fs::write(&file, "ignore:\n  - \"*.tmp\"\n").unwrap();
+        let file = dir.path().join("rules.toml");
+        std::fs::write(&file, "ignore = [\"*.tmp\"]\n").unwrap();
 
         let cmd = config_push(&file, None).unwrap();
         assert_eq!(
             cmd,
             RemoteCommand::ConfigPush {
                 folder: ROOT_SCOPE.to_owned(),
-                format: ManageConfigFormat::Yaml,
-                body: "ignore:\n  - \"*.tmp\"\n".to_owned(),
+                format: ManageConfigFormat::Toml,
+                body: "ignore = [\"*.tmp\"]\n".to_owned(),
             }
         );
     }

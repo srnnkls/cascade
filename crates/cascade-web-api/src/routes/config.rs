@@ -23,8 +23,6 @@ const fn to_manage_format(format: ConfigFormat) -> ManageConfigFormat {
     match format {
         ConfigFormat::Gitignore => ManageConfigFormat::Gitignore,
         ConfigFormat::Toml => ManageConfigFormat::Toml,
-        ConfigFormat::Yaml => ManageConfigFormat::Yaml,
-        ConfigFormat::Json => ManageConfigFormat::Json,
     }
 }
 

@@ -571,6 +571,36 @@ async fn config_push_missing_fields_returns_422() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
 
+#[tokio::test]
+async fn config_push_retired_format_returns_422_naming_it() {
+    let h = Harness::new();
+    let node = h.node_id();
+    let token = h.issue("cp", &node, Capability::ConfigPush, Scope::folder("x"));
+    for format in ["yaml", "json"] {
+        let body = serde_json::json!({ "folder": "x", "format": format, "body": "{}" });
+        let response = h
+            .router
+            .clone()
+            .oneshot(authed_post("/v1/config/push", &token, &node, &body))
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "format {format}: {text}"
+        );
+        assert!(
+            text.contains(format),
+            "the rejection must name {format}: {text}"
+        );
+    }
+}
+
 // ── Files / folders route tests ───────────────────────────────────────────────
 
 #[tokio::test]

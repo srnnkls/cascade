@@ -379,7 +379,7 @@ folders are `404 not_found`.
   `manage_cache_warm` and return the engine's short summary string.
 - `POST /v1/config/push` — capability: `config:push` over the target
   folder. Body: `{ "folder": "/work", "format": "toml", "body":
-  "..." }`. `format` is one of `gitignore`, `toml`, `yaml`, `json`.
+  "..." }`. `format` is one of `gitignore`, `toml`.
 
 ## Typed client generation
 

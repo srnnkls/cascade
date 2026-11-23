@@ -1,9 +1,7 @@
 //! Parsers for the `.cascade` formats.
 
 pub mod gitignore;
-pub mod json;
 pub mod toml;
-pub mod yaml;
 
 use std::path::{Path, PathBuf};
 

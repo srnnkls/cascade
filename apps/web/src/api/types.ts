@@ -274,7 +274,7 @@ export interface CacheActionResponse {
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
-export type ConfigFormat = 'gitignore' | 'toml' | 'yaml' | 'json';
+export type ConfigFormat = 'gitignore' | 'toml';
 
 export interface ConfigPushBody {
   folder: string;

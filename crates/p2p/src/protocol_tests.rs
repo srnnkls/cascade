@@ -735,12 +735,7 @@ fn encode_decode_manage_request_cache_warm() {
 
 #[test]
 fn encode_decode_manage_request_config_push_every_format() {
-    for format in [
-        ManageConfigFormat::Gitignore,
-        ManageConfigFormat::Toml,
-        ManageConfigFormat::Yaml,
-        ManageConfigFormat::Json,
-    ] {
+    for format in [ManageConfigFormat::Gitignore, ManageConfigFormat::Toml] {
         round_trip(BepMessage::ManageRequest {
             request_id: 11,
             command: ManageCommand::ConfigPush {
@@ -921,6 +916,50 @@ fn decode_manage_request_rejects_unknown_config_format_tag() {
     frame.extend_from_slice(&body);
     let result = decode_message(&frame);
     assert!(result.is_err(), "unknown config format tag must fail");
+}
+
+#[test]
+fn decode_manage_request_rejects_retired_config_format_tags() {
+    let frame = encode_message(&BepMessage::ManageRequest {
+        request_id: 11,
+        command: ManageCommand::ConfigPush {
+            format: ManageConfigFormat::Toml,
+            folder: "/work".into(),
+            body: "ignore = []\n".into(),
+        },
+        scope: ManageScope::Folder {
+            path: "/work".into(),
+        },
+        token: None,
+    })
+    .unwrap();
+    let format_tag = size_of::<u32>() * 3 + size_of::<u64>();
+    assert_eq!(
+        frame.get(format_tag..format_tag + 4),
+        Some(&1_u32.to_be_bytes()[..]),
+        "the TOML format tag sits after the command tag"
+    );
+
+    for (tag, format) in [(2_u32, "yaml"), (3, "json")] {
+        let mut retired = frame.clone();
+        retired.splice(format_tag..format_tag + 4, tag.to_be_bytes());
+        let Err(err) = decode_message(&retired) else {
+            panic!("config format tag {tag} ({format}) must not decode");
+        };
+        let message = format!("{err:#}").to_ascii_lowercase();
+        assert!(
+            message.contains(format) && message.contains(&tag.to_string()),
+            "the error must name tag {tag} as {format}: {message}"
+        );
+        assert!(
+            message.contains("no longer supported") || message.contains("retired"),
+            "the error must say {format} is retired: {message}"
+        );
+        assert!(
+            !message.contains("unknown"),
+            "a retired tag must not fail as an unknown tag: {message}"
+        );
+    }
 }
 
 #[test]

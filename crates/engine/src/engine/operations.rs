@@ -312,7 +312,7 @@ pub fn parse_size_bytes(raw: &str) -> Result<i64> {
 /// [`CascadeConfig`](cascade_config::CascadeConfig).
 ///
 /// Routes to the matching `cascade-config` parser for the wire format. The
-/// gitignore parser is infallible; the structured parsers surface a parse error
+/// gitignore parser is infallible; the TOML parser surfaces a parse error
 /// loudly rather than yielding an empty config.
 #[cfg(feature = "p2p")]
 pub fn parse_config_fragment(
@@ -323,7 +323,5 @@ pub fn parse_config_fragment(
     match format {
         ManageConfigFormat::Gitignore => Ok(cascade_config::parse::gitignore::parse(body)),
         ManageConfigFormat::Toml => cascade_config::parse::toml::parse(body),
-        ManageConfigFormat::Yaml => cascade_config::parse::yaml::parse(body),
-        ManageConfigFormat::Json => cascade_config::parse::json::parse(body),
     }
 }

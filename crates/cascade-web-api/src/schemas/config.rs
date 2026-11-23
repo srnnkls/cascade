@@ -10,10 +10,6 @@ pub enum ConfigFormat {
     Gitignore,
     /// A TOML fragment.
     Toml,
-    /// A YAML fragment.
-    Yaml,
-    /// A JSON fragment.
-    Json,
 }
 
 /// `POST /v1/config/push` request body.

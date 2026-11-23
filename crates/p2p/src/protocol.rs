@@ -583,7 +583,7 @@ pub enum ManageCommand {
 
 /// The serialisation format of a [`ManageCommand::ConfigPush`] body.
 ///
-/// Mirrors the four `.cascade` formats the parser accepts. Kept wire-typed so
+/// The two push formats: gitignore-style `.cascade` and TOML. Kept wire-typed so
 /// the protocol crate stays independent of the config crate; the engine maps
 /// each variant to the matching parser at the dispatch boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -592,20 +592,16 @@ pub enum ManageConfigFormat {
     Gitignore,
     /// `.cascade.toml`.
     Toml,
-    /// `.cascade.yaml`.
-    Yaml,
-    /// `.cascade.json`.
-    Json,
 }
 
 /// Wire discriminant for [`ManageConfigFormat::Gitignore`].
 const MANAGE_CONFIG_FORMAT_GITIGNORE: u32 = 0;
 /// Wire discriminant for [`ManageConfigFormat::Toml`].
 const MANAGE_CONFIG_FORMAT_TOML: u32 = 1;
-/// Wire discriminant for [`ManageConfigFormat::Yaml`].
-const MANAGE_CONFIG_FORMAT_YAML: u32 = 2;
-/// Wire discriminant for [`ManageConfigFormat::Json`].
-const MANAGE_CONFIG_FORMAT_JSON: u32 = 3;
+/// Retired wire discriminant of the YAML format; never reused.
+const MANAGE_CONFIG_FORMAT_RETIRED_YAML: u32 = 2;
+/// Retired wire discriminant of the JSON format; never reused.
+const MANAGE_CONFIG_FORMAT_RETIRED_JSON: u32 = 3;
 
 /// A capability grant as carried on the wire inside a
 /// [`ManageCommand::GrantAdd`].
@@ -1732,8 +1728,6 @@ const fn manage_config_format_tag(format: ManageConfigFormat) -> u32 {
     match format {
         ManageConfigFormat::Gitignore => MANAGE_CONFIG_FORMAT_GITIGNORE,
         ManageConfigFormat::Toml => MANAGE_CONFIG_FORMAT_TOML,
-        ManageConfigFormat::Yaml => MANAGE_CONFIG_FORMAT_YAML,
-        ManageConfigFormat::Json => MANAGE_CONFIG_FORMAT_JSON,
     }
 }
 
@@ -2091,8 +2085,12 @@ fn manage_config_format_from_tag(tag: u32) -> Result<ManageConfigFormat> {
     match tag {
         MANAGE_CONFIG_FORMAT_GITIGNORE => Ok(ManageConfigFormat::Gitignore),
         MANAGE_CONFIG_FORMAT_TOML => Ok(ManageConfigFormat::Toml),
-        MANAGE_CONFIG_FORMAT_YAML => Ok(ManageConfigFormat::Yaml),
-        MANAGE_CONFIG_FORMAT_JSON => Ok(ManageConfigFormat::Json),
+        MANAGE_CONFIG_FORMAT_RETIRED_YAML => {
+            anyhow::bail!("config format tag {tag} (YAML) is no longer supported")
+        }
+        MANAGE_CONFIG_FORMAT_RETIRED_JSON => {
+            anyhow::bail!("config format tag {tag} (JSON) is no longer supported")
+        }
         other => anyhow::bail!("unknown manage config format tag {other}"),
     }
 }

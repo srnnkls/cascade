@@ -187,7 +187,7 @@ Details are in the design document:
 ```
 crates/
   engine/                 VFS tree, backend trait, cache manager, sync, state DB
-  cascade-config/         .cascade parsing (4 formats), merge, directory walk
+  cascade-config/         .cascade parsing (gitignore-style and TOML), merge, directory walk
   expr/                   Conditional expression parser (PEG via pest) and evaluator
   p2p/                    BEP protocol, peer discovery (LAN, gossip, announce, Mainline DHT), block store
   cascade-announce-wire/  Announce-server wire contract: signed-candidate types, HMAC write auth, wasm-safe handler
@@ -232,7 +232,7 @@ SQLite at `~/.config/cascade/state.db`, or `state.db` in the App Group container
 
 - **Rust edition 2024** with `async_trait` for the Backend and VfsPresenter traits.
 - **Error handling** with `anyhow` for applications and `thiserror` for library crate error types.
-- **Serde** for all serialisation (JSON wire protocol, TOML/YAML/JSON config, SQLite bridge types).
+- **Serde** for all serialisation (JSON wire protocol, TOML config, SQLite bridge types).
 - **Platform context** is injected via traits (`PlatformContext`), not pulled from global APIs. Each OS provides its own implementation behind the same contract.
 - **Backend crates** are self-contained: each exposes exactly one `create_backend` function and implements the `Backend` trait.
 - **Config merge semantics** differ by concern: ignore rules and pins accumulate, lifecycle policies are child-first first-match-wins, cache settings are nearest-wins, device config is root-only.

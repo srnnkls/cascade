@@ -96,15 +96,13 @@ cascade/
 │   │       │   └── windows.rs    # WinRT APIs
 │   │       ├── db.rs             # SQLite state database
 │   │       └── protocol.rs       # Engine ↔ presenter wire protocol
-│   ├── cascade/                  # .cascade parsing (4 formats), merge, directory walk
+│   ├── cascade/                  # .cascade parsing (gitignore-style and TOML), merge, directory walk
 │   │   └── src/
 │   │       ├── lib.rs
 │   │       ├── parse/
 │   │       │   ├── mod.rs
 │   │       │   ├── gitignore.rs  # gitignore-style .cascade parser
-│   │       │   ├── toml.rs       # cascade.toml and cascade.local.toml parser
-│   │       │   ├── yaml.rs       # YAML parser, no longer read from directories
-│   │       │   └── json.rs       # JSON parser, no longer read from directories
+│   │       │   └── toml.rs       # cascade.toml and cascade.local.toml parser
 │   │       ├── merge.rs          # ResolvedConfig builder, directory walk
 │   │       └── types.rs          # CascadeConfig, IgnoreRule, LifecyclePolicy, PinRule
 │   ├── expr/                     # Conditional expression parser and evaluator
@@ -1898,7 +1896,7 @@ On the wire it is two variants on the existing `BepMessage` enum — `ManageRequ
 | `Restart` / `Stop` | `lifecycle:control` |
 | `GrantAdd` / `GrantRevoke` | `grant:admin` |
 
-Because the dangerous capabilities are never satisfied by a node-wide or root-normalising grant, the commands that need them carry the scope they are authorised over explicitly: `BackendAdd` / `BackendRemove` carry the backend's `mount_path`, and `Restart` / `Stop` take a folder scope rather than a wildcard. A `ConfigPush` body is one of the four `.cascade` formats, wire-typed as `ManageConfigFormat` so the protocol crate stays free of the config crate's parser, and applies under the folder it targets.
+Because the dangerous capabilities are never satisfied by a node-wide or root-normalising grant, the commands that need them carry the scope they are authorised over explicitly: `BackendAdd` / `BackendRemove` carry the backend's `mount_path`, and `Restart` / `Stop` take a folder scope rather than a wildcard. A `ConfigPush` body is gitignore-style or TOML, wire-typed as `ManageConfigFormat` so the protocol crate stays free of the config crate's parser, and applies under the folder it targets; the retired YAML and JSON tags 2 and 3 fail to decode and are never reused.
 
 `GrantAdd` carries a second, stricter gate on top of the `grant:admin` capability check: the grant being delegated must be a subset of authority the caller can *itself exercise*. `caller_can_delegate` collects the caller's own grants of the same capability whose scope covers the delegated scope and which `authorises` would permit the caller to exercise directly — reusing `authorises` folds in the dangerous + node-wide bar, so a node-wide dangerous grant the caller can never use cannot be laundered into a narrow folder-scoped delegation. Holding `grant:admin` alone is not enough; a manager can delegate only what it could already do. The delegated expiry is clamped to the latest expiry among the backing grants, so a delegate never outlives the authority it derived from, and `granted_by` is stamped with the authenticated caller rather than trusted off the wire.
 
@@ -1939,7 +1937,7 @@ Grants are kept as a local list with the connection's authenticated device ID as
 |-------|---------|-------|
 | `tokio` | Async runtime | v1 |
 | `rusqlite` | SQLite state database | v1 |
-| `serde` + `toml` + `serde_yaml` + `serde_json` | Config parsing | v1 |
+| `serde` + `toml` | Config parsing | v1 |
 | `ignore` | `.gitignore`-style glob matching (from ripgrep) | v1 |
 | `pest` | PEG grammar for expression language | v4 |
 | `notify` | Filesystem event watching (FSEvents / inotify) | v6 |

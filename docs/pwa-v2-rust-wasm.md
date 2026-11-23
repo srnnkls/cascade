@@ -61,7 +61,7 @@ Three categories of crate emerge.
 | Crate | What it provides | Action |
 |-------|------------------|--------|
 | `cascade-announce-wire` | Wire types, ed25519 seed derivation, signed-candidate envelope, HMAC client auth, announce handler. | Already wasm-safe. The v2 PWA reuses `signing::SignedCandidates` and `auth` for peer-to-peer envelopes. |
-| `cascade-config` | `.cascade` parser (four formats), merge, directory walk, typed `CascadeConfig`. Pure serde + toml + serde_yaml + serde_json. | Compiles to wasm. The PWA uses it to render the config editor and to parse a user-pasted `.cascade` file in the browser before pushing it to the daemon. |
+| `cascade-config` | `.cascade` parser (gitignore-style and TOML), merge, directory walk, typed `CascadeConfig`. Pure serde + toml. | Compiles to wasm. The PWA uses it to render the config editor and to parse a user-pasted `.cascade` file in the browser before pushing it to the daemon. |
 | `cascade-expr` | PEG parser and evaluator for the conditional expression language. | Compiles to wasm after cfg-gating the `libc` dependency (only `DiskProvider` uses it; the wasm build does not need disk providers). The PWA evaluates `.cascade` conditions against the `EvalContext` it constructs from the device and the daemon's reported state. |
 
 The cfg-gating pattern follows the workspace convention documented in

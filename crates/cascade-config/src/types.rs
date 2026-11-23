@@ -1,4 +1,4 @@
-//! Cascade config types — shared across all four format parsers.
+//! Cascade config types — shared by the gitignore-style and TOML parsers.
 
 use std::fmt;
 use std::time::Duration;

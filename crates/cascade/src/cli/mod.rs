@@ -760,8 +760,8 @@ pub enum RemoteCacheCommands {
 pub enum RemoteConfigCommands {
     /// Push a .cascade fragment file, merging it into the node's rule set
     Push {
-        /// Path to the local .cascade fragment file (its extension selects the
-        /// format: .toml/.yaml/.json, else gitignore-style)
+        /// Path to the local .cascade fragment file: a .toml file, or an
+        /// extensionless gitignore-style file such as .cascade
         file: PathBuf,
 
         /// Folder the fragment applies to (defaults to the node root)
